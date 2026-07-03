@@ -5,9 +5,11 @@
 //! 封装之间的 Rust 侧接口。当前构建在无法证明 zero-copy D3D11 import 前不会创建
 //! 真实会话，避免引入任何 CPU raw frame 回退。
 
+use super::ProbeCaps;
 use crate::config::ChromaSampling;
 use crate::error::BackendError;
 use crate::rate_control::RateControlConfig;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBackendKind {
@@ -92,4 +94,21 @@ pub fn unsupported_until_zero_copy_verified(request: &RecordingRequest) -> Backe
         ),
         "尚未完成 shared D3D11 surface import 实测；按文档要求禁止创建会话或改用 CPU 回退",
     )
+}
+
+pub fn record_once_gpu_only(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+) -> Result<(), BackendError> {
+    let _ = (output, duration_seconds);
+    if !caps.d3d11_texture_input_supported {
+        return Err(BackendError::unsupported(
+            "oneVPL 编码",
+            "D3D11 texture 输入",
+            "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
+        ));
+    }
+    Err(unsupported_until_zero_copy_verified(request))
 }

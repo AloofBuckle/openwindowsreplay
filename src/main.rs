@@ -6,9 +6,9 @@
 
 mod app;
 mod backend;
+mod cli_debug;
 mod config;
 mod error;
-mod ffmpeg_record;
 mod rate_control;
 mod ring;
 
@@ -34,13 +34,13 @@ fn run() -> anyhow::Result<()> {
             headless_self_test()?;
             return Ok(());
         }
-        Some("--record-once") => {
-            ffmpeg_record::record_once(&args[1..])?;
+        Some("--debug-cli") => {
+            cli_debug::run(&args[1..])?;
             return Ok(());
         }
         Some("--help") | Some("-h") => {
             println!(
-                "RustReplay 即时回放\n\n用法:\n  rust_replay.exe              启动 GUI\n  rust_replay.exe --probe-json 仅输出能力探测 JSON\n  rust_replay.exe --headless-self-test 运行无窗口自检\n  rust_replay.exe --record-once --output <mp4> [--duration 3.559] 录制一次用于测试审计"
+                "RustReplay 即时回放\n\n用法:\n  rust_replay.exe              启动 GUI\n  rust_replay.exe --probe-json 仅输出能力探测 JSON\n  rust_replay.exe --headless-self-test 运行无窗口自检\n  rust_replay.exe --debug-cli <命令> 运行可拆除的生产后端 CLI 调试器"
             );
             return Ok(());
         }

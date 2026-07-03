@@ -6,6 +6,7 @@
 //! `MFXVideoENCODE_Query/Init` 与 shared D3D11 surface import 再次验证。
 
 use crate::config::ChromaSampling;
+use crate::error::BackendError;
 use crate::rate_control::RateControlMethod;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,12 @@ const MFX_ACCEL_MODE_VIA_D3D11: u32 = 0x0300;
 const MFX_RESOURCE_DX11_TEXTURE: u32 = 5;
 const MFX_IOPATTERN_IN_VIDEO_MEMORY: u16 = 0x01;
 const MFX_PICSTRUCT_PROGRESSIVE: u16 = 0x01;
+const MFX_HANDLE_D3D11_DEVICE: u32 = 3;
+const MFX_VARIANT_VERSION: u16 = struct_version(1, 1);
+const MFX_VARIANT_TYPE_U32: u32 = 5;
+const MFX_VARIANT_TYPE_PTR: u32 = 11;
+const MFX_IMPL_HARDWARE_ANY: u32 = 0x0004;
+const MFX_IMPL_VIA_D3D11: u32 = 0x0300;
 
 const MFX_CODEC_HEVC: u32 = make_fourcc(b'H', b'E', b'V', b'C');
 const MFX_FOURCC_NV12: u32 = make_fourcc(b'N', b'V', b'1', b'2');
@@ -212,12 +219,20 @@ struct VplApi {
     _library: Library,
     mfx_load: unsafe extern "C" fn() -> MfxLoader,
     mfx_unload: unsafe extern "C" fn(MfxLoader),
+    mfx_init: Option<unsafe extern "C" fn(u32, *mut MfxVersion, *mut MfxSession) -> i32>,
+    mfx_create_config: unsafe extern "C" fn(MfxLoader) -> MfxConfig,
+    mfx_set_config_filter_property: unsafe extern "C" fn(MfxConfig, *const u8, MfxVariant) -> i32,
     mfx_enum_implementations: unsafe extern "C" fn(MfxLoader, u32, u32, *mut MfxHDL) -> i32,
     mfx_release_impl_description: unsafe extern "C" fn(MfxLoader, MfxHDL) -> i32,
     mfx_create_session: unsafe extern "C" fn(MfxLoader, u32, *mut MfxSession) -> i32,
     mfx_close: unsafe extern "C" fn(MfxSession) -> i32,
     mfx_video_encode_query:
         unsafe extern "C" fn(MfxSession, *mut MfxVideoParam, *mut MfxVideoParam) -> i32,
+    mfx_video_core_set_handle: unsafe extern "C" fn(MfxSession, u32, MfxHDL) -> i32,
+    mfx_video_encode_query_iosurf:
+        unsafe extern "C" fn(MfxSession, *mut MfxVideoParam, *mut MfxFrameAllocRequest) -> i32,
+    mfx_video_encode_init: unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> i32,
+    mfx_video_encode_close: unsafe extern "C" fn(MfxSession) -> i32,
 }
 
 impl VplApi {
@@ -233,6 +248,24 @@ impl VplApi {
                             .map_err(|e| e.to_string())?;
                         let mfx_unload = *library
                             .get::<unsafe extern "C" fn(MfxLoader)>(b"MFXUnload\0")
+                            .map_err(|e| e.to_string())?;
+                        let mfx_init = library
+                            .get::<unsafe extern "C" fn(
+                                u32,
+                                *mut MfxVersion,
+                                *mut MfxSession,
+                            ) -> i32>(b"MFXInit\0")
+                            .ok()
+                            .map(|symbol| *symbol);
+                        let mfx_create_config = *library
+                            .get::<unsafe extern "C" fn(MfxLoader) -> MfxConfig>(
+                                b"MFXCreateConfig\0",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let mfx_set_config_filter_property = *library
+                            .get::<unsafe extern "C" fn(MfxConfig, *const u8, MfxVariant) -> i32>(
+                                b"MFXSetConfigFilterProperty\0",
+                            )
                             .map_err(|e| e.to_string())?;
                         let mfx_enum_implementations = *library
                             .get::<unsafe extern "C" fn(MfxLoader, u32, u32, *mut MfxHDL) -> i32>(
@@ -259,15 +292,44 @@ impl VplApi {
                                 *mut MfxVideoParam,
                             ) -> i32>(b"MFXVideoENCODE_Query\0")
                             .map_err(|e| e.to_string())?;
+                        let mfx_video_core_set_handle = *library
+                            .get::<unsafe extern "C" fn(MfxSession, u32, MfxHDL) -> i32>(
+                                b"MFXVideoCORE_SetHandle\0",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let mfx_video_encode_query_iosurf = *library
+                            .get::<unsafe extern "C" fn(
+                                MfxSession,
+                                *mut MfxVideoParam,
+                                *mut MfxFrameAllocRequest,
+                            ) -> i32>(b"MFXVideoENCODE_QueryIOSurf\0")
+                            .map_err(|e| e.to_string())?;
+                        let mfx_video_encode_init = *library
+                            .get::<unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> i32>(
+                                b"MFXVideoENCODE_Init\0",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let mfx_video_encode_close = *library
+                            .get::<unsafe extern "C" fn(MfxSession) -> i32>(
+                                b"MFXVideoENCODE_Close\0",
+                            )
+                            .map_err(|e| e.to_string())?;
                         Self {
                             _library: library,
                             mfx_load,
                             mfx_unload,
+                            mfx_init,
+                            mfx_create_config,
+                            mfx_set_config_filter_property,
                             mfx_enum_implementations,
                             mfx_release_impl_description,
                             mfx_create_session,
                             mfx_close,
                             mfx_video_encode_query,
+                            mfx_video_core_set_handle,
+                            mfx_video_encode_query_iosurf,
+                            mfx_video_encode_init,
+                            mfx_video_encode_close,
                         }
                     };
                     return Ok((api, path));
@@ -297,6 +359,248 @@ fn candidate_dlls() -> Vec<PathBuf> {
         PathBuf::from(r"C:\msys64\ucrt64\bin\libvpl-2.dll"),
     ]);
     out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VplD3d11EncodeInitSmoke {
+    pub adapter_index: u32,
+    pub adapter_luid: String,
+    pub dll_path: String,
+    pub implementation_index: u32,
+    pub session_mode: String,
+    pub legacy_init_status: Option<i32>,
+    pub cfg_impl_status: i32,
+    pub cfg_accel_status: i32,
+    pub cfg_handle_type_status: i32,
+    pub cfg_handle_status: i32,
+    pub set_handle_status: i32,
+    pub query_iosurf_status: i32,
+    pub init_status: i32,
+    pub close_status: i32,
+    pub width: u16,
+    pub height: u16,
+    pub fourcc: String,
+    pub num_frame_min: u16,
+    pub num_frame_suggested: u16,
+    pub request_type: u16,
+}
+
+#[cfg(windows)]
+pub fn run_d3d11_encode_init_smoke(
+    adapter_index: u32,
+) -> Result<VplD3d11EncodeInitSmoke, BackendError> {
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    };
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+        D3D11CreateDevice, ID3D11Device,
+    };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+    use windows::core::Interface;
+
+    let (api, dll_path) =
+        VplApi::load().map_err(|err| BackendError::unsupported("oneVPL", "DLL", err))?;
+
+    unsafe {
+        let factory: IDXGIFactory1 =
+            CreateDXGIFactory1().map_err(|err| BackendError::WindowsApi {
+                func: "CreateDXGIFactory1",
+                message: err.to_string(),
+            })?;
+        let adapter1 =
+            factory
+                .EnumAdapters1(adapter_index)
+                .map_err(|err| BackendError::WindowsApi {
+                    func: "IDXGIFactory1::EnumAdapters1",
+                    message: err.to_string(),
+                })?;
+        let desc = adapter1
+            .GetDesc1()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "IDXGIAdapter1::GetDesc1",
+                message: err.to_string(),
+            })?;
+        let adapter_luid = format!(
+            "{:08X}:{:08X}",
+            desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
+        );
+        let adapter: IDXGIAdapter = adapter1.cast().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIAdapter1::cast",
+            message: err.to_string(),
+        })?;
+
+        let mut device: Option<ID3D11Device> = None;
+        let mut feature_level = D3D_FEATURE_LEVEL(0);
+        let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        D3D11CreateDevice(
+            Some(&adapter),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            Some(&mut feature_level),
+            None,
+        )
+        .map_err(|err| BackendError::WindowsApi {
+            func: "D3D11CreateDevice",
+            message: err.to_string(),
+        })?;
+        let device = device.ok_or_else(|| BackendError::WindowsApi {
+            func: "D3D11CreateDevice",
+            message: "返回空 ID3D11Device".to_owned(),
+        })?;
+
+        let loader = (api.mfx_load)();
+        if loader.is_null() {
+            return Err(BackendError::unsupported(
+                "oneVPL",
+                "MFXLoad",
+                "返回空 loader",
+            ));
+        }
+        let raw_device = windows::core::Interface::as_raw(&device) as MfxHDL;
+        // 注意：测试机上的 mfx-gen 对 loader 级 mfxHandleType/mfxHDL 过滤返回
+        // MFX_ERR_UNDEFINED_BEHAVIOR，故这里先不启用；保留字段用于日志暴露。
+        let cfg_impl_status = i32::MIN;
+        let cfg_accel_status = i32::MIN;
+        let cfg_handle_type_status = i32::MIN;
+        let cfg_handle_status = i32::MIN;
+
+        let mut session: MfxSession = ptr::null_mut();
+        let implementation_index = 0;
+        let mut session_mode = "loader".to_owned();
+        let mut legacy_init_status = None;
+        if let Some(mfx_init) = api.mfx_init {
+            let mut version = MfxVersion { version: (2 << 16) };
+            let status = mfx_init(
+                MFX_IMPL_HARDWARE_ANY | MFX_IMPL_VIA_D3D11,
+                &mut version,
+                &mut session,
+            );
+            legacy_init_status = Some(status);
+            if status == MFX_ERR_NONE && !session.is_null() {
+                session_mode = "legacy MFXInit(HARDWARE_ANY|D3D11)".to_owned();
+            } else {
+                session = ptr::null_mut();
+            }
+        }
+        if session.is_null() {
+            let create_status =
+                (api.mfx_create_session)(loader, implementation_index, &mut session);
+            if create_status != MFX_ERR_NONE || session.is_null() {
+                (api.mfx_unload)(loader);
+                return Err(BackendError::VplStatus {
+                    func: "MFXCreateSession",
+                    status: create_status,
+                });
+            }
+        }
+
+        let set_handle_status =
+            (api.mfx_video_core_set_handle)(session, MFX_HANDLE_D3D11_DEVICE, raw_device);
+
+        let mut param = make_query_param(
+            RateControlMethod::Cbr,
+            MFX_FOURCC_P010,
+            1,
+            10,
+            MFX_PROFILE_HEVC_MAIN10 as u16,
+        );
+        param.mfx.FrameInfo.Width = 3840;
+        param.mfx.FrameInfo.Height = 2160;
+        param.mfx.FrameInfo.CropW = 3840;
+        param.mfx.FrameInfo.CropH = 2160;
+        param.mfx.TargetKbps = 20_000;
+        param.mfx.BufferSizeInKB = 40_000;
+        param.mfx.GopRefDist = 1;
+
+        let mut request: MfxFrameAllocRequest = std::mem::zeroed();
+        let query_iosurf_status =
+            (api.mfx_video_encode_query_iosurf)(session, &mut param, &mut request);
+        let init_status = (api.mfx_video_encode_init)(session, &mut param);
+        let close_status = if init_status >= MFX_ERR_NONE {
+            (api.mfx_video_encode_close)(session)
+        } else {
+            MFX_ERR_NONE
+        };
+        let mfx_close_status = (api.mfx_close)(session);
+        (api.mfx_unload)(loader);
+        if mfx_close_status != MFX_ERR_NONE {
+            return Err(BackendError::VplStatus {
+                func: "MFXClose",
+                status: mfx_close_status,
+            });
+        }
+
+        Ok(VplD3d11EncodeInitSmoke {
+            adapter_index,
+            adapter_luid,
+            dll_path: dll_path.display().to_string(),
+            implementation_index,
+            session_mode,
+            legacy_init_status,
+            cfg_impl_status,
+            cfg_accel_status,
+            cfg_handle_type_status,
+            cfg_handle_status,
+            set_handle_status,
+            query_iosurf_status,
+            init_status,
+            close_status,
+            width: param.mfx.FrameInfo.Width,
+            height: param.mfx.FrameInfo.Height,
+            fourcc: fourcc_to_string(param.mfx.FrameInfo.FourCC),
+            num_frame_min: request.NumFrameMin,
+            num_frame_suggested: request.NumFrameSuggested,
+            request_type: request.Type,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn run_d3d11_encode_init_smoke(
+    adapter_index: u32,
+) -> Result<VplD3d11EncodeInitSmoke, BackendError> {
+    let _ = adapter_index;
+    Err(BackendError::unsupported(
+        "oneVPL D3D11 encode init",
+        "Windows D3D11",
+        "仅 Windows 可用",
+    ))
+}
+
+unsafe fn set_loader_u32(api: &VplApi, loader: MfxLoader, name: *const u8, value: u32) -> i32 {
+    let cfg = (api.mfx_create_config)(loader);
+    if cfg.is_null() {
+        return -2;
+    }
+    let variant = MfxVariant {
+        Version: MfxStructVersion {
+            version: MFX_VARIANT_VERSION,
+        },
+        Type: MFX_VARIANT_TYPE_U32,
+        Data: value as u64,
+    };
+    (api.mfx_set_config_filter_property)(cfg, name, variant)
+}
+
+unsafe fn set_loader_ptr(api: &VplApi, loader: MfxLoader, name: *const u8, value: MfxHDL) -> i32 {
+    let cfg = (api.mfx_create_config)(loader);
+    if cfg.is_null() {
+        return -2;
+    }
+    let variant = MfxVariant {
+        Version: MfxStructVersion {
+            version: MFX_VARIANT_VERSION,
+        },
+        Type: MFX_VARIANT_TYPE_PTR,
+        Data: value as usize as u64,
+    };
+    (api.mfx_set_config_filter_property)(cfg, name, variant)
 }
 
 unsafe fn parse_impl(
@@ -604,6 +908,7 @@ fn chroma_from_vpl(value: u16) -> Option<ChromaSampling> {
 }
 
 type MfxLoader = *mut c_void;
+type MfxConfig = *mut c_void;
 type MfxSession = *mut c_void;
 type MfxHDL = *mut c_void;
 
@@ -617,6 +922,14 @@ struct MfxStructVersion {
 #[derive(Debug, Clone, Copy)]
 struct MfxVersion {
     version: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxVariant {
+    Version: MfxStructVersion,
+    Type: u32,
+    Data: u64,
 }
 
 #[repr(C)]
@@ -701,6 +1014,18 @@ struct MfxVideoParam {
     IOPattern: u16,
     ExtParam: *mut *mut c_void,
     NumExtParam: u16,
+    reserved2: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxFrameAllocRequest {
+    AllocId: u32,
+    reserved3: [u32; 3],
+    Info: MfxFrameInfo,
+    Type: u16,
+    NumFrameMin: u16,
+    NumFrameSuggested: u16,
     reserved2: u16,
 }
 

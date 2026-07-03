@@ -38,13 +38,16 @@ rust_replay.exe --probe-json
 
 该命令只输出 JSON，不打开 GUI，便于通过调试机 `/run` 接口执行。
 
-## 录制审计入口
+## 可拆除 CLI 调试器
 
 ```powershell
-rust_replay.exe --record-once --duration 3.559 --output C:\Temp\RustReplay\record.mp4
+rust_replay.exe --debug-cli probe
+rust_replay.exe --debug-cli smoke-d3d11 --adapter 0
+rust_replay.exe --debug-cli smoke-encode --adapter 0
+rust_replay.exe --debug-cli record --output C:\Temp\RustReplay\record.mp4 --duration 3.559 --chroma 420 --rate CBR
 ```
 
-该入口用于当前“编码循环”自动化测试：在 Windows 桌面会话中调用 FFmpeg `ddagrab` + Intel `hevc_qsv` 产出 MP4，写入 `hvc1`、HEVC Main10、BT.2020/PQ/Full、AAC LC 48k stereo 192k 等 MediaInfo 目标字段。DDA 路径默认不录光标。生产后端的 oneVPL/D3D11 GPU-only 契约仍在 `src/backend` 中继续推进。
+该入口用于 `/run` 自动化测试，功能与 GUI 对齐，但全部调用 `src/backend` 中的生产后端，不使用 FFmpeg/raw-frame CPU 回落。`smoke-d3d11` 只验证 DDA 取得 `ID3D11Texture2D`，`smoke-encode` 验证 oneVPL D3D11/P010/HEVC 初始化，`record` 用于后续端到端录制。
 
 本机审计：
 

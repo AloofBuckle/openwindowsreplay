@@ -1,14 +1,17 @@
 //! GPU-only 后端总入口。
 
 pub mod dxgi;
+pub mod gpu_smoke;
 pub mod pipeline;
 pub mod session;
 pub mod vpl;
 
 use crate::config::ChromaSampling;
 use crate::rate_control::RateControlMethod;
+use crate::{config::AppConfig, error::BackendError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,4 +193,27 @@ pub fn probe_all() -> ProbeCaps {
         path_blockers: reasons,
         vpl,
     }
+}
+
+pub fn debug_record_once(
+    config: &AppConfig,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+) -> Result<(), BackendError> {
+    let chroma = config.chroma.ok_or_else(|| {
+        BackendError::unsupported("debug-cli record", "色度采样", "没有选择色度采样")
+    })?;
+    let request = pipeline::RecordingRequest {
+        capture_backend: pipeline::CaptureBackendKind::Dda,
+        color_transform: pipeline::ColorTransformKind::HdrPq10ToYuv10,
+        chroma_writer: match chroma {
+            ChromaSampling::Yuv420 => pipeline::ChromaWriterKind::P010,
+            ChromaSampling::Yuv422 => pipeline::ChromaWriterKind::P210,
+            ChromaSampling::Yuv444 => pipeline::ChromaWriterKind::Y410,
+        },
+        rate_control: config.rate_control.clone(),
+        replay_minutes: duration_seconds / 60.0,
+    };
+    pipeline::record_once_gpu_only(&request, caps, output, duration_seconds)
 }
