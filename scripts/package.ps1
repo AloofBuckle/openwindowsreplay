@@ -21,14 +21,31 @@ try {
         "C:\msys64\ucrt64\bin\libvpl-2.dll"
     ) | Where-Object { $_ -and (Test-Path $_) })
 
+    $packaged = @()
+
     if ($vplCandidates.Count -gt 0) {
         $src = $vplCandidates[0]
         $name = Split-Path $src -Leaf
         Copy-Item -LiteralPath $src -Destination (Join-Path $OutDir $name) -Force
-        "Bundled oneVPL user-mode dependency: $name" | Set-Content -Encoding UTF8 (Join-Path $OutDir "PACKAGED_DEPENDENCIES.txt")
+        $packaged += "Bundled oneVPL user-mode dependency: $name"
     } else {
-        "No libvpl.dll/libvpl-2.dll was found to bundle. The target machine must provide oneVPL/Intel Graphics Runtime." | Set-Content -Encoding UTF8 (Join-Path $OutDir "PACKAGED_DEPENDENCIES.txt")
+        $packaged += "No libvpl.dll/libvpl-2.dll was found to bundle. The target machine must provide oneVPL/Intel Graphics Runtime."
     }
+
+    $ffmpegCandidates = @()
+    if ($env:RUSTREPLAY_FFMPEG) { $ffmpegCandidates += $env:RUSTREPLAY_FFMPEG }
+    $ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($ffmpegCommand) { $ffmpegCandidates += $ffmpegCommand.Source }
+    $ffmpegCandidates = @($ffmpegCandidates | Where-Object { $_ -and (Test-Path $_) })
+
+    if ($ffmpegCandidates.Count -gt 0) {
+        Copy-Item -LiteralPath $ffmpegCandidates[0] -Destination (Join-Path $OutDir "ffmpeg.exe") -Force
+        $packaged += "Bundled FFmpeg dependency: ffmpeg.exe"
+    } else {
+        $packaged += "No ffmpeg.exe was found to bundle. --record-once requires FFmpeg in PATH or next to rust_replay.exe."
+    }
+
+    $packaged | Set-Content -Encoding UTF8 (Join-Path $OutDir "PACKAGED_DEPENDENCIES.txt")
 
     Compress-Archive -Path (Join-Path $OutDir "*") -DestinationPath "dist\RustReplay.zip" -Force
     Write-Host "Package generated: dist\RustReplay.zip"

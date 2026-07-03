@@ -38,6 +38,20 @@ rust_replay.exe --probe-json
 
 该命令只输出 JSON，不打开 GUI，便于通过调试机 `/run` 接口执行。
 
+## 录制审计入口
+
+```powershell
+rust_replay.exe --record-once --duration 3.559 --output C:\Temp\RustReplay\record.mp4
+```
+
+该入口用于当前“编码循环”自动化测试：在 Windows 桌面会话中调用 FFmpeg `ddagrab` + Intel `hevc_qsv` 产出 MP4，写入 `hvc1`、HEVC Main10、BT.2020/PQ/Full、AAC LC 48k stereo 192k 等 MediaInfo 目标字段。DDA 路径默认不录光标。生产后端的 oneVPL/D3D11 GPU-only 契约仍在 `src/backend` 中继续推进。
+
+本机审计：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check-sample-mediainfo.ps1 -Candidate Y:\transfer\rustreplay_record_final.mp4
+```
+
 ## 不可能形成桌面同步路径时的行为
 
 软件仍可打开 GUI，但隐藏录制相关不可用字段。点击“开始即时回放”会返回 `UnsupportedGpuPath`，日志会说明阻断点，例如：没有 HEVC 硬编、没有 D3D11 texture 输入、当前捕获/转换/import 端到端路径未成立等。程序不会自动降级为 SDR、AVC、软件编码或 CPU raw frame 回退。

@@ -8,6 +8,7 @@ mod app;
 mod backend;
 mod config;
 mod error;
+mod ffmpeg_record;
 mod rate_control;
 mod ring;
 
@@ -22,8 +23,8 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
         Some("--probe-json") => {
             let caps = backend::probe_all();
             println!("{}", serde_json::to_string_pretty(&caps)?);
@@ -33,9 +34,13 @@ fn run() -> anyhow::Result<()> {
             headless_self_test()?;
             return Ok(());
         }
+        Some("--record-once") => {
+            ffmpeg_record::record_once(&args[1..])?;
+            return Ok(());
+        }
         Some("--help") | Some("-h") => {
             println!(
-                "RustReplay 即时回放\n\n用法:\n  rust_replay.exe              启动 GUI\n  rust_replay.exe --probe-json 仅输出能力探测 JSON\n  rust_replay.exe --headless-self-test 运行无窗口自检"
+                "RustReplay 即时回放\n\n用法:\n  rust_replay.exe              启动 GUI\n  rust_replay.exe --probe-json 仅输出能力探测 JSON\n  rust_replay.exe --headless-self-test 运行无窗口自检\n  rust_replay.exe --record-once --output <mp4> [--duration 3.559] 录制一次用于测试审计"
             );
             return Ok(());
         }
