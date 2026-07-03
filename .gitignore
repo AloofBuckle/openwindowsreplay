@@ -1,0 +1,9 @@
+/target/
+/cache/
+/replays/
+*.pdb
+*.ilk
+*.mp4
+*.h265
+*.aac
+/dist/

@@ -1,0 +1,43 @@
+格式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : MPEG-4
+格式配置　（Ｐｒｏｆｉｌｅ）　　　　　　　　　　　　　　　　　　　　　　　　　　 : Base Media / Version 2
+编解码器　ＩＤ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : mp42 (isom/mp42)
+
+视频
+ＩＤ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 1
+格式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : HEVC
+格式／信息　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : High Efficiency Video Coding
+编解码器　ＩＤ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : hvc1
+编解码器　ＩＤ／信息　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : High Efficiency Video Coding
+帧率模式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 可变
+色彩空间　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : YUV
+色度抽样　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 4:2:0
+位深　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 10 位
+色彩范围　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : Full
+色彩原色　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : BT.2020
+传输特性　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : PQ
+矩阵系数　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : BT.2020 non-constant
+ｍｄｈｄ＿Ｄｕｒａｔｉｏｎ　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 3559
+　ＨＥＶＣ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : Yes
+编码配置区块　（ｂｏｘ）　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : hvcC
+
+音频
+ＩＤ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 2
+格式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : AAC LC
+格式／信息　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : Advanced Audio Codec Low Complexity
+编解码器　ＩＤ　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : mp4a-40-2
+时长　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 3 秒 435 毫秒
+源时长　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 3 秒 440 毫秒
+码率模式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 恒定码率
+码率　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 192 kb/s
+额定码率　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 96.0 kb/s
+声道数　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 2 声道
+声道布局　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : L R
+采样率　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 48.0 kHz
+帧率　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 46.875 FPS (1024 SPF)
+压缩模式　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 有损
+流大小　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 80.7 KiB (0%)
+源流大小　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 80.7 KiB (0%)
+标题　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : SoundHandle / System sounds
+编码日期　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 2026-07-03 18:04:34 UTC
+标记日期　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 2026-07-03 18:04:34 UTC
+ｍｄｈｄ＿Ｄｕｒａｔｉｏｎ　　　　　　　　　　　　　　　　　　　　　　　　　　　 : 3435
