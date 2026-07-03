@@ -17,6 +17,11 @@ use std::ptr;
 
 const MFX_ERR_NONE: i32 = 0;
 const MFX_ERR_NOT_FOUND: i32 = -9;
+const MFX_ERR_MORE_DATA: i32 = -10;
+const MFX_ERR_MORE_SURFACE: i32 = -11;
+const MFX_ERR_NOT_IMPLEMENTED: i32 = -24;
+const MFX_WRN_IN_EXECUTION: i32 = 1;
+const MFX_WRN_DEVICE_BUSY: i32 = 2;
 const MFX_WRN_PARTIAL_ACCELERATION: i32 = 4;
 const MFX_IMPLCAPS_IMPLDESCSTRUCTURE: u32 = 1;
 const MFX_IMPL_TYPE_HARDWARE: u32 = 0x0002;
@@ -25,11 +30,16 @@ const MFX_RESOURCE_DX11_TEXTURE: u32 = 5;
 const MFX_IOPATTERN_IN_VIDEO_MEMORY: u16 = 0x01;
 const MFX_PICSTRUCT_PROGRESSIVE: u16 = 0x01;
 const MFX_HANDLE_D3D11_DEVICE: u32 = 3;
+const MFX_HANDLE_MEMORY_INTERFACE: u32 = 1001;
 const MFX_VARIANT_VERSION: u16 = struct_version(1, 1);
 const MFX_VARIANT_TYPE_U32: u32 = 5;
 const MFX_VARIANT_TYPE_PTR: u32 = 11;
 const MFX_IMPL_HARDWARE_ANY: u32 = 0x0004;
 const MFX_IMPL_VIA_D3D11: u32 = 0x0300;
+const MFX_SURFACE_TYPE_D3D11_TEX2D: u32 = 2;
+const MFX_SURFACE_FLAG_IMPORT_SHARED: u32 = 0x0010;
+const MFX_SURFACE_COMPONENT_ENCODE: u32 = 1;
+const MFX_SURFACEINTERFACE_VERSION: u16 = struct_version(1, 0);
 
 const MFX_CODEC_HEVC: u32 = make_fourcc(b'H', b'E', b'V', b'C');
 const MFX_FOURCC_NV12: u32 = make_fourcc(b'N', b'V', b'1', b'2');
@@ -229,9 +239,20 @@ struct VplApi {
     mfx_video_encode_query:
         unsafe extern "C" fn(MfxSession, *mut MfxVideoParam, *mut MfxVideoParam) -> i32,
     mfx_video_core_set_handle: unsafe extern "C" fn(MfxSession, u32, MfxHDL) -> i32,
+    mfx_video_core_get_handle: Option<unsafe extern "C" fn(MfxSession, u32, *mut MfxHDL) -> i32>,
     mfx_video_encode_query_iosurf:
         unsafe extern "C" fn(MfxSession, *mut MfxVideoParam, *mut MfxFrameAllocRequest) -> i32,
     mfx_video_encode_init: unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> i32,
+    mfx_memory_get_surface_for_encode:
+        unsafe extern "C" fn(MfxSession, *mut *mut MfxFrameSurface1) -> i32,
+    mfx_video_encode_frame_async: unsafe extern "C" fn(
+        MfxSession,
+        *mut c_void,
+        *mut MfxFrameSurface1,
+        *mut MfxBitstream,
+        *mut MfxSyncPoint,
+    ) -> i32,
+    mfx_video_core_sync_operation: unsafe extern "C" fn(MfxSession, MfxSyncPoint, u32) -> i32,
     mfx_video_encode_close: unsafe extern "C" fn(MfxSession) -> i32,
 }
 
@@ -297,6 +318,12 @@ impl VplApi {
                                 b"MFXVideoCORE_SetHandle\0",
                             )
                             .map_err(|e| e.to_string())?;
+                        let mfx_video_core_get_handle = library
+                            .get::<unsafe extern "C" fn(MfxSession, u32, *mut MfxHDL) -> i32>(
+                                b"MFXVideoCORE_GetHandle\0",
+                            )
+                            .ok()
+                            .map(|symbol| *symbol);
                         let mfx_video_encode_query_iosurf = *library
                             .get::<unsafe extern "C" fn(
                                 MfxSession,
@@ -307,6 +334,28 @@ impl VplApi {
                         let mfx_video_encode_init = *library
                             .get::<unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> i32>(
                                 b"MFXVideoENCODE_Init\0",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let mfx_memory_get_surface_for_encode = *library
+                            .get::<unsafe extern "C" fn(
+                                MfxSession,
+                                *mut *mut MfxFrameSurface1,
+                            ) -> i32>(b"MFXMemory_GetSurfaceForEncode\0")
+                            .map_err(|e| e.to_string())?;
+                        let mfx_video_encode_frame_async = *library
+                            .get::<unsafe extern "C" fn(
+                                MfxSession,
+                                *mut c_void,
+                                *mut MfxFrameSurface1,
+                                *mut MfxBitstream,
+                                *mut MfxSyncPoint,
+                            ) -> i32>(
+                                b"MFXVideoENCODE_EncodeFrameAsync\0"
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let mfx_video_core_sync_operation = *library
+                            .get::<unsafe extern "C" fn(MfxSession, MfxSyncPoint, u32) -> i32>(
+                                b"MFXVideoCORE_SyncOperation\0",
                             )
                             .map_err(|e| e.to_string())?;
                         let mfx_video_encode_close = *library
@@ -327,8 +376,12 @@ impl VplApi {
                             mfx_close,
                             mfx_video_encode_query,
                             mfx_video_core_set_handle,
+                            mfx_video_core_get_handle,
                             mfx_video_encode_query_iosurf,
                             mfx_video_encode_init,
+                            mfx_memory_get_surface_for_encode,
+                            mfx_video_encode_frame_async,
+                            mfx_video_core_sync_operation,
                             mfx_video_encode_close,
                         }
                     };
@@ -374,6 +427,7 @@ pub struct VplD3d11EncodeInitSmoke {
     pub cfg_handle_type_status: i32,
     pub cfg_handle_status: i32,
     pub set_handle_status: i32,
+    pub query_status: i32,
     pub query_iosurf_status: i32,
     pub init_status: i32,
     pub close_status: i32,
@@ -383,6 +437,29 @@ pub struct VplD3d11EncodeInitSmoke {
     pub num_frame_min: u16,
     pub num_frame_suggested: u16,
     pub request_type: u16,
+    pub get_surface_status: i32,
+    pub native_handle_status: i32,
+    pub native_resource_type: u32,
+    pub native_texture_width: u32,
+    pub native_texture_height: u32,
+    pub native_texture_format: u32,
+    pub device_handle_status: i32,
+    pub device_handle_type: u32,
+    pub gpu_copy_status: String,
+    pub memory_get_interface_status: i32,
+    pub import_shared_status: i32,
+    pub import_shared_actual_flags: u32,
+    pub import_shared_encode_status: i32,
+    pub import_shared_sync_status: i32,
+    pub import_shared_bytes: u32,
+    pub import_shared_release_status: i32,
+    pub external_same_device_encode_status: i32,
+    pub external_same_device_sync_status: i32,
+    pub external_same_device_bytes: u32,
+    pub onevpl_surface_encode_status: i32,
+    pub onevpl_surface_sync_status: i32,
+    pub onevpl_surface_bytes: u32,
+    pub surface_release_status: i32,
 }
 
 #[cfg(windows)]
@@ -395,7 +472,7 @@ pub fn run_d3d11_encode_init_smoke(
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
-        D3D11CreateDevice, ID3D11Device,
+        D3D11_TEXTURE2D_DESC, D3D11CreateDevice, ID3D11Device, ID3D11Resource, ID3D11Texture2D,
     };
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
     use windows::core::Interface;
@@ -469,9 +546,29 @@ pub fn run_d3d11_encode_init_smoke(
         let cfg_accel_status = i32::MIN;
         let cfg_handle_type_status = i32::MIN;
         let cfg_handle_status = i32::MIN;
+        let implementation_index = 0;
+
+        // 在独立短会话里测试“把应用自己的 D3D11 device 交给 oneVPL”。
+        // 该路径在测试机 mfx-gen 上返回 MFX_ERR_UNDEFINED_BEHAVIOR；不要让这个
+        // 失败状态污染后续 oneVPL 内部分配 surface 的生产路径 smoke。
+        let set_handle_status = {
+            let mut handle_session: MfxSession = ptr::null_mut();
+            let create_status =
+                (api.mfx_create_session)(loader, implementation_index, &mut handle_session);
+            if create_status == MFX_ERR_NONE && !handle_session.is_null() {
+                let status = (api.mfx_video_core_set_handle)(
+                    handle_session,
+                    MFX_HANDLE_D3D11_DEVICE,
+                    raw_device,
+                );
+                let _ = (api.mfx_close)(handle_session);
+                status
+            } else {
+                create_status
+            }
+        };
 
         let mut session: MfxSession = ptr::null_mut();
-        let implementation_index = 0;
         let mut session_mode = "loader".to_owned();
         let mut legacy_init_status = None;
         if let Some(mfx_init) = api.mfx_init {
@@ -500,9 +597,6 @@ pub fn run_d3d11_encode_init_smoke(
             }
         }
 
-        let set_handle_status =
-            (api.mfx_video_core_set_handle)(session, MFX_HANDLE_D3D11_DEVICE, raw_device);
-
         let mut param = make_query_param(
             RateControlMethod::Cbr,
             MFX_FOURCC_P010,
@@ -517,11 +611,295 @@ pub fn run_d3d11_encode_init_smoke(
         param.mfx.TargetKbps = 20_000;
         param.mfx.BufferSizeInKB = 40_000;
         param.mfx.GopRefDist = 1;
+        param.AsyncDepth = 1;
+
+        let mut queried_param = param;
+        let query_status = (api.mfx_video_encode_query)(session, &mut param, &mut queried_param);
+        if query_status >= MFX_ERR_NONE {
+            param = queried_param;
+        }
 
         let mut request: MfxFrameAllocRequest = std::mem::zeroed();
         let query_iosurf_status =
             (api.mfx_video_encode_query_iosurf)(session, &mut param, &mut request);
         let init_status = (api.mfx_video_encode_init)(session, &mut param);
+        let mut get_surface_status = i32::MIN;
+        let mut native_handle_status = i32::MIN;
+        let mut native_resource_type = 0;
+        let mut native_texture_width = 0;
+        let mut native_texture_height = 0;
+        let mut native_texture_format = 0;
+        let mut device_handle_status = i32::MIN;
+        let mut device_handle_type = 0;
+        let mut gpu_copy_status = "not-run".to_owned();
+        let mut memory_get_interface_status = i32::MIN;
+        let mut import_shared_status = i32::MIN;
+        let mut import_shared_actual_flags = 0;
+        let mut import_shared_encode_status = i32::MIN;
+        let mut import_shared_sync_status = i32::MIN;
+        let mut import_shared_bytes = 0;
+        let mut import_shared_release_status = i32::MIN;
+        let mut external_same_device_encode_status = i32::MIN;
+        let mut external_same_device_sync_status = i32::MIN;
+        let mut external_same_device_bytes = 0;
+        let mut onevpl_surface_encode_status = i32::MIN;
+        let mut onevpl_surface_sync_status = i32::MIN;
+        let mut onevpl_surface_bytes = 0;
+        let mut surface_release_status = i32::MIN;
+        let mut onevpl_surface_encoded = false;
+
+        if init_status >= MFX_ERR_NONE {
+            let mut surface: *mut MfxFrameSurface1 = ptr::null_mut();
+            get_surface_status = (api.mfx_memory_get_surface_for_encode)(session, &mut surface);
+            if get_surface_status == MFX_ERR_NONE && !surface.is_null() {
+                let frame_interface = (*surface).FrameInterface;
+                if !frame_interface.is_null() {
+                    let mut native_resource: MfxHDL = ptr::null_mut();
+                    native_handle_status = ((*frame_interface).GetNativeHandle)(
+                        surface,
+                        &mut native_resource,
+                        &mut native_resource_type,
+                    );
+                    let mut native_device: MfxHDL = ptr::null_mut();
+                    device_handle_status = ((*frame_interface).GetDeviceHandle)(
+                        surface,
+                        &mut native_device,
+                        &mut device_handle_type,
+                    );
+
+                    if native_handle_status == MFX_ERR_NONE
+                        && native_resource_type == MFX_RESOURCE_DX11_TEXTURE
+                        && !native_resource.is_null()
+                    {
+                        let Some(target_texture) =
+                            <ID3D11Texture2D as Interface>::from_raw_borrowed(&native_resource)
+                        else {
+                            gpu_copy_status =
+                                "GetNativeHandle 返回的不是 ID3D11Texture2D".to_owned();
+                            surface_release_status = ((*frame_interface).Release)(surface);
+                            let close_status = (api.mfx_video_encode_close)(session);
+                            let mfx_close_status = (api.mfx_close)(session);
+                            (api.mfx_unload)(loader);
+                            if mfx_close_status != MFX_ERR_NONE {
+                                return Err(BackendError::VplStatus {
+                                    func: "MFXClose",
+                                    status: mfx_close_status,
+                                });
+                            }
+                            return Ok(VplD3d11EncodeInitSmoke {
+                                adapter_index,
+                                adapter_luid,
+                                dll_path: dll_path.display().to_string(),
+                                implementation_index,
+                                session_mode,
+                                legacy_init_status,
+                                cfg_impl_status,
+                                cfg_accel_status,
+                                cfg_handle_type_status,
+                                cfg_handle_status,
+                                set_handle_status,
+                                query_status,
+                                query_iosurf_status,
+                                init_status,
+                                close_status,
+                                width: param.mfx.FrameInfo.Width,
+                                height: param.mfx.FrameInfo.Height,
+                                fourcc: fourcc_to_string(param.mfx.FrameInfo.FourCC),
+                                num_frame_min: request.NumFrameMin,
+                                num_frame_suggested: request.NumFrameSuggested,
+                                request_type: request.Type,
+                                get_surface_status,
+                                native_handle_status,
+                                native_resource_type,
+                                native_texture_width,
+                                native_texture_height,
+                                native_texture_format,
+                                device_handle_status,
+                                device_handle_type,
+                                gpu_copy_status,
+                                memory_get_interface_status,
+                                import_shared_status,
+                                import_shared_actual_flags,
+                                import_shared_encode_status,
+                                import_shared_sync_status,
+                                import_shared_bytes,
+                                import_shared_release_status,
+                                external_same_device_encode_status,
+                                external_same_device_sync_status,
+                                external_same_device_bytes,
+                                onevpl_surface_encode_status,
+                                onevpl_surface_sync_status,
+                                onevpl_surface_bytes,
+                                surface_release_status,
+                            });
+                        };
+                        let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
+                        target_texture.GetDesc(&mut texture_desc);
+                        native_texture_width = texture_desc.Width;
+                        native_texture_height = texture_desc.Height;
+                        native_texture_format = texture_desc.Format.0 as u32;
+
+                        if device_handle_status == MFX_ERR_NONE
+                            && device_handle_type == MFX_HANDLE_D3D11_DEVICE
+                            && !native_device.is_null()
+                        {
+                            let mut memory_iface_handle: MfxHDL = ptr::null_mut();
+                            memory_get_interface_status = if let Some(mfx_video_core_get_handle) =
+                                api.mfx_video_core_get_handle
+                            {
+                                mfx_video_core_get_handle(
+                                    session,
+                                    MFX_HANDLE_MEMORY_INTERFACE,
+                                    &mut memory_iface_handle,
+                                )
+                            } else {
+                                MFX_ERR_NOT_IMPLEMENTED
+                            };
+                            if let Some(surface_device) =
+                                <ID3D11Device as Interface>::from_raw_borrowed(&native_device)
+                            {
+                                let mut src_desc = texture_desc;
+                                src_desc.BindFlags = Default::default();
+                                src_desc.MiscFlags = Default::default();
+                                let mut src_texture: Option<ID3D11Texture2D> = None;
+                                match surface_device.CreateTexture2D(
+                                    &src_desc,
+                                    None,
+                                    Some(&mut src_texture),
+                                ) {
+                                    Ok(()) => {
+                                        if let Some(src_texture) = src_texture {
+                                            match surface_device.GetImmediateContext() {
+                                                Ok(context) => {
+                                                    let dst_resource =
+                                                        target_texture.cast::<ID3D11Resource>();
+                                                    let src_resource =
+                                                        src_texture.cast::<ID3D11Resource>();
+                                                    match (dst_resource, src_resource) {
+                                                        (Ok(dst_resource), Ok(src_resource)) => {
+                                                            context.CopyResource(
+                                                                Some(&dst_resource),
+                                                                Some(&src_resource),
+                                                            );
+                                                            context.Flush();
+                                                            gpu_copy_status = "CopyResource(P010 -> oneVPL surface) submitted".to_owned();
+
+                                                            (*surface).Data.TimeStamp = 90_000;
+                                                            (*surface).Data.FrameOrder = 1;
+                                                            let copied = encode_one_surface(
+                                                                &api, session, surface,
+                                                            );
+                                                            onevpl_surface_encode_status = copied.0;
+                                                            onevpl_surface_sync_status = copied.1;
+                                                            onevpl_surface_bytes = copied.2;
+                                                            onevpl_surface_encoded = true;
+                                                        }
+                                                        (Err(dst_err), Ok(_)) => {
+                                                            gpu_copy_status = format!(
+                                                                "target texture cast ID3D11Resource 失败: {dst_err}"
+                                                            );
+                                                        }
+                                                        (Ok(_), Err(src_err)) => {
+                                                            gpu_copy_status = format!(
+                                                                "source texture cast ID3D11Resource 失败: {src_err}"
+                                                            );
+                                                        }
+                                                        (Err(dst_err), Err(src_err)) => {
+                                                            gpu_copy_status = format!(
+                                                                "texture cast ID3D11Resource 均失败: dst={dst_err}; src={src_err}"
+                                                            );
+                                                        }
+                                                    }
+
+                                                    if memory_get_interface_status == MFX_ERR_NONE
+                                                        && !memory_iface_handle.is_null()
+                                                    {
+                                                        let imported = import_d3d11_texture_shared(
+                                                            memory_iface_handle
+                                                                as *mut MfxMemoryInterface,
+                                                            Interface::as_raw(&src_texture)
+                                                                as MfxHDL,
+                                                        );
+                                                        import_shared_status = imported.0;
+                                                        import_shared_actual_flags = imported.1;
+                                                        if !imported.2.is_null() {
+                                                            (*imported.2).Data.TimeStamp = 90_000;
+                                                            (*imported.2).Data.FrameOrder = 2;
+                                                            let encoded = encode_one_surface(
+                                                                &api, session, imported.2,
+                                                            );
+                                                            import_shared_encode_status = encoded.0;
+                                                            import_shared_sync_status = encoded.1;
+                                                            import_shared_bytes = encoded.2;
+                                                            if !(*imported.2)
+                                                                .FrameInterface
+                                                                .is_null()
+                                                            {
+                                                                import_shared_release_status =
+                                                                    ((*(*imported.2)
+                                                                        .FrameInterface)
+                                                                        .Release)(
+                                                                        imported.2
+                                                                    );
+                                                            }
+                                                        }
+                                                    }
+
+                                                    let mut pair = MfxHDLPair {
+                                                        first: Interface::as_raw(&src_texture)
+                                                            as MfxHDL,
+                                                        second: ptr::null_mut(),
+                                                    };
+                                                    let mut external_surface =
+                                                        make_external_surface(
+                                                            &param.mfx.FrameInfo,
+                                                            &mut pair,
+                                                            request.Type,
+                                                            90_000,
+                                                        );
+                                                    let direct = encode_one_surface(
+                                                        &api,
+                                                        session,
+                                                        &mut external_surface,
+                                                    );
+                                                    external_same_device_encode_status = direct.0;
+                                                    external_same_device_sync_status = direct.1;
+                                                    external_same_device_bytes = direct.2;
+                                                }
+                                                Err(err) => {
+                                                    gpu_copy_status =
+                                                        format!("GetImmediateContext 失败: {err}");
+                                                }
+                                            }
+                                        } else {
+                                            gpu_copy_status =
+                                                "CreateTexture2D 返回空源纹理".to_owned();
+                                        }
+                                    }
+                                    Err(err) => {
+                                        gpu_copy_status =
+                                            format!("CreateTexture2D 源纹理失败: {err}");
+                                    }
+                                }
+                            } else {
+                                gpu_copy_status =
+                                    "GetDeviceHandle 返回的不是 ID3D11Device".to_owned();
+                            }
+                        }
+                    }
+
+                    if !onevpl_surface_encoded {
+                        (*surface).Data.TimeStamp = 90_000;
+                        (*surface).Data.FrameOrder = 1;
+                        let copied = encode_one_surface(&api, session, surface);
+                        onevpl_surface_encode_status = copied.0;
+                        onevpl_surface_sync_status = copied.1;
+                        onevpl_surface_bytes = copied.2;
+                    }
+                    surface_release_status = ((*frame_interface).Release)(surface);
+                }
+            }
+        }
         let close_status = if init_status >= MFX_ERR_NONE {
             (api.mfx_video_encode_close)(session)
         } else {
@@ -548,6 +926,7 @@ pub fn run_d3d11_encode_init_smoke(
             cfg_handle_type_status,
             cfg_handle_status,
             set_handle_status,
+            query_status,
             query_iosurf_status,
             init_status,
             close_status,
@@ -557,6 +936,29 @@ pub fn run_d3d11_encode_init_smoke(
             num_frame_min: request.NumFrameMin,
             num_frame_suggested: request.NumFrameSuggested,
             request_type: request.Type,
+            get_surface_status,
+            native_handle_status,
+            native_resource_type,
+            native_texture_width,
+            native_texture_height,
+            native_texture_format,
+            device_handle_status,
+            device_handle_type,
+            gpu_copy_status,
+            memory_get_interface_status,
+            import_shared_status,
+            import_shared_actual_flags,
+            import_shared_encode_status,
+            import_shared_sync_status,
+            import_shared_bytes,
+            import_shared_release_status,
+            external_same_device_encode_status,
+            external_same_device_sync_status,
+            external_same_device_bytes,
+            onevpl_surface_encode_status,
+            onevpl_surface_sync_status,
+            onevpl_surface_bytes,
+            surface_release_status,
         })
     }
 }
@@ -571,6 +973,100 @@ pub fn run_d3d11_encode_init_smoke(
         "Windows D3D11",
         "仅 Windows 可用",
     ))
+}
+
+unsafe fn make_external_surface(
+    info: &MfxFrameInfo,
+    pair: *mut MfxHDLPair,
+    mem_type: u16,
+    timestamp: u64,
+) -> MfxFrameSurface1 {
+    let mut surface: MfxFrameSurface1 = std::mem::zeroed();
+    surface.Version = MfxStructVersion {
+        version: struct_version(1, 1),
+    };
+    surface.Info = *info;
+    surface.Data.MemType = mem_type;
+    surface.Data.MemId = pair as MfxHDL;
+    surface.Data.TimeStamp = timestamp;
+    surface
+}
+
+unsafe fn import_d3d11_texture_shared(
+    memory_interface: *mut MfxMemoryInterface,
+    texture: MfxHDL,
+) -> (i32, u32, *mut MfxFrameSurface1) {
+    if memory_interface.is_null() {
+        return (MFX_ERR_NOT_IMPLEMENTED, 0, ptr::null_mut());
+    }
+
+    let mut external: MfxSurfaceD3D11Tex2D = std::mem::zeroed();
+    external.SurfaceInterface.Header.SurfaceType = MFX_SURFACE_TYPE_D3D11_TEX2D;
+    external.SurfaceInterface.Header.SurfaceFlags = MFX_SURFACE_FLAG_IMPORT_SHARED;
+    external.SurfaceInterface.Header.StructSize =
+        std::mem::size_of::<MfxSurfaceD3D11Tex2D>() as u32;
+    external.SurfaceInterface.Version = MfxStructVersion {
+        version: MFX_SURFACEINTERFACE_VERSION,
+    };
+    external.texture2D = texture;
+
+    let mut imported_surface: *mut MfxFrameSurface1 = ptr::null_mut();
+    let status = ((*memory_interface).ImportFrameSurface)(
+        memory_interface,
+        MFX_SURFACE_COMPONENT_ENCODE,
+        &mut external.SurfaceInterface.Header,
+        &mut imported_surface,
+    );
+    (
+        status,
+        external.SurfaceInterface.Header.SurfaceFlags,
+        imported_surface,
+    )
+}
+
+unsafe fn encode_one_surface(
+    api: &VplApi,
+    session: MfxSession,
+    surface: *mut MfxFrameSurface1,
+) -> (i32, i32, u32) {
+    const BITSTREAM_BYTES: usize = 128 * 1024 * 1024;
+
+    let mut storage = vec![0u8; BITSTREAM_BYTES + 31];
+    let aligned = ((storage.as_mut_ptr() as usize + 31) & !31usize) as *mut u8;
+    let mut bitstream: MfxBitstream = std::mem::zeroed();
+    bitstream.CodecId = MFX_CODEC_HEVC;
+    bitstream.Data = aligned;
+    bitstream.MaxLength = BITSTREAM_BYTES as u32;
+
+    let mut syncp: MfxSyncPoint = ptr::null_mut();
+    let mut encode_status = (api.mfx_video_encode_frame_async)(
+        session,
+        ptr::null_mut(),
+        surface,
+        &mut bitstream,
+        &mut syncp,
+    );
+
+    if encode_status == MFX_WRN_DEVICE_BUSY {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        syncp = ptr::null_mut();
+        bitstream.DataLength = 0;
+        encode_status = (api.mfx_video_encode_frame_async)(
+            session,
+            ptr::null_mut(),
+            surface,
+            &mut bitstream,
+            &mut syncp,
+        );
+    }
+
+    let sync_status = if !syncp.is_null() && encode_status >= MFX_ERR_NONE {
+        (api.mfx_video_core_sync_operation)(session, syncp, 60_000)
+    } else {
+        i32::MIN
+    };
+
+    (encode_status, sync_status, bitstream.DataLength)
 }
 
 unsafe fn set_loader_u32(api: &VplApi, loader: MfxLoader, name: *const u8, value: u32) -> i32 {
@@ -911,6 +1407,7 @@ type MfxLoader = *mut c_void;
 type MfxConfig = *mut c_void;
 type MfxSession = *mut c_void;
 type MfxHDL = *mut c_void;
+type MfxSyncPoint = *mut c_void;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -930,6 +1427,13 @@ struct MfxVariant {
     Version: MfxStructVersion,
     Type: u32,
     Data: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxHDLPair {
+    first: MfxHDL,
+    second: MfxHDL,
 }
 
 #[repr(C)]
@@ -1027,6 +1531,138 @@ struct MfxFrameAllocRequest {
     NumFrameMin: u16,
     NumFrameSuggested: u16,
     reserved2: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxFrameData {
+    ExtParam: *mut *mut c_void,
+    NumExtParam: u16,
+    reserved: [u16; 9],
+    MemType: u16,
+    PitchHigh: u16,
+    TimeStamp: u64,
+    FrameOrder: u32,
+    Locked: u16,
+    Pitch: u16,
+    Y: *mut u8,
+    UV: *mut u8,
+    V: *mut u8,
+    A: *mut u8,
+    MemId: MfxHDL,
+    Corrupted: u16,
+    DataFlag: u16,
+    reserved4: [u16; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxFrameSurface1 {
+    FrameInterface: *mut MfxFrameSurfaceInterface,
+    Version: MfxStructVersion,
+    reserved1: [u16; 3],
+    Info: MfxFrameInfo,
+    Data: MfxFrameData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MfxFrameSurfaceInterface {
+    Context: MfxHDL,
+    Version: MfxStructVersion,
+    reserved1: [u16; 3],
+    AddRef: unsafe extern "C" fn(*mut MfxFrameSurface1) -> i32,
+    Release: unsafe extern "C" fn(*mut MfxFrameSurface1) -> i32,
+    GetRefCounter: unsafe extern "C" fn(*mut MfxFrameSurface1, *mut u32) -> i32,
+    Map: unsafe extern "C" fn(*mut MfxFrameSurface1, u32) -> i32,
+    Unmap: unsafe extern "C" fn(*mut MfxFrameSurface1) -> i32,
+    GetNativeHandle: unsafe extern "C" fn(*mut MfxFrameSurface1, *mut MfxHDL, *mut u32) -> i32,
+    GetDeviceHandle: unsafe extern "C" fn(*mut MfxFrameSurface1, *mut MfxHDL, *mut u32) -> i32,
+    Synchronize: unsafe extern "C" fn(*mut MfxFrameSurface1, u32) -> i32,
+    OnComplete: unsafe extern "C" fn(i32),
+    QueryInterface: unsafe extern "C" fn(*mut MfxFrameSurface1, MfxGuid, *mut MfxHDL) -> i32,
+    reserved2: [MfxHDL; 2],
+}
+
+impl std::fmt::Debug for MfxFrameSurfaceInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfxFrameSurfaceInterface")
+            .field("Context", &self.Context)
+            .field("Version", &self.Version.version)
+            .finish_non_exhaustive()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxGuid {
+    Data: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MfxBitstream {
+    EncryptedData: *mut c_void,
+    ExtParam: *mut *mut c_void,
+    NumExtParam: u16,
+    reserved1: u16,
+    CodecId: u32,
+    DecodeTimeStamp: i64,
+    TimeStamp: u64,
+    Data: *mut u8,
+    DataOffset: u32,
+    DataLength: u32,
+    MaxLength: u32,
+    PicStruct: u16,
+    FrameType: u16,
+    DataFlag: u16,
+    reserved2: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MfxSurfaceHeader {
+    SurfaceType: u32,
+    SurfaceFlags: u32,
+    StructSize: u32,
+    NumExtParam: u16,
+    ExtParam: *mut *mut c_void,
+    reserved: [u32; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MfxSurfaceInterface {
+    Header: MfxSurfaceHeader,
+    Version: MfxStructVersion,
+    Context: MfxHDL,
+    AddRef: Option<unsafe extern "C" fn(*mut MfxSurfaceInterface) -> i32>,
+    Release: Option<unsafe extern "C" fn(*mut MfxSurfaceInterface) -> i32>,
+    GetRefCounter: Option<unsafe extern "C" fn(*mut MfxSurfaceInterface, *mut u32) -> i32>,
+    Synchronize: Option<unsafe extern "C" fn(*mut MfxSurfaceInterface, u32) -> i32>,
+    reserved: [MfxHDL; 11],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MfxSurfaceD3D11Tex2D {
+    SurfaceInterface: MfxSurfaceInterface,
+    texture2D: MfxHDL,
+    reserved: [MfxHDL; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MfxMemoryInterface {
+    Context: MfxHDL,
+    Version: MfxStructVersion,
+    ImportFrameSurface: unsafe extern "C" fn(
+        *mut MfxMemoryInterface,
+        u32,
+        *mut MfxSurfaceHeader,
+        *mut *mut MfxFrameSurface1,
+    ) -> i32,
+    reserved: [MfxHDL; 16],
 }
 
 #[repr(C)]
@@ -1190,6 +1826,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<MfxFrameInfo>(), 68);
         assert_eq!(std::mem::size_of::<MfxInfoMFX>(), 136);
         assert_eq!(std::mem::size_of::<MfxVideoParam>(), 208);
+        assert_eq!(std::mem::size_of::<MfxBitstream>(), 72);
+        assert_eq!(std::mem::size_of::<MfxFrameData>(), 96);
+        assert_eq!(std::mem::size_of::<MfxFrameSurface1>(), 184);
+        assert_eq!(std::mem::size_of::<MfxSurfaceHeader>(), 48);
+        assert_eq!(std::mem::size_of::<MfxSurfaceInterface>(), 184);
+        assert_eq!(std::mem::size_of::<MfxSurfaceD3D11Tex2D>(), 248);
+        assert_eq!(std::mem::size_of::<MfxMemoryInterface>(), 152);
     }
 
     #[test]
