@@ -75,8 +75,15 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
                 config: cfg.clone(),
             };
             eprintln!("{}", serde_json::to_string_pretty(&request)?);
-            backend::debug_record_once(&cfg, &caps, &options.output, options.duration_seconds)
-                .with_context(|| "生产后端 debug record 失败")?;
+            let report = backend::debug_record_once(
+                &cfg,
+                &caps,
+                &options.output,
+                options.duration_seconds,
+                options.adapter_index,
+            )
+            .with_context(|| "生产后端 debug record 失败")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())

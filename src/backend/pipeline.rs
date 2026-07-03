@@ -2,8 +2,8 @@
 //! 录制流水线契约。
 //!
 //! 本文件定义 DDA/WGC、GPU 色彩转换、色度写入、oneVPL 编码、WASAPI/AAC、MP4
-//! 封装之间的 Rust 侧接口。当前构建在无法证明 zero-copy D3D11 import 前不会创建
-//! 真实会话，避免引入任何 CPU raw frame 回退。
+//! 封装之间的 Rust 侧接口。当前成品路径允许一次 GPU CopyResource 送入 oneVPL
+//! 内部分配 surface，但仍禁止任何 raw frame CPU 回读/Map/Staging 回退。
 
 use super::ProbeCaps;
 use crate::config::ChromaSampling;
@@ -92,7 +92,7 @@ pub fn unsupported_until_zero_copy_verified(request: &RecordingRequest) -> Backe
             request.chroma_writer,
             request.rate_control.method
         ),
-        "尚未完成 shared D3D11 surface import 实测；按文档要求禁止创建会话或改用 CPU 回退",
+        "该参数组合尚未完成一拷贝 GPU-only 路径实装；禁止创建会话或改用 CPU 回退",
     )
 }
 
@@ -101,8 +101,8 @@ pub fn record_once_gpu_only(
     caps: &ProbeCaps,
     output: &Path,
     duration_seconds: f32,
-) -> Result<(), BackendError> {
-    let _ = (output, duration_seconds);
+    adapter_index: u32,
+) -> Result<super::vpl::VplOneCopyRecordReport, BackendError> {
     if !caps.d3d11_texture_input_supported {
         return Err(BackendError::unsupported(
             "oneVPL 编码",
@@ -110,5 +110,17 @@ pub fn record_once_gpu_only(
             "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
         ));
     }
-    Err(unsupported_until_zero_copy_verified(request))
+    if request.chroma_writer != ChromaWriterKind::P010 {
+        return Err(BackendError::unsupported(
+            "录制流水线",
+            format!("{:?}", request.chroma_writer),
+            "当前一拷贝生产路径只成品化了 420/P010；422/444 字段继续隐藏",
+        ));
+    }
+    super::vpl::record_d3d11_onecopy_mp4(
+        adapter_index,
+        output,
+        duration_seconds,
+        request.rate_control.method,
+    )
 }

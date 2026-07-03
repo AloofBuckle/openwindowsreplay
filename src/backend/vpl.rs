@@ -12,7 +12,7 @@ use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 const MFX_ERR_NONE: i32 = 0;
@@ -40,6 +40,7 @@ const MFX_SURFACE_TYPE_D3D11_TEX2D: u32 = 2;
 const MFX_SURFACE_FLAG_IMPORT_SHARED: u32 = 0x0010;
 const MFX_SURFACE_COMPONENT_ENCODE: u32 = 1;
 const MFX_SURFACEINTERFACE_VERSION: u16 = struct_version(1, 0);
+const VIDEO_CLOCK_HZ: u64 = 90_000;
 
 const MFX_CODEC_HEVC: u32 = make_fourcc(b'H', b'E', b'V', b'C');
 const MFX_FOURCC_NV12: u32 = make_fourcc(b'N', b'V', b'1', b'2');
@@ -460,6 +461,29 @@ pub struct VplD3d11EncodeInitSmoke {
     pub onevpl_surface_sync_status: i32,
     pub onevpl_surface_bytes: u32,
     pub surface_release_status: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VplOneCopyRecordReport {
+    pub adapter_index: u32,
+    pub adapter_luid: String,
+    pub output_path: String,
+    pub width: u16,
+    pub height: u16,
+    pub duration_seconds: f32,
+    pub captured_frames: u32,
+    pub encoded_samples: u32,
+    pub encoded_bytes: u64,
+    pub dda_timeouts: u32,
+    pub input_dxgi_format: u32,
+    pub target_dxgi_format: u32,
+    pub query_status: i32,
+    pub init_status: i32,
+    pub close_status: i32,
+    pub first_get_surface_status: i32,
+    pub video_processor_format_flags_in: u32,
+    pub video_processor_format_flags_out: u32,
+    pub notes: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -975,6 +999,526 @@ pub fn run_d3d11_encode_init_smoke(
     ))
 }
 
+#[cfg(windows)]
+pub fn record_d3d11_onecopy_mp4(
+    adapter_index: u32,
+    output: &Path,
+    duration_seconds: f32,
+    rate_control: RateControlMethod,
+) -> Result<VplOneCopyRecordReport, BackendError> {
+    use crate::backend::mp4_mux::{HevcAccessUnit, HevcMp4Track, write_hevc_mp4};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_TEXTURE2D_DESC, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+        D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
+        ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_P010, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_RATIONAL,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIFactory1,
+        IDXGIResource,
+    };
+    use windows::core::Interface;
+
+    let (api, dll_path) =
+        VplApi::load().map_err(|err| BackendError::unsupported("oneVPL", "DLL", err))?;
+    let mut notes = vec![format!("oneVPL DLL: {}", dll_path.display())];
+
+    unsafe {
+        let factory: IDXGIFactory1 =
+            CreateDXGIFactory1().map_err(|err| BackendError::WindowsApi {
+                func: "CreateDXGIFactory1",
+                message: err.to_string(),
+            })?;
+        let adapter1 =
+            factory
+                .EnumAdapters1(adapter_index)
+                .map_err(|err| BackendError::WindowsApi {
+                    func: "IDXGIFactory1::EnumAdapters1",
+                    message: err.to_string(),
+                })?;
+        let desc = adapter1
+            .GetDesc1()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "IDXGIAdapter1::GetDesc1",
+                message: err.to_string(),
+            })?;
+        let adapter_luid = format!(
+            "{:08X}:{:08X}",
+            desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
+        );
+        let output0 = adapter1
+            .EnumOutputs(0)
+            .map_err(|err| BackendError::WindowsApi {
+                func: "IDXGIAdapter1::EnumOutputs(0)",
+                message: err.to_string(),
+            })?;
+        let output_desc = output0.GetDesc().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput::GetDesc",
+            message: err.to_string(),
+        })?;
+        let capture_width = (output_desc.DesktopCoordinates.right
+            - output_desc.DesktopCoordinates.left)
+            .max(1) as u16;
+        let capture_height = (output_desc.DesktopCoordinates.bottom
+            - output_desc.DesktopCoordinates.top)
+            .max(1) as u16;
+        let aligned_width = align16(capture_width);
+        let aligned_height = align16(capture_height);
+
+        let loader = (api.mfx_load)();
+        if loader.is_null() {
+            return Err(BackendError::unsupported(
+                "oneVPL record",
+                "MFXLoad",
+                "返回空 loader",
+            ));
+        }
+        let mut session: MfxSession = ptr::null_mut();
+        let create_status = (api.mfx_create_session)(loader, 0, &mut session);
+        if create_status != MFX_ERR_NONE || session.is_null() {
+            (api.mfx_unload)(loader);
+            return Err(BackendError::VplStatus {
+                func: "MFXCreateSession",
+                status: create_status,
+            });
+        }
+
+        let mut param = make_query_param(
+            rate_control,
+            MFX_FOURCC_P010,
+            1,
+            10,
+            MFX_PROFILE_HEVC_MAIN10 as u16,
+        );
+        param.AsyncDepth = 1;
+        param.mfx.FrameInfo.Width = aligned_width;
+        param.mfx.FrameInfo.Height = aligned_height;
+        param.mfx.FrameInfo.CropW = capture_width;
+        param.mfx.FrameInfo.CropH = capture_height;
+        param.mfx.FrameInfo.FrameRateExtN = 60;
+        param.mfx.FrameInfo.FrameRateExtD = 1;
+        param.mfx.TargetKbps = 20_000;
+        param.mfx.BufferSizeInKB = 40_000;
+        param.mfx.GopPicSize = 60;
+        param.mfx.GopRefDist = 1;
+        param.mfx.IdrInterval = 1;
+
+        let mut queried = param;
+        let query_status = (api.mfx_video_encode_query)(session, &mut param, &mut queried);
+        if query_status >= MFX_ERR_NONE {
+            param = queried;
+        }
+        let init_status = (api.mfx_video_encode_init)(session, &mut param);
+        if init_status < MFX_ERR_NONE {
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::VplStatus {
+                func: "MFXVideoENCODE_Init",
+                status: init_status,
+            });
+        }
+
+        let mut first_surface: *mut MfxFrameSurface1 = ptr::null_mut();
+        let first_get_surface_status =
+            (api.mfx_memory_get_surface_for_encode)(session, &mut first_surface);
+        if first_get_surface_status != MFX_ERR_NONE || first_surface.is_null() {
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::VplStatus {
+                func: "MFXMemory_GetSurfaceForEncode",
+                status: first_get_surface_status,
+            });
+        }
+
+        let first_interface = (*first_surface).FrameInterface;
+        if first_interface.is_null() {
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::unsupported(
+                "oneVPL record",
+                "FrameInterface",
+                "oneVPL surface 没有 FrameInterface",
+            ));
+        }
+        let mut first_native: MfxHDL = ptr::null_mut();
+        let mut first_native_type = 0u32;
+        let native_status = ((*first_interface).GetNativeHandle)(
+            first_surface,
+            &mut first_native,
+            &mut first_native_type,
+        );
+        if native_status != MFX_ERR_NONE || first_native_type != MFX_RESOURCE_DX11_TEXTURE {
+            let _ = ((*first_interface).Release)(first_surface);
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::VplStatus {
+                func: "mfxFrameSurfaceInterface::GetNativeHandle",
+                status: native_status,
+            });
+        }
+        let Some(first_target) = <ID3D11Texture2D as Interface>::from_raw_borrowed(&first_native)
+        else {
+            let _ = ((*first_interface).Release)(first_surface);
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::unsupported(
+                "oneVPL record",
+                "native texture",
+                "GetNativeHandle 返回值不是 ID3D11Texture2D",
+            ));
+        };
+        let mut target_desc = D3D11_TEXTURE2D_DESC::default();
+        first_target.GetDesc(&mut target_desc);
+
+        let mut device_handle: MfxHDL = ptr::null_mut();
+        let mut device_type = 0u32;
+        let device_status = ((*first_interface).GetDeviceHandle)(
+            first_surface,
+            &mut device_handle,
+            &mut device_type,
+        );
+        if device_status != MFX_ERR_NONE || device_type != MFX_HANDLE_D3D11_DEVICE {
+            let _ = ((*first_interface).Release)(first_surface);
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::VplStatus {
+                func: "mfxFrameSurfaceInterface::GetDeviceHandle",
+                status: device_status,
+            });
+        }
+        let Some(vpl_device) = <ID3D11Device as Interface>::from_raw_borrowed(&device_handle)
+        else {
+            let _ = ((*first_interface).Release)(first_surface);
+            let _ = (api.mfx_video_encode_close)(session);
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::unsupported(
+                "oneVPL record",
+                "device handle",
+                "GetDeviceHandle 返回值不是 ID3D11Device",
+            ));
+        };
+
+        let duplication = create_duplication_on_device(&adapter1, vpl_device)?;
+        let video_device: ID3D11VideoDevice =
+            vpl_device.cast().map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::cast<ID3D11VideoDevice>",
+                message: err.to_string(),
+            })?;
+        let immediate: ID3D11DeviceContext =
+            vpl_device
+                .GetImmediateContext()
+                .map_err(|err| BackendError::WindowsApi {
+                    func: "ID3D11Device::GetImmediateContext",
+                    message: err.to_string(),
+                })?;
+        let video_context: ID3D11VideoContext =
+            immediate.cast().map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11DeviceContext::cast<ID3D11VideoContext>",
+                message: err.to_string(),
+            })?;
+        let p010_intermediate = create_p010_intermediate(vpl_device, &target_desc)?;
+
+        let start = Instant::now();
+        let end_at = start + Duration::from_secs_f32(duration_seconds.max(0.1));
+        let mut samples = Vec::new();
+        let mut captured_frames = 0u32;
+        let mut dda_timeouts = 0u32;
+        let mut input_dxgi_format = 0u32;
+        let mut video_processor: Option<ID3D11VideoProcessor> = None;
+        let mut enumerator: Option<ID3D11VideoProcessorEnumerator> = None;
+        let mut rgba_converter: Option<GpuRgbaConverter> = None;
+        let mut format_flags_in = 0u32;
+        let mut format_flags_out = 0u32;
+        let mut pending_surface = Some(first_surface);
+
+        while Instant::now() < end_at || samples.is_empty() {
+            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            match duplication.AcquireNextFrame(100, &mut frame_info, &mut resource) {
+                Ok(()) => {}
+                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    dda_timeouts += 1;
+                    if Instant::now() >= end_at && !samples.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    release_pending_surface(pending_surface.take());
+                    let _ = (api.mfx_video_encode_close)(session);
+                    let _ = (api.mfx_close)(session);
+                    (api.mfx_unload)(loader);
+                    return Err(BackendError::WindowsApi {
+                        func: "IDXGIOutputDuplication::AcquireNextFrame",
+                        message: err.to_string(),
+                    });
+                }
+            }
+
+            let frame_result = (|| -> Result<(), BackendError> {
+                let resource = resource.ok_or_else(|| BackendError::WindowsApi {
+                    func: "AcquireNextFrame",
+                    message: "返回空 IDXGIResource".to_owned(),
+                })?;
+                let source: ID3D11Texture2D =
+                    resource.cast().map_err(|err| BackendError::WindowsApi {
+                        func: "IDXGIResource::cast<ID3D11Texture2D>",
+                        message: err.to_string(),
+                    })?;
+                let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+                source.GetDesc(&mut source_desc);
+                if input_dxgi_format == 0 {
+                    input_dxgi_format = source_desc.Format.0 as u32;
+                }
+
+                if video_processor.is_none() || enumerator.is_none() {
+                    let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                        InputFrameRate: DXGI_RATIONAL {
+                            Numerator: 60,
+                            Denominator: 1,
+                        },
+                        InputWidth: source_desc.Width,
+                        InputHeight: source_desc.Height,
+                        OutputFrameRate: DXGI_RATIONAL {
+                            Numerator: 60,
+                            Denominator: 1,
+                        },
+                        OutputWidth: target_desc.Width,
+                        OutputHeight: target_desc.Height,
+                        Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+                    };
+                    let new_enum = video_device
+                        .CreateVideoProcessorEnumerator(&content_desc)
+                        .map_err(|err| BackendError::WindowsApi {
+                            func: "ID3D11VideoDevice::CreateVideoProcessorEnumerator",
+                            message: err.to_string(),
+                        })?;
+                    format_flags_in = new_enum
+                        .CheckVideoProcessorFormat(source_desc.Format)
+                        .map_err(|err| BackendError::WindowsApi {
+                            func: "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(input)",
+                            message: err.to_string(),
+                        })?;
+                    format_flags_out = new_enum
+                        .CheckVideoProcessorFormat(DXGI_FORMAT_P010)
+                        .map_err(|err| BackendError::WindowsApi {
+                            func: "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(P010)",
+                            message: err.to_string(),
+                        })?;
+                    if (format_flags_in & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32) == 0
+                    {
+                        let rgba_flags = new_enum
+                            .CheckVideoProcessorFormat(DXGI_FORMAT_R8G8B8A8_UNORM)
+                            .map_err(|err| BackendError::WindowsApi {
+                                func: "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(RGBA8)",
+                                message: err.to_string(),
+                            })?;
+                        if (rgba_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32) == 0 {
+                            return Err(BackendError::unsupported(
+                                "D3D11 VideoProcessor",
+                                format!(
+                                    "输入 DXGI_FORMAT({}) 或 RGBA8 中间纹理",
+                                    source_desc.Format.0
+                                ),
+                                "驱动既不支持原始输入，也不支持 RGBA8 input",
+                            ));
+                        }
+                        format_flags_in = rgba_flags;
+                        rgba_converter = Some(GpuRgbaConverter::new(
+                            vpl_device,
+                            &immediate,
+                            source_desc.Width,
+                            source_desc.Height,
+                        )?);
+                        notes.push(format!(
+                            "DDA 输入 DXGI_FORMAT({}) 不被 VideoProcessor 直接接受，已启用 GPU shader -> RGBA8 中间纹理",
+                            source_desc.Format.0
+                        ));
+                    }
+                    if (format_flags_out & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32)
+                        == 0
+                    {
+                        return Err(BackendError::unsupported(
+                            "D3D11 VideoProcessor",
+                            "P010 输出",
+                            "驱动未报告 VideoProcessor P010 output 支持",
+                        ));
+                    }
+                    let new_processor =
+                        video_device
+                            .CreateVideoProcessor(&new_enum, 0)
+                            .map_err(|err| BackendError::WindowsApi {
+                                func: "ID3D11VideoDevice::CreateVideoProcessor",
+                                message: err.to_string(),
+                            })?;
+                    enumerator = Some(new_enum);
+                    video_processor = Some(new_processor);
+                }
+
+                let surface = if let Some(surface) = pending_surface.take() {
+                    surface
+                } else {
+                    let mut next_surface: *mut MfxFrameSurface1 = ptr::null_mut();
+                    let status =
+                        (api.mfx_memory_get_surface_for_encode)(session, &mut next_surface);
+                    if status != MFX_ERR_NONE || next_surface.is_null() {
+                        return Err(BackendError::VplStatus {
+                            func: "MFXMemory_GetSurfaceForEncode",
+                            status,
+                        });
+                    }
+                    next_surface
+                };
+
+                let frame_interface = (*surface).FrameInterface;
+                let mut native: MfxHDL = ptr::null_mut();
+                let mut native_type = 0u32;
+                let status =
+                    ((*frame_interface).GetNativeHandle)(surface, &mut native, &mut native_type);
+                if status != MFX_ERR_NONE || native_type != MFX_RESOURCE_DX11_TEXTURE {
+                    let _ = ((*frame_interface).Release)(surface);
+                    return Err(BackendError::VplStatus {
+                        func: "mfxFrameSurfaceInterface::GetNativeHandle",
+                        status,
+                    });
+                }
+                let Some(target) = <ID3D11Texture2D as Interface>::from_raw_borrowed(&native)
+                else {
+                    let _ = ((*frame_interface).Release)(surface);
+                    return Err(BackendError::unsupported(
+                        "oneVPL record",
+                        "native texture",
+                        "GetNativeHandle 返回值不是 ID3D11Texture2D",
+                    ));
+                };
+
+                let vp_source = if let Some(converter) = &rgba_converter {
+                    converter.convert(&source)?
+                } else {
+                    source.clone()
+                };
+
+                process_with_video_processor(
+                    &video_device,
+                    &video_context,
+                    enumerator.as_ref().expect("enumerator initialized"),
+                    video_processor.as_ref().expect("processor initialized"),
+                    &vp_source,
+                    &p010_intermediate,
+                )?;
+                copy_texture_resource(&immediate, &p010_intermediate, target)?;
+
+                let elapsed = Instant::now().saturating_duration_since(start);
+                let ts90 = duration_to_90k(elapsed);
+                (*surface).Data.TimeStamp = ts90;
+                (*surface).Data.FrameOrder = captured_frames;
+                let encoded = encode_surface_bytes(&api, session, surface)?;
+                let release_status = ((*frame_interface).Release)(surface);
+                if release_status != MFX_ERR_NONE {
+                    return Err(BackendError::VplStatus {
+                        func: "mfxFrameSurfaceInterface::Release",
+                        status: release_status,
+                    });
+                }
+                if !encoded.bytes.is_empty() {
+                    samples.push(HevcAccessUnit {
+                        timestamp_90k: if samples.is_empty() { 0 } else { ts90 },
+                        data: encoded.bytes,
+                        is_sync: captured_frames == 0,
+                    });
+                }
+                captured_frames += 1;
+                Ok(())
+            })();
+
+            duplication
+                .ReleaseFrame()
+                .map_err(|err| BackendError::WindowsApi {
+                    func: "IDXGIOutputDuplication::ReleaseFrame",
+                    message: err.to_string(),
+                })?;
+            frame_result?;
+        }
+
+        let duration_90k = duration_to_90k(start.elapsed())
+            .max((duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64);
+        flush_encoder(&api, session, &mut samples, duration_90k)?;
+        let close_status = (api.mfx_video_encode_close)(session);
+        let mfx_close_status = (api.mfx_close)(session);
+        (api.mfx_unload)(loader);
+        if mfx_close_status != MFX_ERR_NONE {
+            return Err(BackendError::VplStatus {
+                func: "MFXClose",
+                status: mfx_close_status,
+            });
+        }
+
+        let encoded_samples = samples.len() as u32;
+        let encoded_bytes = samples.iter().map(|s| s.data.len() as u64).sum();
+        write_hevc_mp4(
+            output,
+            &HevcMp4Track {
+                width: capture_width,
+                height: capture_height,
+                duration_90k,
+                samples,
+            },
+        )?;
+
+        notes.push("视频路径为 DDA texture -> GPU shader(必要时RGBA8) -> D3D11 VideoProcessor(P010中间纹理) -> 一次 CopyResource 到 oneVPL surface -> HEVC -> MP4；未做 raw frame CPU 回读".to_owned());
+        notes.push("当前成品先完成视频轨；音频/WASAPI+AAC 仍需下一轮接入".to_owned());
+
+        Ok(VplOneCopyRecordReport {
+            adapter_index,
+            adapter_luid,
+            output_path: output.display().to_string(),
+            width: capture_width,
+            height: capture_height,
+            duration_seconds,
+            captured_frames,
+            encoded_samples,
+            encoded_bytes,
+            dda_timeouts,
+            input_dxgi_format,
+            target_dxgi_format: target_desc.Format.0 as u32,
+            query_status,
+            init_status,
+            close_status,
+            first_get_surface_status,
+            video_processor_format_flags_in: format_flags_in,
+            video_processor_format_flags_out: format_flags_out,
+            notes,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn record_d3d11_onecopy_mp4(
+    adapter_index: u32,
+    output: &Path,
+    duration_seconds: f32,
+    rate_control: RateControlMethod,
+) -> Result<VplOneCopyRecordReport, BackendError> {
+    let _ = (adapter_index, output, duration_seconds, rate_control);
+    Err(BackendError::unsupported(
+        "oneVPL D3D11 one-copy record",
+        "Windows D3D11",
+        "仅 Windows 可用",
+    ))
+}
+
 unsafe fn make_external_surface(
     info: &MfxFrameInfo,
     pair: *mut MfxHDLPair,
@@ -1022,6 +1566,542 @@ unsafe fn import_d3d11_texture_shared(
         external.SurfaceInterface.Header.SurfaceFlags,
         imported_surface,
     )
+}
+
+#[derive(Debug)]
+struct EncodedSurfaceBytes {
+    encode_status: i32,
+    sync_status: i32,
+    bytes: Vec<u8>,
+}
+
+unsafe fn encode_surface_bytes(
+    api: &VplApi,
+    session: MfxSession,
+    surface: *mut MfxFrameSurface1,
+) -> Result<EncodedSurfaceBytes, BackendError> {
+    encode_surface_or_flush_bytes(api, session, surface)
+}
+
+unsafe fn encode_surface_or_flush_bytes(
+    api: &VplApi,
+    session: MfxSession,
+    surface: *mut MfxFrameSurface1,
+) -> Result<EncodedSurfaceBytes, BackendError> {
+    const BITSTREAM_BYTES: usize = 128 * 1024 * 1024;
+
+    let mut storage = vec![0u8; BITSTREAM_BYTES + 31];
+    let aligned_offset = (32 - (storage.as_ptr() as usize & 31)) & 31;
+    let aligned = storage.as_mut_ptr().add(aligned_offset);
+    let mut bitstream: MfxBitstream = std::mem::zeroed();
+    bitstream.CodecId = MFX_CODEC_HEVC;
+    bitstream.Data = aligned;
+    bitstream.MaxLength = BITSTREAM_BYTES as u32;
+
+    let mut syncp: MfxSyncPoint = ptr::null_mut();
+    let mut encode_status = (api.mfx_video_encode_frame_async)(
+        session,
+        ptr::null_mut(),
+        surface,
+        &mut bitstream,
+        &mut syncp,
+    );
+    let mut busy_retries = 0u32;
+    while encode_status == MFX_WRN_DEVICE_BUSY && busy_retries < 50 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        syncp = ptr::null_mut();
+        bitstream.DataLength = 0;
+        bitstream.DataOffset = 0;
+        encode_status = (api.mfx_video_encode_frame_async)(
+            session,
+            ptr::null_mut(),
+            surface,
+            &mut bitstream,
+            &mut syncp,
+        );
+        busy_retries += 1;
+    }
+
+    if matches!(encode_status, MFX_ERR_MORE_DATA | MFX_ERR_MORE_SURFACE) {
+        return Ok(EncodedSurfaceBytes {
+            encode_status,
+            sync_status: i32::MIN,
+            bytes: Vec::new(),
+        });
+    }
+    if encode_status < MFX_ERR_NONE {
+        return Err(BackendError::VplStatus {
+            func: "MFXVideoENCODE_EncodeFrameAsync",
+            status: encode_status,
+        });
+    }
+
+    let sync_status = if !syncp.is_null() {
+        (api.mfx_video_core_sync_operation)(session, syncp, 60_000)
+    } else {
+        i32::MIN
+    };
+    if sync_status < MFX_ERR_NONE && sync_status != i32::MIN {
+        return Err(BackendError::VplStatus {
+            func: "MFXVideoCORE_SyncOperation",
+            status: sync_status,
+        });
+    }
+
+    let start = bitstream.Data.add(bitstream.DataOffset as usize);
+    let len = bitstream.DataLength as usize;
+    let bytes = if len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(start, len).to_vec()
+    };
+    Ok(EncodedSurfaceBytes {
+        encode_status,
+        sync_status,
+        bytes,
+    })
+}
+
+unsafe fn flush_encoder(
+    api: &VplApi,
+    session: MfxSession,
+    samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
+    duration_90k: u64,
+) -> Result<(), BackendError> {
+    loop {
+        let encoded = encode_surface_or_flush_bytes(api, session, ptr::null_mut())?;
+        if encoded.encode_status == MFX_ERR_MORE_DATA {
+            break;
+        }
+        if !encoded.bytes.is_empty() {
+            samples.push(crate::backend::mp4_mux::HevcAccessUnit {
+                timestamp_90k: duration_90k.saturating_sub(1),
+                data: encoded.bytes,
+                is_sync: false,
+            });
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn create_duplication_on_device(
+    adapter1: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+) -> Result<windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication, BackendError> {
+    use windows::Win32::Graphics::Dxgi::IDXGIOutput1;
+    use windows::core::Interface;
+
+    let output = adapter1
+        .EnumOutputs(0)
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIAdapter1::EnumOutputs(0)",
+            message: err.to_string(),
+        })?;
+    let output1: IDXGIOutput1 = output.cast().map_err(|err| BackendError::WindowsApi {
+        func: "IDXGIOutput::cast<IDXGIOutput1>",
+        message: err.to_string(),
+    })?;
+    output1
+        .DuplicateOutput(device)
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput1::DuplicateOutput(oneVPL device)",
+            message: err.to_string(),
+        })
+}
+
+#[cfg(windows)]
+unsafe fn create_p010_intermediate(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    target_desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, BackendError> {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010;
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: target_desc.Width,
+        Height: target_desc.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_P010,
+        SampleDesc: target_desc.SampleDesc,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    device
+        .CreateTexture2D(&desc, None, Some(&mut texture))
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::CreateTexture2D(P010 intermediate)",
+            message: err.to_string(),
+        })?;
+    texture.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateTexture2D(P010 intermediate)",
+        message: "返回空纹理".to_owned(),
+    })
+}
+
+#[cfg(windows)]
+unsafe fn copy_texture_resource(
+    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    target: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+) -> Result<(), BackendError> {
+    use windows::Win32::Graphics::Direct3D11::ID3D11Resource;
+    use windows::core::Interface;
+
+    let src_resource: ID3D11Resource = source.cast().map_err(|err| BackendError::WindowsApi {
+        func: "ID3D11Texture2D::cast<ID3D11Resource>(copy source)",
+        message: err.to_string(),
+    })?;
+    let dst_resource: ID3D11Resource = target.cast().map_err(|err| BackendError::WindowsApi {
+        func: "ID3D11Texture2D::cast<ID3D11Resource>(copy target)",
+        message: err.to_string(),
+    })?;
+    context.CopyResource(&dst_resource, &src_resource);
+    context.Flush();
+    Ok(())
+}
+
+#[cfg(windows)]
+struct GpuRgbaConverter {
+    device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    output: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    render_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    vertex_shader: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
+    pixel_shader: windows::Win32::Graphics::Direct3D11::ID3D11PixelShader,
+    viewport: windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT,
+}
+
+#[cfg(windows)]
+impl GpuRgbaConverter {
+    unsafe fn new(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, BackendError> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+            D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width.max(1),
+            Height: height.max(1),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut output = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut output))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreateTexture2D(RGBA converter)",
+                message: err.to_string(),
+            })?;
+        let output = output.ok_or_else(|| BackendError::WindowsApi {
+            func: "CreateTexture2D(RGBA converter)",
+            message: "返回空纹理".to_owned(),
+        })?;
+        let mut render_target = None;
+        device
+            .CreateRenderTargetView(&output, None, Some(&mut render_target))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreateRenderTargetView(RGBA converter)",
+                message: err.to_string(),
+            })?;
+        let render_target = render_target.ok_or_else(|| BackendError::WindowsApi {
+            func: "CreateRenderTargetView(RGBA converter)",
+            message: "返回空 RTV".to_owned(),
+        })?;
+
+        let vs_blob = compile_shader(RGBA_CONVERT_HLSL, b"vs_main\0", b"vs_5_0\0")?;
+        let ps_blob = compile_shader(RGBA_CONVERT_HLSL, b"ps_main\0", b"ps_5_0\0")?;
+        let mut vertex_shader = None;
+        device
+            .CreateVertexShader(&vs_blob, None, Some(&mut vertex_shader))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreateVertexShader(RGBA converter)",
+                message: err.to_string(),
+            })?;
+        let mut pixel_shader = None;
+        device
+            .CreatePixelShader(&ps_blob, None, Some(&mut pixel_shader))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreatePixelShader(RGBA converter)",
+                message: err.to_string(),
+            })?;
+
+        Ok(Self {
+            device: device.clone(),
+            context: context.clone(),
+            output,
+            render_target,
+            vertex_shader: vertex_shader.ok_or_else(|| BackendError::WindowsApi {
+                func: "CreateVertexShader(RGBA converter)",
+                message: "返回空 VS".to_owned(),
+            })?,
+            pixel_shader: pixel_shader.ok_or_else(|| BackendError::WindowsApi {
+                func: "CreatePixelShader(RGBA converter)",
+                message: "返回空 PS".to_owned(),
+            })?,
+            viewport: windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            },
+        })
+    }
+
+    unsafe fn convert(
+        &self,
+        source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, BackendError> {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11RenderTargetView, ID3D11Resource, ID3D11ShaderResourceView,
+        };
+        use windows::core::Interface;
+
+        let source_resource: ID3D11Resource =
+            source.cast().map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Texture2D::cast<ID3D11Resource>(RGBA source)",
+                message: err.to_string(),
+            })?;
+        let mut srv = None;
+        self.device
+            .CreateShaderResourceView(&source_resource, None, Some(&mut srv))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreateShaderResourceView(RGBA source)",
+                message: err.to_string(),
+            })?;
+        let srv = srv.ok_or_else(|| BackendError::WindowsApi {
+            func: "CreateShaderResourceView(RGBA source)",
+            message: "返回空 SRV".to_owned(),
+        })?;
+
+        self.context.RSSetViewports(Some(&[self.viewport]));
+        self.context
+            .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        self.context.VSSetShader(&self.vertex_shader, None);
+        self.context.PSSetShader(&self.pixel_shader, None);
+        self.context.PSSetShaderResources(0, Some(&[Some(srv)]));
+        self.context
+            .OMSetRenderTargets(Some(&[Some(self.render_target.clone())]), None);
+        self.context.Draw(3, 0);
+        let empty_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
+        self.context.PSSetShaderResources(0, Some(&empty_srv));
+        let empty_rtv: [Option<ID3D11RenderTargetView>; 1] = [None];
+        self.context.OMSetRenderTargets(Some(&empty_rtv), None);
+        self.context.Flush();
+        Ok(self.output.clone())
+    }
+}
+
+#[cfg(windows)]
+const RGBA_CONVERT_HLSL: &str = r#"
+Texture2D<float4> src_tex : register(t0);
+
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 pos[3] = {
+        float2(-1.0,  1.0),
+        float2( 3.0,  1.0),
+        float2(-1.0, -3.0)
+    };
+    return float4(pos[id], 0.0, 1.0);
+}
+
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    return saturate(src_tex.Load(int3(uint2(pos.xy), 0)));
+}
+"#;
+
+#[cfg(windows)]
+unsafe fn compile_shader(
+    source: &str,
+    entry: &[u8],
+    target: &[u8],
+) -> Result<Vec<u8>, BackendError> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
+    use windows::core::PCSTR;
+
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    let result = D3DCompile(
+        source.as_ptr() as *const c_void,
+        source.len(),
+        PCSTR::null(),
+        None,
+        Option::<&ID3DInclude>::None,
+        PCSTR(entry.as_ptr()),
+        PCSTR(target.as_ptr()),
+        0,
+        0,
+        &mut code,
+        Some(&mut errors),
+    );
+    if let Err(err) = result {
+        let message = if let Some(errors) = errors {
+            let ptr = errors.GetBufferPointer() as *const u8;
+            let len = errors.GetBufferSize();
+            String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).to_string()
+        } else {
+            err.to_string()
+        };
+        return Err(BackendError::WindowsApi {
+            func: "D3DCompile",
+            message,
+        });
+    }
+    let code = code.ok_or_else(|| BackendError::WindowsApi {
+        func: "D3DCompile",
+        message: "返回空 shader blob".to_owned(),
+    })?;
+    let ptr = code.GetBufferPointer() as *const u8;
+    let len = code.GetBufferSize();
+    Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+}
+
+#[cfg(windows)]
+unsafe fn process_with_video_processor(
+    video_device: &windows::Win32::Graphics::Direct3D11::ID3D11VideoDevice,
+    video_context: &windows::Win32::Graphics::Direct3D11::ID3D11VideoContext,
+    enumerator: &windows::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator,
+    processor: &windows::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,
+    source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    target: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+) -> Result<(), BackendError> {
+    use std::mem::ManuallyDrop;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Resource,
+        ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+    };
+    use windows::core::Interface;
+
+    let source_resource: ID3D11Resource =
+        source.cast().map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Texture2D::cast<ID3D11Resource>(source)",
+            message: err.to_string(),
+        })?;
+    let target_resource: ID3D11Resource =
+        target.cast().map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Texture2D::cast<ID3D11Resource>(target)",
+            message: err.to_string(),
+        })?;
+
+    let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+        FourCC: 0,
+        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_VPIV {
+                MipSlice: 0,
+                ArraySlice: 0,
+            },
+        },
+    };
+    let mut input_view: Option<ID3D11VideoProcessorInputView> = None;
+    video_device
+        .CreateVideoProcessorInputView(
+            &source_resource,
+            enumerator,
+            &input_desc,
+            Some(&mut input_view),
+        )
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11VideoDevice::CreateVideoProcessorInputView",
+            message: err.to_string(),
+        })?;
+    let input_view = input_view.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateVideoProcessorInputView",
+        message: "返回空 input view".to_owned(),
+    })?;
+
+    let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+        },
+    };
+    let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
+    video_device
+        .CreateVideoProcessorOutputView(
+            &target_resource,
+            enumerator,
+            &output_desc,
+            Some(&mut output_view),
+        )
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11VideoDevice::CreateVideoProcessorOutputView",
+            message: err.to_string(),
+        })?;
+    let output_view = output_view.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateVideoProcessorOutputView",
+        message: "返回空 output view".to_owned(),
+    })?;
+
+    let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+        Enable: windows::core::BOOL(1),
+        OutputIndex: 0,
+        InputFrameOrField: 0,
+        PastFrames: 0,
+        FutureFrames: 0,
+        ppPastSurfaces: ptr::null_mut(),
+        pInputSurface: ManuallyDrop::new(Some(input_view)),
+        ppFutureSurfaces: ptr::null_mut(),
+        ppPastSurfacesRight: ptr::null_mut(),
+        pInputSurfaceRight: ManuallyDrop::new(None),
+        ppFutureSurfacesRight: ptr::null_mut(),
+    };
+    let blt_result =
+        video_context.VideoProcessorBlt(processor, &output_view, 0, std::slice::from_ref(&stream));
+    ManuallyDrop::drop(&mut stream.pInputSurface);
+    blt_result.map_err(|err| BackendError::WindowsApi {
+        func: "ID3D11VideoContext::VideoProcessorBlt",
+        message: err.to_string(),
+    })
+}
+
+unsafe fn release_pending_surface(surface: Option<*mut MfxFrameSurface1>) {
+    if let Some(surface) = surface
+        && !surface.is_null()
+        && !(*surface).FrameInterface.is_null()
+    {
+        let _ = ((*(*surface).FrameInterface).Release)(surface);
+    }
+}
+
+fn duration_to_90k(duration: std::time::Duration) -> u64 {
+    (duration.as_secs_f64() * VIDEO_CLOCK_HZ as f64).round() as u64
+}
+
+const fn align16(value: u16) -> u16 {
+    value.div_ceil(16) * 16
 }
 
 unsafe fn encode_one_surface(

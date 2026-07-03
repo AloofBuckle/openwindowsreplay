@@ -2,6 +2,7 @@
 
 pub mod dxgi;
 pub mod gpu_smoke;
+pub mod mp4_mux;
 pub mod pipeline;
 pub mod session;
 pub mod vpl;
@@ -125,16 +126,17 @@ pub fn probe_all() -> ProbeCaps {
         reasons.push("当前运行时未确认任何可用码率控制模式；前端隐藏码控字段".to_owned());
     }
 
-    // 当前代码还没有完成 DDA/WGC 捕获、GPU 色彩转换 shader、shared D3D11 surface import 的
-    // 端到端实测，所以完整桌面同步路径保持关闭；这会让前端直接隐藏相关字段。
+    // 当前生产后端先在可拆除 CLI 调试器里落地 DDA -> GPU shader/VideoProcessor ->
+    // oneVPL 内部分配 P010 surface -> 一次 GPU CopyResource -> HEVC -> MP4 的视频路径。
+    // GUI 的连续即时回放环和音频尚未接上，因此前端仍隐藏完整桌面同步字段。
     let desktop_sync_path_available = false;
     reasons.push(
-        "捕获->GPU色彩转换->shared D3D11 surface import 端到端路径尚未实装验证；不创建录制会话"
+        "一拷贝视频录制路径已在 debug-cli 成品化；GUI 连续回放环/WGC/音频尚未接入，前端继续隐藏完整桌面同步录制入口"
             .to_owned(),
     );
 
     let supported_chroma = if desktop_sync_path_available {
-        vpl_candidate_chroma.clone()
+        vec![ChromaSampling::Yuv420]
     } else {
         Vec::new()
     };
@@ -200,7 +202,8 @@ pub fn debug_record_once(
     caps: &ProbeCaps,
     output: &Path,
     duration_seconds: f32,
-) -> Result<(), BackendError> {
+    adapter_index: u32,
+) -> Result<vpl::VplOneCopyRecordReport, BackendError> {
     let chroma = config.chroma.ok_or_else(|| {
         BackendError::unsupported("debug-cli record", "色度采样", "没有选择色度采样")
     })?;
@@ -215,5 +218,5 @@ pub fn debug_record_once(
         rate_control: config.rate_control.clone(),
         replay_minutes: duration_seconds / 60.0,
     };
-    pipeline::record_once_gpu_only(&request, caps, output, duration_seconds)
+    pipeline::record_once_gpu_only(&request, caps, output, duration_seconds, adapter_index)
 }
