@@ -26,6 +26,7 @@ enum DebugCommand {
     Probe,
     Config,
     SmokeD3d11,
+    DdaRate,
     SmokeEncode,
     Record,
 }
@@ -59,6 +60,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
         DebugCommand::SmokeD3d11 => {
             let result = backend::gpu_smoke::run_d3d11_dda_smoke(options.adapter_index)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        DebugCommand::DdaRate => {
+            let result = backend::gpu_smoke::measure_d3d11_dda_rate(
+                options.adapter_index,
+                options.duration_seconds,
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         DebugCommand::SmokeEncode => {
@@ -121,6 +129,7 @@ fn parse(args: &[String]) -> anyhow::Result<DebugOptions> {
         "probe" => DebugCommand::Probe,
         "config" => DebugCommand::Config,
         "smoke-d3d11" => DebugCommand::SmokeD3d11,
+        "dda-rate" => DebugCommand::DdaRate,
         "smoke-encode" => DebugCommand::SmokeEncode,
         "record" => DebugCommand::Record,
         "help" | "--help" | "-h" => DebugCommand::Help,
@@ -193,6 +202,7 @@ fn print_help() {
            rust_replay.exe --debug-cli probe\n\
            rust_replay.exe --debug-cli config [--output out.mp4] [--duration 3.559] [--chroma 420] [--rate CBR]\n\
            rust_replay.exe --debug-cli smoke-d3d11 [--adapter 0]\n\
+           rust_replay.exe --debug-cli dda-rate [--duration 3.559] [--adapter 0]\n\
            rust_replay.exe --debug-cli smoke-encode [--adapter 0]\n\
            rust_replay.exe --debug-cli record --output out.mp4 [--duration 3.559] [--adapter 0] [--chroma 420] [--rate CBR]\n"
     );
