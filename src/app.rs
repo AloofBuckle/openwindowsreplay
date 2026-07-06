@@ -348,9 +348,9 @@ impl RustReplayApp {
     }
 
     fn click_start(&mut self) {
-        if self.probe_rx.is_some() {
+        if self.is_initializing() {
             self.loop_log
-                .push("能力探测仍在进行，暂不能开始录制。".to_owned());
+                .push("等待初始化完成，暂不能开始录制。".to_owned());
             return;
         }
         let Some(caps) = &self.caps else {
@@ -368,6 +368,11 @@ impl RustReplayApp {
     }
 
     fn click_save(&mut self) {
+        if self.is_initializing() {
+            self.loop_log
+                .push("等待初始化完成，暂不能保存回放。".to_owned());
+            return;
+        }
         match self.controller.save(&self.config) {
             Ok(()) => {
                 self.indicator_flash = Some((IndicatorColor::Green, Instant::now()));
@@ -381,6 +386,11 @@ impl RustReplayApp {
     }
 
     fn click_stop(&mut self) {
+        if self.is_initializing() {
+            self.loop_log
+                .push("等待初始化完成，暂不能停止回放。".to_owned());
+            return;
+        }
         match self.controller.stop() {
             Ok(()) => {
                 self.indicator_flash = None;
@@ -598,8 +608,8 @@ impl RustReplayApp {
     }
 
     fn status_text(&self) -> String {
-        if self.probe_rx.is_some() && matches!(self.controller.state(), ReplayState::Idle) {
-            return "状态：能力探测中，暂不可启动".to_owned();
+        if self.is_initializing() {
+            return "状态：等待初始化".to_owned();
         }
         match self.controller.state() {
             ReplayState::Idle => "状态：空闲".to_owned(),
@@ -618,6 +628,10 @@ impl RustReplayApp {
         self.probe_rx.is_none()
             && self.caps.is_some()
             && matches!(self.controller.state(), ReplayState::Idle)
+    }
+
+    fn is_initializing(&self) -> bool {
+        self.probe_rx.is_some()
     }
 }
 
@@ -672,24 +686,55 @@ impl RustReplayApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
+            let initializing = self.is_initializing();
+            let start_label = if initializing {
+                "等待初始化"
+            } else {
+                "开始即时回放"
+            };
+            let save_label = if initializing {
+                "等待初始化"
+            } else {
+                "保存即时回放"
+            };
+            let stop_label = if initializing {
+                "等待初始化"
+            } else {
+                "停止即时回放"
+            };
+            let probe_label = if initializing {
+                "等待初始化"
+            } else {
+                "重新探测能力"
+            };
             if ui
-                .add_enabled(self.can_start_replay(), egui::Button::new("开始即时回放"))
-                .on_disabled_hover_text("能力探测完成且当前无录制会话时才能开始")
+                .add_enabled(
+                    !initializing && self.can_start_replay(),
+                    egui::Button::new(start_label),
+                )
+                .on_disabled_hover_text("等待初始化")
                 .clicked()
             {
                 self.click_start();
             }
-            if ui.button("保存即时回放").clicked() {
+            if ui
+                .add_enabled(!initializing, egui::Button::new(save_label))
+                .on_disabled_hover_text("等待初始化")
+                .clicked()
+            {
                 self.click_save();
             }
-            if ui.button("停止即时回放").clicked() {
+            if ui
+                .add_enabled(!initializing, egui::Button::new(stop_label))
+                .on_disabled_hover_text("等待初始化")
+                .clicked()
+            {
                 self.click_stop();
             }
-            let can_probe =
-                self.probe_rx.is_none() && matches!(self.controller.state(), ReplayState::Idle);
+            let can_probe = !initializing && matches!(self.controller.state(), ReplayState::Idle);
             if ui
-                .add_enabled(can_probe, egui::Button::new("重新探测能力"))
-                .on_disabled_hover_text("探测中或录制中不能重新探测")
+                .add_enabled(can_probe, egui::Button::new(probe_label))
+                .on_disabled_hover_text("等待初始化")
                 .clicked()
             {
                 self.start_probe();
