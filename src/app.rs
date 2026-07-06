@@ -156,7 +156,18 @@ impl RustReplayApp {
     }
 
     fn start_probe(&mut self) {
+        if self.probe_rx.is_some() {
+            self.encoder_log
+                .push("能力探测正在进行，忽略重复探测请求。".to_owned());
+            return;
+        }
+        if !matches!(self.controller.state(), ReplayState::Idle) {
+            self.encoder_log
+                .push("后台录制运行中，不能重新探测能力。".to_owned());
+            return;
+        }
         let (tx, rx) = mpsc::channel();
+        self.caps = None;
         self.probe_rx = Some(rx);
         self.encoder_log
             .push("开始探测 DXGI adapter 与 oneVPL HEVC 能力。".to_owned());
@@ -337,6 +348,11 @@ impl RustReplayApp {
     }
 
     fn click_start(&mut self) {
+        if self.probe_rx.is_some() {
+            self.loop_log
+                .push("能力探测仍在进行，暂不能开始录制。".to_owned());
+            return;
+        }
         let Some(caps) = &self.caps else {
             self.loop_log
                 .push("尚未完成能力探测，不能开始录制。".to_owned());
@@ -582,6 +598,9 @@ impl RustReplayApp {
     }
 
     fn status_text(&self) -> String {
+        if self.probe_rx.is_some() && matches!(self.controller.state(), ReplayState::Idle) {
+            return "状态：能力探测中，暂不可启动".to_owned();
+        }
         match self.controller.state() {
             ReplayState::Idle => "状态：空闲".to_owned(),
             ReplayState::Running { started_at } => format!(
@@ -593,6 +612,12 @@ impl RustReplayApp {
                 started_at.elapsed().as_secs_f32()
             ),
         }
+    }
+
+    fn can_start_replay(&self) -> bool {
+        self.probe_rx.is_none()
+            && self.caps.is_some()
+            && matches!(self.controller.state(), ReplayState::Idle)
     }
 }
 
@@ -647,7 +672,11 @@ impl RustReplayApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if ui.button("开始即时回放").clicked() {
+            if ui
+                .add_enabled(self.can_start_replay(), egui::Button::new("开始即时回放"))
+                .on_disabled_hover_text("能力探测完成且当前无录制会话时才能开始")
+                .clicked()
+            {
                 self.click_start();
             }
             if ui.button("保存即时回放").clicked() {
@@ -656,7 +685,13 @@ impl RustReplayApp {
             if ui.button("停止即时回放").clicked() {
                 self.click_stop();
             }
-            if ui.button("重新探测能力").clicked() {
+            let can_probe =
+                self.probe_rx.is_none() && matches!(self.controller.state(), ReplayState::Idle);
+            if ui
+                .add_enabled(can_probe, egui::Button::new("重新探测能力"))
+                .on_disabled_hover_text("探测中或录制中不能重新探测")
+                .clicked()
+            {
                 self.start_probe();
             }
             ui.separator();

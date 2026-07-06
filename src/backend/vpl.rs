@@ -704,6 +704,22 @@ pub fn probe_vpl() -> VplProbeInfo {
 
     let mut warnings = Vec::new();
     let mut implementations = Vec::new();
+    let current_display_routes = match probe_current_display_record_routes(0) {
+        Ok(routes) => routes,
+        Err(err) => {
+            warnings.push(format!(
+                "当前显示器自动 route 探测失败；前端不按显示状态展示录制字段: {err}"
+            ));
+            Vec::new()
+        }
+    };
+    let current_display_route_keys = current_display_routes
+        .iter()
+        .filter(|route| !route.fourcc.is_empty())
+        .map(|route| {
+            route_probe_key_parts(&route.fourcc, route.chroma, route.bit_depth, &route.profile)
+        })
+        .collect::<BTreeSet<_>>();
 
     unsafe {
         let loader = (api.mfx_load)();
@@ -739,7 +755,14 @@ pub fn probe_vpl() -> VplProbeInfo {
             }
 
             let desc = &*(handle as *const MfxImplDescription);
-            implementations.push(parse_impl(index, desc, &api, loader, &mut warnings));
+            implementations.push(parse_impl(
+                index,
+                desc,
+                &api,
+                loader,
+                &current_display_route_keys,
+                &mut warnings,
+            ));
 
             let release_status = (api.mfx_release_impl_description)(loader, handle);
             if release_status != MFX_ERR_NONE {
@@ -804,15 +827,6 @@ pub fn probe_vpl() -> VplProbeInfo {
                 .to_owned(),
         );
     }
-    let current_display_routes = match probe_current_display_record_routes(0) {
-        Ok(routes) => routes,
-        Err(err) => {
-            warnings.push(format!(
-                "当前显示器自动 route 探测失败；前端不按显示状态展示录制字段: {err}"
-            ));
-            Vec::new()
-        }
-    };
 
     VplProbeInfo {
         available: true,
@@ -8889,6 +8903,7 @@ unsafe fn parse_impl(
     desc: &MfxImplDescription,
     api: &VplApi,
     loader: MfxLoader,
+    current_display_route_keys: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> VplImplementationInfo {
     let mut hevc_supported = false;
@@ -8943,7 +8958,14 @@ unsafe fn parse_impl(
     }
 
     let route_candidates = if hevc_supported {
-        query_encode_route_candidates(api, loader, index, &input_fourcc, warnings)
+        query_encode_route_candidates(
+            api,
+            loader,
+            index,
+            &input_fourcc,
+            current_display_route_keys,
+            warnings,
+        )
     } else {
         Vec::new()
     };
@@ -9377,6 +9399,7 @@ unsafe fn query_encode_route_candidates(
     loader: MfxLoader,
     implementation_index: u32,
     input_fourcc: &BTreeSet<String>,
+    current_display_route_keys: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Vec<VplRouteProbe> {
     let mut session: MfxSession = ptr::null_mut();
@@ -9389,7 +9412,10 @@ unsafe fn query_encode_route_candidates(
     }
 
     let mut probes = Vec::new();
-    for route in route_candidates_from_fourcc(input_fourcc) {
+    for route in route_candidates_from_fourcc(input_fourcc)
+        .into_iter()
+        .filter(|route| current_display_route_keys.contains(&route_probe_key(*route)))
+    {
         let cfg = RateControlConfig::default();
         let mut input = make_query_param(
             &cfg,
@@ -9497,6 +9523,24 @@ fn route_candidates_from_fourcc(input_fourcc: &BTreeSet<String>) -> Vec<VplRecor
         .into_iter()
         .filter(|route| input_fourcc.contains(&fourcc_to_string(route.fourcc)))
         .collect()
+}
+
+fn route_probe_key(route: VplRecordRoute) -> String {
+    route_probe_key_parts(
+        &fourcc_to_string(route.fourcc),
+        chroma_from_vpl(route.chroma).unwrap_or(ChromaSampling::Yuv420),
+        route.bit_depth,
+        hevc_profile_name(u32::from(route.profile)),
+    )
+}
+
+fn route_probe_key_parts(
+    fourcc: &str,
+    chroma: ChromaSampling,
+    bit_depth: u16,
+    profile: &str,
+) -> String {
+    format!("{fourcc}::{chroma:?}::{bit_depth}::{profile}")
 }
 
 fn choose_query_format(input_fourcc: &BTreeSet<String>) -> (u32, u16, u16, u16) {
