@@ -10,6 +10,7 @@ mod error;
 mod hotkey;
 mod rate_control;
 mod ring;
+mod tray;
 
 use eframe::egui;
 
@@ -26,6 +27,7 @@ fn run() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RustReplay 即时回放")
+            .with_decorations(false)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([980.0, 620.0]),
         ..Default::default()

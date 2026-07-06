@@ -36,12 +36,15 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn config_path() -> PathBuf {
-        let base = std::env::var_os("APPDATA")
+    pub fn config_dir() -> PathBuf {
+        let base = std::env::var_os("ProgramData")
             .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("RustReplay").join("config.json")
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        base.join("OneVPL Replay")
+    }
+
+    pub fn config_path() -> PathBuf {
+        Self::config_dir().join("config.json")
     }
 
     pub fn load_from_disk() -> Result<Option<Self>, String> {
@@ -70,6 +73,15 @@ impl AppConfig {
 
     pub fn stable_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn clear_global_entry() -> Result<(), String> {
+        let path = Self::config_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("删除配置文件 {} 失败：{err}", path.display())),
+        }
     }
 }
 

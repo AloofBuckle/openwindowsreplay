@@ -5,6 +5,7 @@ use crate::backend::{ProbeCaps, RateControlFeatureSupport};
 use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
+use crate::tray::{TrayEvent, TrayRuntime};
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -20,8 +21,9 @@ pub struct RustReplayApp {
     last_status_refresh: Instant,
     last_saved_config_json: String,
     hotkey: HotkeyRuntime,
+    tray: TrayRuntime,
     waiting_save_hotkey: bool,
-    hotkey_bind_message: Option<String>,
+    allow_exit: bool,
 }
 
 impl RustReplayApp {
@@ -54,12 +56,10 @@ impl RustReplayApp {
             loop_log: vec!["循环器尚未启动。".to_owned()],
             last_status_refresh: Instant::now(),
             last_saved_config_json,
-            hotkey: HotkeyRuntime::new(initial_save_hotkey),
+            hotkey: HotkeyRuntime::new(initial_save_hotkey, cc.egui_ctx.clone()),
+            tray: TrayRuntime::new(cc.egui_ctx.clone()),
             waiting_save_hotkey: false,
-            hotkey_bind_message: Some(format!(
-                "当前保存即时回放热键：{}",
-                initial_save_hotkey.label()
-            )),
+            allow_exit: false,
         };
         this.start_probe();
         this
@@ -225,23 +225,7 @@ impl RustReplayApp {
             self.encoder_log.push(format!("路径阻断：{reason}"));
         }
 
-        if self.config.chroma.is_none()
-            || self
-                .config
-                .chroma
-                .is_some_and(|c| !caps.supported_chroma.contains(&c))
-        {
-            self.config.chroma = caps.supported_chroma.first().copied();
-        }
-        let selected_chroma = self.config.chroma;
-        let supported_rate_controls = selected_chroma
-            .map(|chroma| caps.rate_controls_for_chroma(chroma))
-            .unwrap_or(&[]);
-        if !supported_rate_controls.is_empty()
-            && !supported_rate_controls.contains(&self.config.rate_control.method)
-        {
-            self.config.rate_control.method = supported_rate_controls[0];
-        }
+        sanitize_config_against_caps(&mut self.config, &caps);
         self.caps = Some(caps);
     }
 
@@ -290,23 +274,19 @@ impl RustReplayApp {
 
     fn begin_save_hotkey_binding(&mut self) {
         self.waiting_save_hotkey = true;
-        self.hotkey_bind_message = Some("请按新的保存即时回放热键；Esc 取消。".to_owned());
         self.hotkey.set_hotkey(None);
     }
 
     fn cancel_save_hotkey_binding(&mut self) {
         self.waiting_save_hotkey = false;
-        self.hotkey_bind_message = Some(format!(
-            "已取消更改，继续使用：{}",
-            self.config.save_hotkey.label()
-        ));
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
     }
 
     fn apply_save_hotkey_binding(&mut self, hotkey: HotkeyConfig) {
         self.config.save_hotkey = hotkey;
         self.waiting_save_hotkey = false;
-        self.hotkey_bind_message = Some(format!("保存即时回放热键已改为：{}", hotkey.label()));
+        self.loop_log
+            .push(format!("保存即时回放热键已改为：{}", hotkey.label()));
         self.hotkey.set_hotkey(Some(hotkey));
     }
 
@@ -337,9 +317,8 @@ impl RustReplayApp {
             }
 
             let Some(hotkey_key) = egui_key_to_hotkey_key(key) else {
-                self.hotkey_bind_message = Some(
-                    "这个按键暂不支持；请使用 F1-F24，或 Ctrl/Alt/Shift + 字母/数字。".to_owned(),
-                );
+                self.loop_log
+                    .push("这个热键暂不支持；请换一个按键组合。".to_owned());
                 return;
             };
 
@@ -350,10 +329,8 @@ impl RustReplayApp {
                 key: hotkey_key,
             };
             if !hotkey.is_safe_global_binding() {
-                self.hotkey_bind_message = Some(
-                    "字母/数字单键会拦截普通输入；请按 Ctrl/Alt/Shift + 字母/数字，或直接使用 F1-F24。"
-                        .to_owned(),
-                );
+                self.loop_log
+                    .push("字母/数字单键会拦截普通输入，请搭配 Ctrl/Alt/Shift。".to_owned());
                 return;
             }
 
@@ -380,6 +357,54 @@ impl RustReplayApp {
         }
     }
 
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        for event in self.tray.drain_events() {
+            match event {
+                TrayEvent::StartReplay => self.click_start(),
+                TrayEvent::SaveReplay => self.click_save(),
+                TrayEvent::StopReplay => self.click_stop(),
+                TrayEvent::ExitProgram => {
+                    self.loop_log.push("收到退出程序请求。".to_owned());
+                    self.allow_exit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                TrayEvent::Status(line) => self.loop_log.push(line),
+            }
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.minimize_to_taskbar(ctx);
+        }
+    }
+
+    fn minimize_to_taskbar(&mut self, ctx: &egui::Context) {
+        self.loop_log
+            .push("窗口已收起到任务栏，后台录制状态不变。".to_owned());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    fn reset_all_config(&mut self) {
+        match AppConfig::clear_global_entry() {
+            Ok(()) => self.encoder_log.push(format!(
+                "已清空全局配置：{}",
+                AppConfig::config_path().display()
+            )),
+            Err(err) => self.encoder_log.push(format!("重置配置失败：{err}")),
+        }
+
+        self.config = AppConfig::default();
+        if let Some(caps) = &self.caps {
+            sanitize_config_against_caps(&mut self.config, caps);
+        }
+        self.waiting_save_hotkey = false;
+        self.hotkey.set_hotkey(Some(self.config.save_hotkey));
+        self.last_saved_config_json.clear();
+        self.persist_config_if_changed();
+    }
+
     fn status_text(&self) -> String {
         match self.controller.state() {
             ReplayState::Idle => "状态：空闲".to_owned(),
@@ -397,12 +422,14 @@ impl RustReplayApp {
 
 impl eframe::App for RustReplayApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close_request(ctx);
         self.receive_probe();
         for line in self.controller.drain_log_messages() {
             self.loop_log.push(line);
         }
         self.handle_save_hotkey_binding_input(ctx);
         self.handle_hotkey_events();
+        self.handle_tray_events(ctx);
         if self.last_status_refresh.elapsed() > Duration::from_millis(500) {
             ctx.request_repaint_after(Duration::from_millis(500));
             self.last_status_refresh = Instant::now();
@@ -411,44 +438,136 @@ impl eframe::App for RustReplayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("top_controls").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("开始即时回放").clicked() {
-                    self.click_start();
-                }
-                if ui.button("保存即时回放").clicked() {
-                    self.click_save();
-                }
-                if ui.button("停止即时回放").clicked() {
-                    self.click_stop();
-                }
-                ui.separator();
-                if ui.button("重新探测能力").clicked() {
-                    self.start_probe();
-                }
-                ui.label(self.status_text());
+        egui::Panel::top("top_controls")
+            .exact_size(36.0)
+            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
+            .show(ui, |ui| {
+                self.top_bar(ui);
             });
-        });
+
+        egui::Panel::bottom("bottom_actions")
+            .exact_size(34.0)
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("重置所有配置").clicked() {
+                        self.reset_all_config();
+                    }
+                });
+            });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.columns(2, |cols| {
-                self.left_encoder_panel(&mut cols[0]);
-                self.right_loop_panel(&mut cols[1]);
-            });
-            ui.separator();
-            ui.columns(2, |cols| {
-                log_panel(&mut cols[0], "编码器日志", &self.encoder_log);
-                log_panel(&mut cols[1], "循环器日志", &self.loop_log);
-            });
+            self.main_panel(ui);
         });
     }
 }
 
 impl RustReplayApp {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button("开始即时回放").clicked() {
+                self.click_start();
+            }
+            if ui.button("保存即时回放").clicked() {
+                self.click_save();
+            }
+            if ui.button("停止即时回放").clicked() {
+                self.click_stop();
+            }
+            if ui.button("重新探测能力").clicked() {
+                self.start_probe();
+            }
+            ui.separator();
+            ui.label(self.status_text());
+
+            let controls_width = 110.0;
+            let drag_width = (ui.available_width() - controls_width).max(8.0);
+            let (drag_rect, drag_response) =
+                ui.allocate_exact_size(egui::vec2(drag_width, 28.0), egui::Sense::click_and_drag());
+            if drag_response.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag_response.double_clicked() {
+                self.toggle_maximized(ui.ctx());
+            }
+            let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+            ui.painter().line_segment(
+                [drag_rect.left_center(), drag_rect.right_center()],
+                egui::Stroke::new(1.0, stroke.color.linear_multiply(0.35)),
+            );
+
+            self.window_buttons(ui);
+        });
+    }
+
+    fn window_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui.button("—").on_hover_text("最小化").clicked() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        let maximized = ui
+            .ctx()
+            .input(|input| input.viewport().maximized.unwrap_or(false));
+        let max_label = if maximized { "❐" } else { "□" };
+        if ui.button(max_label).on_hover_text("最大化/还原").clicked() {
+            self.toggle_maximized(ui.ctx());
+        }
+        if ui.button("×").on_hover_text("收起到任务栏").clicked() {
+            self.minimize_to_taskbar(ui.ctx());
+        }
+    }
+
+    fn toggle_maximized(&mut self, ctx: &egui::Context) {
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+
+    fn main_panel(&mut self, ui: &mut egui::Ui) {
+        let available_height = ui.available_height();
+        let log_total_height = (available_height * 0.42).clamp(260.0, 360.0);
+        let params_height = (available_height - log_total_height - 10.0).max(180.0);
+
+        ui.allocate_ui(egui::vec2(ui.available_width(), params_height), |ui| {
+            ui.columns(2, |cols| {
+                egui::ScrollArea::vertical()
+                    .id_salt("encoder_params_scroll")
+                    .max_height(params_height)
+                    .show(&mut cols[0], |ui| {
+                        self.left_encoder_panel(ui);
+                    });
+                egui::ScrollArea::vertical()
+                    .id_salt("loop_params_scroll")
+                    .max_height(params_height)
+                    .show(&mut cols[1], |ui| {
+                        self.right_loop_panel(ui);
+                    });
+            });
+        });
+
+        ui.separator();
+        let log_height = (ui.available_height() - 4.0).max(200.0);
+        ui.columns(2, |cols| {
+            log_panel(
+                &mut cols[0],
+                "encoder_log_scroll",
+                "编码器日志",
+                &self.encoder_log,
+                log_height,
+            );
+            log_panel(
+                &mut cols[1],
+                "loop_log_scroll",
+                "循环器日志",
+                &self.loop_log,
+                log_height,
+            );
+        });
+    }
+
     fn left_encoder_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("编码器参数");
         ui.group(|ui| {
-            ui.label("选什么色度采样？");
+            ui.label("色度采样");
             let supported = self
                 .caps
                 .as_ref()
@@ -469,7 +588,7 @@ impl RustReplayApp {
 
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.label("要什么码率控制模式？");
+            ui.label("码率控制模式");
             let supported = self.current_rate_controls();
             if supported.is_empty() {
                 ui.small(
@@ -587,11 +706,6 @@ impl RustReplayApp {
                     self.apply_save_hotkey_binding(HotkeyConfig::default());
                 }
             });
-            ui.small("只允许更改“保存即时重放”的热键；触发效果等同点击顶部“保存即时回放”。");
-            ui.small("字母/数字必须搭配 Ctrl/Alt/Shift；F1-F24 可单独使用。");
-            if let Some(message) = &self.hotkey_bind_message {
-                ui.small(message);
-            }
         });
     }
 }
@@ -712,6 +826,25 @@ fn rate_control_fields(
             serde_json::to_string_pretty(&fields).unwrap_or_else(|_| "<序列化失败>".to_owned()),
         );
     });
+}
+
+fn sanitize_config_against_caps(config: &mut AppConfig, caps: &ProbeCaps) {
+    if config.chroma.is_none()
+        || config
+            .chroma
+            .is_some_and(|chroma| !caps.supported_chroma.contains(&chroma))
+    {
+        config.chroma = caps.supported_chroma.first().copied();
+    }
+    let supported_rate_controls = config
+        .chroma
+        .map(|chroma| caps.rate_controls_for_chroma(chroma))
+        .unwrap_or(&[]);
+    if !supported_rate_controls.is_empty()
+        && !supported_rate_controls.contains(&config.rate_control.method)
+    {
+        config.rate_control.method = supported_rate_controls[0];
+    }
 }
 
 fn sanitize_hidden_rate_control_fields(
@@ -981,13 +1114,18 @@ fn pick_folder(_current: &str) -> Option<String> {
     None
 }
 
-fn log_panel(ui: &mut egui::Ui, title: &str, lines: &[String]) {
+fn log_panel(ui: &mut egui::Ui, id_salt: &'static str, title: &str, lines: &[String], height: f32) {
     ui.heading(title);
     egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_min_height(height);
         egui::ScrollArea::vertical()
+            .id_salt(id_salt)
             .stick_to_bottom(true)
-            .max_height(260.0)
+            .min_scrolled_height(height)
+            .max_height(height)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 for line in lines.iter().rev().take(400).rev() {
                     ui.monospace(line);
                 }

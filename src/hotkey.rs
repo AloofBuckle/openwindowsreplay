@@ -3,6 +3,7 @@
 //! 这里刻意只注册一个“保存即时回放/重放”全局热键，不扩展开始/停止等其它动作。
 
 use crate::config::{HotkeyConfig, HotkeyKey};
+use eframe::egui;
 use std::sync::mpsc::{self, Receiver};
 
 #[derive(Debug)]
@@ -26,12 +27,12 @@ pub struct HotkeyRuntime {
 
 #[cfg(windows)]
 impl HotkeyRuntime {
-    pub fn new(initial: HotkeyConfig) -> Self {
+    pub fn new(initial: HotkeyConfig, repaint_ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("rustreplay-save-hotkey".to_owned())
-            .spawn(move || hotkey_thread(cmd_rx, event_tx, Some(initial)))
+            .spawn(move || hotkey_thread(cmd_rx, event_tx, repaint_ctx, Some(initial)))
             .ok();
         if handle.is_none() {
             let _ = cmd_tx.send(HotkeyCommand::Shutdown);
@@ -70,6 +71,7 @@ impl Drop for HotkeyRuntime {
 fn hotkey_thread(
     cmd_rx: Receiver<HotkeyCommand>,
     event_tx: mpsc::Sender<HotkeyEvent>,
+    repaint_ctx: egui::Context,
     initial: Option<HotkeyConfig>,
 ) {
     use std::time::Duration;
@@ -84,6 +86,11 @@ fn hotkey_thread(
     let mut registered = false;
     let mut active = None;
 
+    let send_event = |event: HotkeyEvent| {
+        let _ = event_tx.send(event);
+        repaint_ctx.request_repaint();
+    };
+
     let apply =
         |target: Option<HotkeyConfig>, registered: &mut bool, active: &mut Option<HotkeyConfig>| {
             if *registered {
@@ -95,14 +102,14 @@ fn hotkey_thread(
             }
 
             let Some(hotkey) = target else {
-                let _ = event_tx.send(HotkeyEvent::Status(
+                send_event(HotkeyEvent::Status(
                     "保存即时回放热键已暂停，等待重新绑定。".to_owned(),
                 ));
                 return;
             };
 
             if !hotkey.is_safe_global_binding() {
-                let _ = event_tx.send(HotkeyEvent::Status(format!(
+                send_event(HotkeyEvent::Status(format!(
                     "保存即时回放热键未注册：{} 会拦截普通输入，字母/数字必须搭配 Ctrl/Alt/Shift。",
                     hotkey.label()
                 )));
@@ -125,13 +132,13 @@ fn hotkey_thread(
                 Ok(()) => {
                     *registered = true;
                     *active = Some(hotkey);
-                    let _ = event_tx.send(HotkeyEvent::Status(format!(
+                    send_event(HotkeyEvent::Status(format!(
                         "保存即时回放全局热键已注册：{}",
                         hotkey.label()
                     )));
                 }
                 Err(err) => {
-                    let _ = event_tx.send(HotkeyEvent::Status(format!(
+                    send_event(HotkeyEvent::Status(format!(
                         "保存即时回放热键注册失败：{}；可能已被系统或其它程序占用。",
                         err.message()
                     )));
@@ -168,7 +175,7 @@ fn hotkey_thread(
                 break;
             }
             if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_ID && active.is_some() {
-                let _ = event_tx.send(HotkeyEvent::Pressed);
+                send_event(HotkeyEvent::Pressed);
             }
         }
 
@@ -249,11 +256,12 @@ pub struct HotkeyRuntime {
 
 #[cfg(not(windows))]
 impl HotkeyRuntime {
-    pub fn new(_initial: HotkeyConfig) -> Self {
+    pub fn new(_initial: HotkeyConfig, repaint_ctx: egui::Context) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let _ = event_tx.send(HotkeyEvent::Status(
             "全局保存热键仅在 Windows 上注册；当前平台只保存配置。".to_owned(),
         ));
+        repaint_ctx.request_repaint();
         Self { event_rx }
     }
 
