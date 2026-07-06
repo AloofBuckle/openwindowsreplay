@@ -732,14 +732,22 @@ impl RustReplayApp {
                         .unwrap_or_else(|| rect.center());
                     draw_indicator_image(ui, &image, size, Some(pointer));
                     if ui.ctx().input(|input| input.pointer.primary_clicked()) {
-                        let viewport_origin = ui
-                            .ctx()
-                            .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
-                            .unwrap_or(egui::Pos2::ZERO);
-                        picked_top_left = Some(
-                            viewport_origin + pointer.to_vec2()
-                                - egui::vec2(size / 2.0, size / 2.0),
-                        );
+                        let diameter = self.config.indicator.diameter_px.max(1) as f32;
+                        picked_top_left = current_cursor_physical_pos()
+                            .or_else(|| {
+                                let viewport_origin = ui
+                                    .ctx()
+                                    .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
+                                    .unwrap_or(egui::Pos2::ZERO);
+                                let pixels_per_point = ui.ctx().input(|input| {
+                                    input.viewport().native_pixels_per_point.unwrap_or(1.0)
+                                });
+                                Some(egui::pos2(
+                                    (viewport_origin.x + pointer.x) * pixels_per_point,
+                                    (viewport_origin.y + pointer.y) * pixels_per_point,
+                                ))
+                            })
+                            .map(|pos| pos - egui::vec2(diameter / 2.0, diameter / 2.0));
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -1106,6 +1114,22 @@ fn rate_control_fields(
             serde_json::to_string_pretty(&fields).unwrap_or_else(|_| "<序列化失败>".to_owned()),
         );
     });
+}
+
+#[cfg(windows)]
+fn current_cursor_physical_pos() -> Option<egui::Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }
+        .ok()
+        .map(|_| egui::pos2(point.x as f32, point.y as f32))
+}
+
+#[cfg(not(windows))]
+fn current_cursor_physical_pos() -> Option<egui::Pos2> {
+    None
 }
 
 fn draw_indicator_image(
