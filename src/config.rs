@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub replay_minutes: f32,
     /// 只允许用户修改“保存即时回放/重放”这一项热键。
     pub save_hotkey: HotkeyConfig,
+    pub indicator: IndicatorConfig,
 }
 
 impl Default for AppConfig {
@@ -31,6 +32,7 @@ impl Default for AppConfig {
             save_dir: "replays".to_owned(),
             replay_minutes: 3.0,
             save_hotkey: HotkeyConfig::default(),
+            indicator: IndicatorConfig::default(),
         }
     }
 }
@@ -45,6 +47,10 @@ impl AppConfig {
 
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.json")
+    }
+
+    pub fn indicator_dir() -> PathBuf {
+        Self::config_dir().join("indicator")
     }
 
     pub fn load_from_disk() -> Result<Option<Self>, String> {
@@ -81,6 +87,28 @@ impl AppConfig {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(format!("删除配置文件 {} 失败：{err}", path.display())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndicatorConfig {
+    /// 指示器左上角屏幕位置，单位为 egui 逻辑点。
+    pub position_x: f32,
+    pub position_y: f32,
+    /// 用户界面以 px 展示；渲染时按当前 DPI 折算到逻辑点。
+    pub diameter_px: u32,
+    pub image_path: Option<String>,
+}
+
+impl Default for IndicatorConfig {
+    fn default() -> Self {
+        Self {
+            position_x: 32.0,
+            position_y: 32.0,
+            diameter_px: 32,
+            image_path: None,
         }
     }
 }

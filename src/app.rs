@@ -7,9 +7,75 @@ use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use crate::tray::{TrayEvent, TrayRuntime};
 use eframe::egui;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+
+const INDICATOR_FLASH_DURATION: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndicatorColor {
+    Blue,
+    Green,
+    Red,
+    Yellow,
+    Purple,
+}
+
+impl IndicatorColor {
+    const ALL: [Self; 5] = [
+        Self::Blue,
+        Self::Green,
+        Self::Red,
+        Self::Yellow,
+        Self::Purple,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Green => "green",
+            Self::Red => "red",
+            Self::Yellow => "yellow",
+            Self::Purple => "purple",
+        }
+    }
+
+    const fn color32(self) -> egui::Color32 {
+        match self {
+            Self::Blue => egui::Color32::from_rgb(0, 122, 255),
+            Self::Green => egui::Color32::from_rgb(0, 200, 90),
+            Self::Red => egui::Color32::from_rgb(255, 55, 55),
+            Self::Yellow => egui::Color32::from_rgb(255, 210, 0),
+            Self::Purple => egui::Color32::from_rgb(190, 0, 255),
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Blue => 0,
+            Self::Green => 1,
+            Self::Red => 2,
+            Self::Yellow => 3,
+            Self::Purple => 4,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IndicatorImages {
+    diameter_px: u32,
+    images: Vec<egui::ColorImage>,
+}
+
+impl IndicatorImages {
+    fn image(&self, color: IndicatorColor) -> egui::ColorImage {
+        self.images.get(color.index()).cloned().unwrap_or_else(|| {
+            build_circle_indicator_images(self.diameter_px.max(1))[color.index()].clone()
+        })
+    }
+}
 
 pub struct RustReplayApp {
     config: AppConfig,
@@ -22,6 +88,9 @@ pub struct RustReplayApp {
     last_saved_config_json: String,
     hotkey: HotkeyRuntime,
     tray: TrayRuntime,
+    indicator_images: IndicatorImages,
+    indicator_flash: Option<(IndicatorColor, Instant)>,
+    configuring_indicator_position: bool,
     waiting_save_hotkey: bool,
     allow_exit: bool,
 }
@@ -43,6 +112,7 @@ impl RustReplayApp {
         };
         let last_saved_config_json = config.stable_json();
         let initial_save_hotkey = config.save_hotkey;
+        let (indicator_images, indicator_status) = build_indicator_images_for_config(&config);
         let mut this = Self {
             config,
             caps: None,
@@ -58,9 +128,15 @@ impl RustReplayApp {
             last_saved_config_json,
             hotkey: HotkeyRuntime::new(initial_save_hotkey, cc.egui_ctx.clone()),
             tray: TrayRuntime::new(cc.egui_ctx.clone()),
+            indicator_images,
+            indicator_flash: None,
+            configuring_indicator_position: false,
             waiting_save_hotkey: false,
             allow_exit: false,
         };
+        if let Some(status) = indicator_status {
+            this.loop_log.push(status);
+        }
         this.start_probe();
         this
     }
@@ -253,21 +329,33 @@ impl RustReplayApp {
             return;
         };
         match self.controller.start(&self.config, caps) {
-            Ok(()) => self.loop_log.push("即时回放已开始。".to_owned()),
+            Ok(()) => {
+                self.indicator_flash = None;
+                self.loop_log.push("即时回放已开始。".to_owned());
+            }
             Err(err) => self.loop_log.push(format!("开始失败：{err}")),
         }
     }
 
     fn click_save(&mut self) {
         match self.controller.save(&self.config) {
-            Ok(()) => self.loop_log.push("即时回放已保存。".to_owned()),
-            Err(err) => self.loop_log.push(format!("保存失败：{err}")),
+            Ok(()) => {
+                self.indicator_flash = Some((IndicatorColor::Green, Instant::now()));
+                self.loop_log.push("即时回放已保存。".to_owned());
+            }
+            Err(err) => {
+                self.indicator_flash = Some((IndicatorColor::Red, Instant::now()));
+                self.loop_log.push(format!("保存失败：{err}"));
+            }
         }
     }
 
     fn click_stop(&mut self) {
         match self.controller.stop() {
-            Ok(()) => self.loop_log.push("即时回放停止请求已发送。".to_owned()),
+            Ok(()) => {
+                self.indicator_flash = None;
+                self.loop_log.push("即时回放停止请求已发送。".to_owned());
+            }
             Err(err) => self.loop_log.push(format!("停止失败：{err}")),
         }
     }
@@ -399,10 +487,62 @@ impl RustReplayApp {
         if let Some(caps) = &self.caps {
             sanitize_config_against_caps(&mut self.config, caps);
         }
+        self.rebuild_indicator_images();
+        self.configuring_indicator_position = false;
+        self.indicator_flash = None;
         self.waiting_save_hotkey = false;
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
         self.last_saved_config_json.clear();
         self.persist_config_if_changed();
+    }
+
+    fn update_indicator_runtime(&mut self, ctx: &egui::Context) {
+        if !self.replay_indicator_visible() {
+            self.indicator_flash = None;
+            return;
+        }
+
+        if self
+            .indicator_flash
+            .as_ref()
+            .is_some_and(|(_, shown_at)| shown_at.elapsed() >= INDICATOR_FLASH_DURATION)
+        {
+            self.indicator_flash = None;
+            ctx.request_repaint();
+        } else if self.indicator_flash.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn replay_indicator_visible(&self) -> bool {
+        !matches!(self.controller.state(), ReplayState::Idle)
+    }
+
+    fn current_indicator_color(&self) -> Option<IndicatorColor> {
+        match self.controller.state() {
+            ReplayState::Idle => None,
+            ReplayState::Running { .. } => self
+                .indicator_flash
+                .map(|(color, _)| color)
+                .or(Some(IndicatorColor::Blue)),
+            ReplayState::Stopping { .. } => Some(IndicatorColor::Yellow),
+        }
+    }
+
+    fn rebuild_indicator_images(&mut self) {
+        let (images, status) = build_indicator_images_for_config(&self.config);
+        self.indicator_images = images;
+        if let Some(status) = status {
+            self.loop_log.push(status);
+        }
+    }
+
+    fn import_indicator_image(&mut self) {
+        let Some(path) = pick_image_file() else {
+            return;
+        };
+        self.config.indicator.image_path = Some(path);
+        self.rebuild_indicator_images();
     }
 
     fn status_text(&self) -> String {
@@ -421,6 +561,10 @@ impl RustReplayApp {
 }
 
 impl eframe::App for RustReplayApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
         self.receive_probe();
@@ -430,6 +574,7 @@ impl eframe::App for RustReplayApp {
         self.handle_save_hotkey_binding_input(ctx);
         self.handle_hotkey_events();
         self.handle_tray_events(ctx);
+        self.update_indicator_runtime(ctx);
         if self.last_status_refresh.elapsed() > Duration::from_millis(500) {
             ctx.request_repaint_after(Duration::from_millis(500));
             self.last_status_refresh = Instant::now();
@@ -458,6 +603,7 @@ impl eframe::App for RustReplayApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.main_panel(ui);
         });
+        self.show_indicator_viewports(ui.ctx());
     }
 }
 
@@ -520,6 +666,94 @@ impl RustReplayApp {
     fn toggle_maximized(&mut self, ctx: &egui::Context) {
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+
+    fn indicator_size_points(&self, ctx: &egui::Context) -> f32 {
+        let pixels_per_point =
+            ctx.input(|input| input.viewport().native_pixels_per_point.unwrap_or(1.0));
+        (self.config.indicator.diameter_px.max(1) as f32 / pixels_per_point.max(0.1)).max(1.0)
+    }
+
+    fn show_indicator_viewports(&mut self, ctx: &egui::Context) {
+        if let Some(color) = self.current_indicator_color() {
+            let size = self.indicator_size_points(ctx);
+            let image = self.indicator_images.image(color);
+            let pos = egui::pos2(
+                self.config.indicator.position_x,
+                self.config.indicator.position_y,
+            );
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("rustreplay_status_indicator"),
+                egui::ViewportBuilder::default()
+                    .with_title("RustReplay 状态指示器")
+                    .with_decorations(false)
+                    .with_transparent(true)
+                    .with_always_on_top()
+                    .with_mouse_passthrough(true)
+                    .with_resizable(false)
+                    .with_position(pos)
+                    .with_inner_size([size, size]),
+                move |ui, _class| {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                    draw_indicator_image(ui, &image, size, None);
+                },
+            );
+        }
+
+        if self.configuring_indicator_position {
+            let size = self.indicator_size_points(ctx);
+            let image = self.indicator_images.image(IndicatorColor::Purple);
+            let mut picked_top_left = None;
+            let mut cancelled = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("rustreplay_indicator_position_overlay"),
+                egui::ViewportBuilder::default()
+                    .with_title("配置指示器位置")
+                    .with_decorations(false)
+                    .with_fullscreen(true)
+                    .with_always_on_top()
+                    .with_resizable(false),
+                |ui, _class| {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    let pointer = ui
+                        .ctx()
+                        .input(|input| input.pointer.hover_pos())
+                        .unwrap_or_else(|| rect.center());
+                    draw_indicator_image(ui, &image, size, Some(pointer));
+                    if ui.ctx().input(|input| input.pointer.primary_clicked()) {
+                        let viewport_origin = ui
+                            .ctx()
+                            .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
+                            .unwrap_or(egui::Pos2::ZERO);
+                        picked_top_left = Some(
+                            viewport_origin + pointer.to_vec2()
+                                - egui::vec2(size / 2.0, size / 2.0),
+                        );
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+                        cancelled = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                },
+            );
+            if let Some(pos) = picked_top_left {
+                self.config.indicator.position_x = pos.x;
+                self.config.indicator.position_y = pos.y;
+                self.configuring_indicator_position = false;
+                self.loop_log.push(format!(
+                    "状态指示器位置已设置为 ({:.0}, {:.0})。",
+                    pos.x, pos.y
+                ));
+            } else if cancelled {
+                self.configuring_indicator_position = false;
+                self.loop_log.push("已取消状态指示器位置配置。".to_owned());
+            }
+        }
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui) {
@@ -707,6 +941,44 @@ impl RustReplayApp {
                 }
             });
         });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label("配置指示器");
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "位置：{:.0}, {:.0}",
+                    self.config.indicator.position_x, self.config.indicator.position_y
+                ));
+                if ui.button("更改").clicked() {
+                    self.configuring_indicator_position = true;
+                    self.loop_log.push(
+                        "进入状态指示器位置配置：移动紫色图案，左键确认，Esc 取消。".to_owned(),
+                    );
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("直径");
+                let before = self.config.indicator.diameter_px;
+                ui.add(
+                    egui::DragValue::new(&mut self.config.indicator.diameter_px)
+                        .speed(1)
+                        .range(4..=512)
+                        .suffix(" px"),
+                );
+                if self.config.indicator.diameter_px != before {
+                    self.rebuild_indicator_images();
+                }
+                if ui.button("导入图像").clicked() {
+                    self.import_indicator_image();
+                }
+                if self.config.indicator.image_path.is_some() && ui.button("恢复圆形").clicked()
+                {
+                    self.config.indicator.image_path = None;
+                    self.rebuild_indicator_images();
+                }
+            });
+        });
     }
 }
 
@@ -826,6 +1098,148 @@ fn rate_control_fields(
             serde_json::to_string_pretty(&fields).unwrap_or_else(|_| "<序列化失败>".to_owned()),
         );
     });
+}
+
+fn draw_indicator_image(
+    ui: &mut egui::Ui,
+    image: &egui::ColorImage,
+    size: f32,
+    center: Option<egui::Pos2>,
+) {
+    let rect = center
+        .map(|center| egui::Rect::from_center_size(center, egui::vec2(size, size)))
+        .unwrap_or_else(|| egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(size, size)));
+    let texture = ui.ctx().load_texture(
+        format!(
+            "rustreplay_indicator_{}x{}_{}",
+            image.size[0],
+            image.size[1],
+            ui.ctx().cumulative_frame_nr()
+        ),
+        image.clone(),
+        egui::TextureOptions::LINEAR,
+    );
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+fn build_indicator_images_for_config(config: &AppConfig) -> (IndicatorImages, Option<String>) {
+    let diameter_px = config.indicator.diameter_px.max(1);
+    let mut status = None;
+    let images = if let Some(path) = &config.indicator.image_path {
+        match build_custom_indicator_images(Path::new(path), diameter_px) {
+            Ok(images) => {
+                status = Some(format!("状态指示器图像已导入并生成五色图：{path}"));
+                images
+            }
+            Err(err) => {
+                status = Some(format!("状态指示器图像处理失败，已回退默认圆点：{err}"));
+                build_circle_indicator_images(diameter_px)
+            }
+        }
+    } else {
+        build_circle_indicator_images(diameter_px)
+    };
+
+    if let Err(err) = save_indicator_images(&images) {
+        status = Some(format!("状态指示器五色图写入失败：{err}"));
+    }
+
+    (
+        IndicatorImages {
+            diameter_px,
+            images,
+        },
+        status,
+    )
+}
+
+fn build_circle_indicator_images(diameter_px: u32) -> Vec<egui::ColorImage> {
+    let size = diameter_px.max(1) as usize;
+    let radius = size as f32 / 2.0;
+    let center = (size as f32 - 1.0) / 2.0;
+    IndicatorColor::ALL
+        .iter()
+        .map(|&indicator_color| {
+            let color = indicator_color.color32();
+            let mut pixels = Vec::with_capacity(size * size);
+            for y in 0..size {
+                for x in 0..size {
+                    let dx = x as f32 - center;
+                    let dy = y as f32 - center;
+                    if (dx * dx + dy * dy).sqrt() <= radius {
+                        pixels.push(color);
+                    } else {
+                        pixels.push(egui::Color32::TRANSPARENT);
+                    }
+                }
+            }
+            egui::ColorImage::new([size, size], pixels)
+        })
+        .collect()
+}
+
+fn build_custom_indicator_images(
+    path: &Path,
+    diameter_px: u32,
+) -> Result<Vec<egui::ColorImage>, String> {
+    let decoded =
+        image::open(path).map_err(|err| format!("读取图像 {} 失败：{err}", path.display()))?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err(format!("图像 {} 尺寸为空", path.display()));
+    }
+    let side = width.min(height);
+    let crop_x = (width - side) / 2;
+    let crop_y = (height - side) / 2;
+    let cropped = image::imageops::crop_imm(&rgba, crop_x, crop_y, side, side).to_image();
+    let size = diameter_px.max(1);
+    let resized =
+        image::imageops::resize(&cropped, size, size, image::imageops::FilterType::Lanczos3);
+    Ok(IndicatorColor::ALL
+        .iter()
+        .map(|&indicator_color| {
+            let [red, green, blue, _] = indicator_color.color32().to_srgba_unmultiplied();
+            let mut pixels = Vec::with_capacity((size * size) as usize);
+            for pixel in resized.pixels() {
+                let alpha = pixel[3];
+                if alpha == 0 {
+                    pixels.push(egui::Color32::TRANSPARENT);
+                } else {
+                    pixels.push(egui::Color32::from_rgba_unmultiplied(
+                        red, green, blue, alpha,
+                    ));
+                }
+            }
+            egui::ColorImage::new([size as usize, size as usize], pixels)
+        })
+        .collect())
+}
+
+fn save_indicator_images(images: &[egui::ColorImage]) -> Result<(), String> {
+    let dir = AppConfig::indicator_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("创建目录 {} 失败：{err}", dir.display()))?;
+    for &color in &IndicatorColor::ALL {
+        let Some(image) = images.get(color.index()) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
+        for pixel in &image.pixels {
+            bytes.extend_from_slice(&pixel.to_srgba_unmultiplied());
+        }
+        let rgba = image::RgbaImage::from_raw(image.size[0] as u32, image.size[1] as u32, bytes)
+            .ok_or_else(|| "构造 RGBA 图像失败".to_owned())?;
+        let path = dir.join(format!("indicator_{}.png", color.label()));
+        rgba.save(&path)
+            .map_err(|err| format!("写入 {} 失败：{err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn sanitize_config_against_caps(config: &mut AppConfig, caps: &ProbeCaps) {
@@ -1109,8 +1523,39 @@ fn pick_folder(_current: &str) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn pick_image_file() -> Option<String> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let mut options = dialog.GetOptions().ok()?;
+        options |= FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST;
+        dialog.SetOptions(options).ok()?;
+        dialog.SetTitle(windows::core::w!("选择指示器图像")).ok()?;
+        dialog.Show(None).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = path.to_string().ok()?;
+        CoTaskMemFree(Some(path.0.cast()));
+        Some(text)
+    }
+}
+
 #[cfg(not(windows))]
 fn pick_folder(_current: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+fn pick_image_file() -> Option<String> {
     None
 }
 

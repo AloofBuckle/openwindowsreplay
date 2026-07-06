@@ -7,6 +7,7 @@ description = "GPU-only oneVPL 即时回放原型"
 [dependencies]
 anyhow = "1.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 libloading = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
