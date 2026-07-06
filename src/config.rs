@@ -94,12 +94,13 @@ impl AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndicatorConfig {
-    /// 指示器左上角屏幕位置，单位为 egui 逻辑点。
+    /// 指示器左上角屏幕位置，单位为 Win32 物理屏幕像素。
     pub position_x: f32,
     pub position_y: f32,
     /// 用户界面以 px 展示；渲染时按当前 DPI 折算到逻辑点。
     pub diameter_px: u32,
     pub image_path: Option<String>,
+    pub text_enabled: bool,
 }
 
 impl Default for IndicatorConfig {
@@ -109,6 +110,7 @@ impl Default for IndicatorConfig {
             position_y: 32.0,
             diameter_px: 32,
             image_path: None,
+            text_enabled: false,
         }
     }
 }

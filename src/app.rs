@@ -119,6 +119,7 @@ impl RustReplayApp {
         let native_indicator_images = native_images_from_indicator_images(&indicator_images);
         let indicator_x = config.indicator.position_x.round() as i32;
         let indicator_y = config.indicator.position_y.round() as i32;
+        let indicator_text_enabled = config.indicator.text_enabled;
         let mut this = Self {
             config,
             caps: None,
@@ -138,6 +139,7 @@ impl RustReplayApp {
                 indicator_x,
                 indicator_y,
                 native_indicator_images,
+                indicator_text_enabled,
             ),
             indicator_images,
             indicator_flash: None,
@@ -555,6 +557,7 @@ impl RustReplayApp {
             self.config.indicator.position_x.round() as i32,
             self.config.indicator.position_y.round() as i32,
             native_images_from_indicator_images(&self.indicator_images),
+            self.config.indicator.text_enabled,
         );
     }
 
@@ -992,6 +995,13 @@ impl RustReplayApp {
                 {
                     self.config.indicator.image_path = None;
                     self.rebuild_indicator_images();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let before = self.config.indicator.text_enabled;
+                ui.checkbox(&mut self.config.indicator.text_enabled, "文本指示");
+                if self.config.indicator.text_enabled != before {
+                    self.configure_indicator_overlay();
                 }
             });
         });
