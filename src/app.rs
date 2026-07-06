@@ -1,7 +1,7 @@
 //! egui 中文界面。
 
-use crate::backend::ProbeCaps;
 use crate::backend::session::{ReplayController, ReplayState};
+use crate::backend::{ProbeCaps, RateControlFeatureSupport};
 use crate::config::AppConfig;
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use eframe::egui;
@@ -120,6 +120,42 @@ impl RustReplayApp {
                     .join(" / ")
             ));
         }
+        for route in &caps.vpl.current_display_routes {
+            if route.fourcc.is_empty() {
+                self.encoder_log.push(format!(
+                    "当前显示器 route：{} 不可用，{}",
+                    route.chroma.doc_label(),
+                    route.note
+                ));
+            } else {
+                self.encoder_log.push(format!(
+                    "当前显示器 route：{} -> FourCC={} bit_depth={} profile={}；{}",
+                    route.chroma.doc_label(),
+                    route.fourcc,
+                    route.bit_depth,
+                    route.profile,
+                    route.route_summary
+                ));
+            }
+        }
+        for route in caps
+            .vpl
+            .route_candidates
+            .iter()
+            .filter(|route| !route.production_record_supported)
+        {
+            self.encoder_log.push(format!(
+                "oneVPL route 未生产化：FourCC={} chroma={} bit_depth={} profile={}；{}",
+                route.fourcc,
+                route.chroma.doc_label(),
+                route.bit_depth,
+                route.profile,
+                route
+                    .production_blocker
+                    .as_deref()
+                    .unwrap_or(route.note.as_str())
+            ));
+        }
         for policy in &caps.capture_cursor_policy {
             self.encoder_log.push(format!(
                 "光标策略：{} cursor_recording={}，{}",
@@ -141,6 +177,20 @@ impl RustReplayApp {
             "发布策略：允许打包依赖={}；{}",
             caps.package_policy.bundled_dependencies_allowed, caps.package_policy.note
         ));
+        for item in &caps.rate_control_features_by_chroma {
+            for feature in &item.features {
+                self.encoder_log.push(format!(
+                    "码控可选字段：{} {} lookahead={} win_brc={} low_delay={} max_frame_size={} mbbrc={}",
+                    item.chroma.doc_label(),
+                    feature.method.short_name(),
+                    feature.look_ahead_depth,
+                    feature.win_brc,
+                    feature.low_delay_brc,
+                    feature.max_frame_size,
+                    feature.mbbrc
+                ));
+            }
+        }
         for reason in &caps.path_blockers {
             self.encoder_log.push(format!("路径阻断：{reason}"));
         }
@@ -153,12 +203,14 @@ impl RustReplayApp {
         {
             self.config.chroma = caps.supported_chroma.first().copied();
         }
-        if !caps.supported_rate_controls.is_empty()
-            && !caps
-                .supported_rate_controls
-                .contains(&self.config.rate_control.method)
+        let selected_chroma = self.config.chroma;
+        let supported_rate_controls = selected_chroma
+            .map(|chroma| caps.rate_controls_for_chroma(chroma))
+            .unwrap_or(&[]);
+        if !supported_rate_controls.is_empty()
+            && !supported_rate_controls.contains(&self.config.rate_control.method)
         {
-            self.config.rate_control.method = caps.supported_rate_controls[0];
+            self.config.rate_control.method = supported_rate_controls[0];
         }
         self.caps = Some(caps);
     }
@@ -184,7 +236,7 @@ impl RustReplayApp {
 
     fn click_stop(&mut self) {
         match self.controller.stop() {
-            Ok(()) => self.loop_log.push("即时回放已停止。".to_owned()),
+            Ok(()) => self.loop_log.push("即时回放停止请求已发送。".to_owned()),
             Err(err) => self.loop_log.push(format!("停止失败：{err}")),
         }
     }
@@ -196,6 +248,10 @@ impl RustReplayApp {
                 "状态：录制中，已运行 {:.1}s",
                 started_at.elapsed().as_secs_f32()
             ),
+            ReplayState::Stopping { started_at } => format!(
+                "状态：正在停止后台录制，已运行 {:.1}s",
+                started_at.elapsed().as_secs_f32()
+            ),
         }
     }
 }
@@ -203,6 +259,9 @@ impl RustReplayApp {
 impl eframe::App for RustReplayApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_probe();
+        for line in self.controller.drain_log_messages() {
+            self.loop_log.push(line);
+        }
         if self.last_status_refresh.elapsed() > Duration::from_millis(500) {
             ctx.request_repaint_after(Duration::from_millis(500));
             self.last_status_refresh = Instant::now();
@@ -269,20 +328,16 @@ impl RustReplayApp {
         ui.add_space(8.0);
         ui.group(|ui| {
             ui.label("要什么码率控制模式？");
-            let supported = self
-                .caps
-                .as_ref()
-                .map(|c| c.supported_rate_controls.clone())
-                .unwrap_or_default();
+            let supported = self.current_rate_controls();
             if supported.is_empty() {
                 ui.small(
-                    "当前没有经 oneVPL Query 确认的码控模式，已隐藏码控字段；详情见编码器日志。",
+                    "当前色度没有经 oneVPL Query 确认的码控模式，已隐藏码控字段；详情见编码器日志。",
                 );
             } else {
                 egui::ComboBox::from_label("RateControlMethod")
                     .selected_text(self.config.rate_control.method.label())
                     .show_ui(ui, |ui| {
-                        for method in supported {
+                        for &method in &supported {
                             ui.selectable_value(
                                 &mut self.config.rate_control.method,
                                 method,
@@ -291,9 +346,41 @@ impl RustReplayApp {
                         }
                     });
                 ui.separator();
-                rate_control_fields(ui, &mut self.config.rate_control);
+                if supported.contains(&self.config.rate_control.method) {
+                    let features =
+                        self.current_rate_control_features(self.config.rate_control.method);
+                    rate_control_fields(ui, &mut self.config.rate_control, &features);
+                } else if let Some(first) = supported.first() {
+                    self.config.rate_control.method = *first;
+                    let features =
+                        self.current_rate_control_features(self.config.rate_control.method);
+                    rate_control_fields(ui, &mut self.config.rate_control, &features);
+                }
             }
         });
+    }
+
+    fn current_rate_controls(&self) -> Vec<RateControlMethod> {
+        let Some(caps) = &self.caps else {
+            return Vec::new();
+        };
+        let Some(chroma) = self.config.chroma else {
+            return Vec::new();
+        };
+        caps.rate_controls_for_chroma(chroma).to_vec()
+    }
+
+    fn current_rate_control_features(
+        &self,
+        method: RateControlMethod,
+    ) -> RateControlFeatureSupport {
+        let Some(caps) = &self.caps else {
+            return RateControlFeatureSupport::hidden(method);
+        };
+        let Some(chroma) = self.config.chroma else {
+            return RateControlFeatureSupport::hidden(method);
+        };
+        caps.rate_control_features_for(chroma, method)
     }
 
     fn right_loop_panel(&mut self, ui: &mut egui::Ui) {
@@ -333,13 +420,20 @@ impl RustReplayApp {
             ui.label("后端硬约束");
             ui.small("Capture 必须输出同一 DXGI adapter 上的 ID3D11Texture2D。 ");
             ui.small("ColorTransform / ChromaWriter 只允许 Compute Shader / Video Processor / GPU copy。 ");
-            ui.small("oneVPL 输入只允许 shared D3D11 surface import；失败则 UnsupportedGpuPath。 ");
+            ui.small(
+                "oneVPL 输入只允许 D3D11 video-memory surface；生产路线最多一次 GPU CopyResource，失败则 UnsupportedGpuPath。 ",
+            );
             ui.small("禁止 Map / Readback / Staging texture / CPU memcpy raw frame。 ");
         });
     }
 }
 
-fn rate_control_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
+fn rate_control_fields(
+    ui: &mut egui::Ui,
+    cfg: &mut RateControlConfig,
+    features: &RateControlFeatureSupport,
+) {
+    sanitize_hidden_rate_control_fields(cfg, features);
     ui.horizontal(|ui| {
         ui.label("BRCParamMultiplier");
         ui.add(egui::DragValue::new(&mut cfg.brc_param_multiplier).range(1..=65535));
@@ -348,12 +442,21 @@ fn rate_control_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
     match cfg.method {
         RateControlMethod::Cbr => {
             kbps_fields(ui, cfg, false);
-            sliding_window_fields(ui, cfg);
+            if features.win_brc {
+                sliding_window_fields(ui, cfg);
+            }
         }
         RateControlMethod::Vbr => {
             kbps_fields(ui, cfg, true);
-            sliding_window_fields(ui, cfg);
-            low_delay_and_frame_size(ui, cfg);
+            if features.win_brc {
+                sliding_window_fields(ui, cfg);
+            }
+            if features.low_delay_brc {
+                low_delay_brc_field(ui, cfg);
+            }
+            if features.max_frame_size {
+                max_frame_size_field(ui, cfg);
+            }
         }
         RateControlMethod::Cqp => {
             qp_fields(ui, cfg);
@@ -371,24 +474,45 @@ fn rate_control_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
         }
         RateControlMethod::La => {
             target_field(ui, cfg);
-            lookahead_field(ui, cfg);
-            sliding_window_fields(ui, cfg);
+            if features.look_ahead_depth {
+                lookahead_field(ui, cfg);
+            }
+            if features.win_brc {
+                sliding_window_fields(ui, cfg);
+            }
+            if features.max_frame_size {
+                max_frame_size_field(ui, cfg);
+            }
         }
         RateControlMethod::Icq => {
             icq_field(ui, cfg);
         }
         RateControlMethod::Vcm => {
             kbps_fields(ui, cfg, true);
-            ui.checkbox(&mut cfg.low_delay_brc, "LowDelayBRC");
+            if features.low_delay_brc {
+                low_delay_brc_field(ui, cfg);
+            }
+            if features.max_frame_size {
+                max_frame_size_field(ui, cfg);
+            }
         }
         RateControlMethod::LaIcq => {
             icq_field(ui, cfg);
-            lookahead_field(ui, cfg);
+            if features.look_ahead_depth {
+                lookahead_field(ui, cfg);
+            }
         }
         RateControlMethod::LaHrd => {
             kbps_fields(ui, cfg, true);
-            lookahead_field(ui, cfg);
-            sliding_window_fields(ui, cfg);
+            if features.look_ahead_depth {
+                lookahead_field(ui, cfg);
+            }
+            if features.win_brc {
+                sliding_window_fields(ui, cfg);
+            }
+            if features.max_frame_size {
+                max_frame_size_field(ui, cfg);
+            }
         }
         RateControlMethod::Qvbr => {
             kbps_fields(ui, cfg, true);
@@ -396,17 +520,23 @@ fn rate_control_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
                 ui.label("QVBRQuality (1 最好，51 最差)");
                 ui.add(egui::DragValue::new(&mut cfg.qvbr_quality).range(1..=51));
             });
-            sliding_window_fields(ui, cfg);
-            ui.checkbox(&mut cfg.low_delay_brc, "LowDelayBRC");
+            if features.win_brc {
+                sliding_window_fields(ui, cfg);
+            }
+            if features.low_delay_brc {
+                low_delay_brc_field(ui, cfg);
+            }
+            if features.max_frame_size {
+                max_frame_size_field(ui, cfg);
+            }
         }
     }
 
-    ui.separator();
-    ui.checkbox(&mut cfg.mbbrc, "MBBRC（宏块级码率控制，可提升主观质量）");
-    ui.checkbox(
-        &mut cfg.ext_brc,
-        "ExtBRC（外部 BRC，需要配合回调，当前仅记录配置）",
-    );
+    if features.mbbrc {
+        ui.separator();
+        ui.checkbox(&mut cfg.mbbrc, "MBBRC（宏块级码率控制，可提升主观质量）");
+    }
+    cfg.ext_brc = false;
 
     let fields = cfg.to_vpl_fields();
     ui.collapsing("将写入 oneVPL 的字段预览", |ui| {
@@ -414,6 +544,31 @@ fn rate_control_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
             serde_json::to_string_pretty(&fields).unwrap_or_else(|_| "<序列化失败>".to_owned()),
         );
     });
+}
+
+fn sanitize_hidden_rate_control_fields(
+    cfg: &mut RateControlConfig,
+    features: &RateControlFeatureSupport,
+) {
+    if !features.look_ahead_depth {
+        cfg.look_ahead_depth = 0;
+    } else if (1..10).contains(&cfg.look_ahead_depth) {
+        cfg.look_ahead_depth = 10;
+    }
+    if !features.win_brc {
+        cfg.win_brc_max_avg_kbps = 0;
+        cfg.win_brc_size = 0;
+    }
+    if !features.low_delay_brc {
+        cfg.low_delay_brc = false;
+    }
+    if !features.max_frame_size {
+        cfg.max_frame_size = 0;
+    }
+    if !features.mbbrc {
+        cfg.mbbrc = false;
+    }
+    cfg.ext_brc = false;
 }
 
 fn kbps_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig, show_max: bool) {
@@ -472,6 +627,9 @@ fn lookahead_field(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
     ui.horizontal(|ui| {
         ui.label("LookAheadDepth (10-100，0=默认)");
         ui.add(egui::DragValue::new(&mut cfg.look_ahead_depth).range(0..=100));
+        if (1..10).contains(&cfg.look_ahead_depth) {
+            cfg.look_ahead_depth = 10;
+        }
     });
 }
 
@@ -497,8 +655,14 @@ fn sliding_window_fields(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
     });
 }
 
-fn low_delay_and_frame_size(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
-    ui.checkbox(&mut cfg.low_delay_brc, "LowDelayBRC");
+fn low_delay_brc_field(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
+    ui.checkbox(
+        &mut cfg.low_delay_brc,
+        "LowDelayBRC（低延迟码控，按当前 GPU/route 探测显示）",
+    );
+}
+
+fn max_frame_size_field(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
     ui.horizontal(|ui| {
         ui.label("MaxFrameSize (bytes, 0=关闭)");
         ui.add(

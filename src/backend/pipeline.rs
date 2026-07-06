@@ -10,16 +10,19 @@ use crate::config::ChromaSampling;
 use crate::error::BackendError;
 use crate::rate_control::RateControlConfig;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBackendKind {
     Dda,
-    WgcBgra8,
-    WgcFp16,
+    Wgc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorTransformKind {
+    /// 后端根据当前显示器状态和 DDA/WGC 实际输入自动选择 SDR8/SDR10/HDRPQ10 路线。
+    AutoFromDisplay,
     Sdr8ToYuv,
     Sdr10ToYuv10,
     HdrPq10ToYuv10,
@@ -27,6 +30,12 @@ pub enum ColorTransformKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromaWriterKind {
+    /// 只表达用户请求 4:2:0；具体 NV12/P010 由录制后端 RoutePlan 自动选择。
+    Auto420,
+    /// 只表达用户请求 4:2:2；具体 YUY2/Y210/P210 可用性由后端 RoutePlan/Query 决定。
+    Auto422,
+    /// 只表达用户请求 4:4:4；具体 AYUV/Y410/RGB4 由后端 RoutePlan/Query 决定。
+    Auto444,
     Nv12,
     P010,
     Yuy2,
@@ -40,9 +49,9 @@ pub enum ChromaWriterKind {
 impl ChromaWriterKind {
     pub const fn chroma(self) -> ChromaSampling {
         match self {
-            Self::Nv12 | Self::P010 => ChromaSampling::Yuv420,
-            Self::Yuy2 | Self::Y210 | Self::P210 => ChromaSampling::Yuv422,
-            Self::Ayuv | Self::Y410 | Self::Rgb4 => ChromaSampling::Yuv444,
+            Self::Auto420 | Self::Nv12 | Self::P010 => ChromaSampling::Yuv420,
+            Self::Auto422 | Self::Yuy2 | Self::Y210 | Self::P210 => ChromaSampling::Yuv422,
+            Self::Auto444 | Self::Ayuv | Self::Y410 | Self::Rgb4 => ChromaSampling::Yuv444,
         }
     }
 }
@@ -82,26 +91,23 @@ pub trait VplEncoderStage {
     fn encode_gpu_surface(&mut self, input: &GpuFrameSurface) -> Result<(), BackendError>;
 }
 
-pub fn unsupported_until_zero_copy_verified(request: &RecordingRequest) -> BackendError {
-    BackendError::unsupported(
-        "录制流水线",
-        format!(
-            "{:?} -> {:?} -> {:?} / {:?}",
-            request.capture_backend,
-            request.color_transform,
-            request.chroma_writer,
-            request.rate_control.method
-        ),
-        "该参数组合尚未完成一拷贝 GPU-only 路径实装；禁止创建会话或改用 CPU 回退",
-    )
-}
-
 pub fn record_once_gpu_only(
     request: &RecordingRequest,
     caps: &ProbeCaps,
     output: &Path,
     duration_seconds: f32,
     adapter_index: u32,
+) -> Result<super::vpl::VplOneCopyRecordReport, BackendError> {
+    record_once_gpu_only_cancelable(request, caps, output, duration_seconds, adapter_index, None)
+}
+
+pub fn record_once_gpu_only_cancelable(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+    adapter_index: u32,
+    external_stop: Option<Arc<AtomicBool>>,
 ) -> Result<super::vpl::VplOneCopyRecordReport, BackendError> {
     if !caps.d3d11_texture_input_supported {
         return Err(BackendError::unsupported(
@@ -110,17 +116,149 @@ pub fn record_once_gpu_only(
             "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
         ));
     }
-    if request.chroma_writer != ChromaWriterKind::P010 {
+    let requested_chroma = request.chroma_writer.chroma();
+    if !caps.supported_chroma.contains(&requested_chroma) {
+        let reason = caps
+            .route_blocker_summary_for_chroma(requested_chroma)
+            .unwrap_or_else(|| "能力探测未确认该色度采样存在完整 GPU-only 生产 route".to_owned());
         return Err(BackendError::unsupported(
             "录制流水线",
-            format!("{:?}", request.chroma_writer),
-            "当前一拷贝生产路径只成品化了 420/P010；422/444 字段继续隐藏",
+            requested_chroma.doc_label(),
+            reason,
         ));
     }
-    super::vpl::record_d3d11_onecopy_mp4(
-        adapter_index,
+    caps.validate_rate_control_config(requested_chroma, &request.rate_control, "录制流水线")?;
+    match request.capture_backend {
+        CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_cancelable(
+            adapter_index,
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+        ),
+        CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_cancelable(
+            adapter_index,
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+        ),
+    }
+}
+
+#[cfg(windows)]
+pub fn record_once_gpu_only_output_cancelable(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+    adapter_index: u32,
+    external_stop: Option<Arc<AtomicBool>>,
+) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
+    validate_record_request(request, caps)?;
+    let requested_chroma = request.chroma_writer.chroma();
+    match request.capture_backend {
+        CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_output_cancelable(
+            adapter_index,
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+        ),
+        CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_output_cancelable(
+            adapter_index,
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+        ),
+    }
+}
+
+#[cfg(windows)]
+pub fn record_once_gpu_only_memory_output_cancelable(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+    adapter_index: u32,
+    external_stop: Option<Arc<AtomicBool>>,
+) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
+    record_once_gpu_only_memory_output_with_sink_cancelable(
+        request,
+        caps,
         output,
         duration_seconds,
-        request.rate_control.method,
+        adapter_index,
+        external_stop,
+        None,
     )
+}
+
+#[cfg(windows)]
+pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+    output: &Path,
+    duration_seconds: f32,
+    adapter_index: u32,
+    external_stop: Option<Arc<AtomicBool>>,
+    encoded_sink: Option<&mut dyn super::vpl::VplOneCopyRecordSink>,
+) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
+    validate_record_request(request, caps)?;
+    let requested_chroma = request.chroma_writer.chroma();
+    match request.capture_backend {
+        CaptureBackendKind::Dda => {
+            super::vpl::record_d3d11_onecopy_memory_output_with_sink_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+                encoded_sink,
+            )
+        }
+        CaptureBackendKind::Wgc => {
+            super::vpl::record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+                encoded_sink,
+            )
+        }
+    }
+}
+
+fn validate_record_request(
+    request: &RecordingRequest,
+    caps: &ProbeCaps,
+) -> Result<(), BackendError> {
+    if !caps.d3d11_texture_input_supported {
+        return Err(BackendError::unsupported(
+            "oneVPL 编码",
+            "D3D11 texture 输入",
+            "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
+        ));
+    }
+    let requested_chroma = request.chroma_writer.chroma();
+    if !caps.supported_chroma.contains(&requested_chroma) {
+        let reason = caps
+            .route_blocker_summary_for_chroma(requested_chroma)
+            .unwrap_or_else(|| "能力探测未确认该色度采样存在完整 GPU-only 生产 route".to_owned());
+        return Err(BackendError::unsupported(
+            "录制流水线",
+            requested_chroma.doc_label(),
+            reason,
+        ));
+    }
+    caps.validate_rate_control_config(requested_chroma, &request.rate_control, "录制流水线")?;
+    Ok(())
 }

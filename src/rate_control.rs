@@ -192,6 +192,7 @@ impl RateControlConfig {
                 out.look_ahead_depth = self.look_ahead_depth;
                 out.win_brc_max_avg_kbps = self.win_brc_max_avg_kbps;
                 out.win_brc_size = self.win_brc_size;
+                out.max_frame_size = self.max_frame_size;
             }
             RateControlMethod::Icq => {
                 out.icq_quality = self.icq_quality.clamp(1, 51);
@@ -202,6 +203,7 @@ impl RateControlConfig {
                 out.buffer_size_in_kb = self.buffer_size_kb;
                 out.initial_delay_in_kb = self.initial_delay_kb;
                 out.low_delay_brc = self.low_delay_brc;
+                out.max_frame_size = self.max_frame_size;
             }
             RateControlMethod::LaIcq => {
                 out.icq_quality = self.icq_quality.clamp(1, 51);
@@ -215,6 +217,7 @@ impl RateControlConfig {
                 out.look_ahead_depth = self.look_ahead_depth;
                 out.win_brc_max_avg_kbps = self.win_brc_max_avg_kbps;
                 out.win_brc_size = self.win_brc_size;
+                out.max_frame_size = self.max_frame_size;
             }
             RateControlMethod::Qvbr => {
                 out.target_kbps = self.target_kbps;
@@ -225,6 +228,7 @@ impl RateControlConfig {
                 out.win_brc_max_avg_kbps = self.win_brc_max_avg_kbps;
                 out.win_brc_size = self.win_brc_size;
                 out.low_delay_brc = self.low_delay_brc;
+                out.max_frame_size = self.max_frame_size;
             }
         }
 
