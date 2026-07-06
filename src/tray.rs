@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver};
 
 #[derive(Debug)]
 pub enum TrayEvent {
+    OpenMainWindow,
     StartReplay,
     SaveReplay,
     StopReplay,
@@ -87,6 +88,7 @@ fn tray_thread(
 
     const WM_TRAY_ICON: u32 = 0x8000 + 88;
     const TRAY_ID: u32 = 1;
+    const CMD_OPEN_MAIN: u32 = 1000;
     const CMD_START: u32 = 1001;
     const CMD_SAVE: u32 = 1002;
     const CMD_STOP: u32 = 1003;
@@ -134,10 +136,9 @@ fn tray_thread(
         match msg {
             WM_TRAY_ICON => {
                 let mouse_msg = lparam.0 as u32;
-                if mouse_msg == WM_RBUTTONUP
-                    || mouse_msg == WM_CONTEXTMENU
-                    || mouse_msg == WM_LBUTTONDBLCLK
-                {
+                if mouse_msg == WM_LBUTTONDBLCLK {
+                    send_event(TrayEvent::OpenMainWindow);
+                } else if mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU {
                     unsafe {
                         show_tray_menu(hwnd);
                     }
@@ -152,12 +153,19 @@ fn tray_thread(
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
             return;
         };
+        let open_main = wide_with_nul("打开主界面");
         let start = wide_with_nul("开始回放");
         let save = wide_with_nul("保存回放");
         let stop = wide_with_nul("结束回放");
         let exit = wide_with_nul("退出程序");
 
         unsafe {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_OPEN_MAIN as usize,
+                windows::core::PCWSTR(open_main.as_ptr()),
+            );
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -203,6 +211,7 @@ fn tray_thread(
             let _ = DestroyMenu(menu);
 
             match cmd {
+                CMD_OPEN_MAIN => send_event(TrayEvent::OpenMainWindow),
                 CMD_START => send_event(TrayEvent::StartReplay),
                 CMD_SAVE => send_event(TrayEvent::SaveReplay),
                 CMD_STOP => send_event(TrayEvent::StopReplay),

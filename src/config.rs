@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub cache_dir: String,
     pub save_dir: String,
     pub replay_minutes: f32,
+    pub start_recording_on_launch: bool,
+    pub start_minimized_to_tray: bool,
     /// 只允许用户修改“保存即时回放/重放”这一项热键。
     pub save_hotkey: HotkeyConfig,
     pub indicator: IndicatorConfig,
@@ -31,6 +33,8 @@ impl Default for AppConfig {
             cache_dir: "cache".to_owned(),
             save_dir: "replays".to_owned(),
             replay_minutes: 3.0,
+            start_recording_on_launch: false,
+            start_minimized_to_tray: false,
             save_hotkey: HotkeyConfig::default(),
             indicator: IndicatorConfig::default(),
         }
