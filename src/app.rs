@@ -96,6 +96,7 @@ pub struct RustReplayApp {
     configuring_indicator_position: bool,
     waiting_save_hotkey: bool,
     startup_auto_start_pending: bool,
+    startup_hidden_to_tray: bool,
     allow_exit: bool,
 }
 
@@ -122,6 +123,7 @@ impl RustReplayApp {
         let indicator_y = config.indicator.position_y.round() as i32;
         let indicator_text_enabled = config.indicator.text_enabled;
         let startup_auto_start_pending = config.start_recording_on_launch;
+        let startup_hidden_to_tray = config.start_minimized_to_tray;
         let mut this = Self {
             config,
             caps: None,
@@ -149,6 +151,7 @@ impl RustReplayApp {
             configuring_indicator_position: false,
             waiting_save_hotkey: false,
             startup_auto_start_pending,
+            startup_hidden_to_tray,
             allow_exit: false,
         };
         if let Some(status) = indicator_status {
@@ -527,10 +530,16 @@ impl RustReplayApp {
     }
 
     fn open_main_window(&mut self, ctx: &egui::Context) {
+        self.startup_hidden_to_tray = false;
         self.loop_log.push("已打开主界面。".to_owned());
+        restore_root_window_from_tray_start();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        if let Some(command) = egui::ViewportCommand::center_on_screen(ctx) {
+            ctx.send_viewport_cmd(command);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
     }
 
     fn reset_all_config(&mut self) {
@@ -551,6 +560,7 @@ impl RustReplayApp {
         self.indicator_flash = None;
         self.waiting_save_hotkey = false;
         self.startup_auto_start_pending = false;
+        self.startup_hidden_to_tray = false;
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
         self.last_saved_config_json.clear();
         self.persist_config_if_changed();
@@ -653,6 +663,15 @@ impl RustReplayApp {
     fn is_initializing(&self) -> bool {
         self.probe_rx.is_some()
     }
+
+    fn maintain_startup_tray_hidden(&mut self, ctx: &egui::Context) {
+        if !self.startup_hidden_to_tray {
+            return;
+        }
+        prepare_root_window_for_tray_start();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
 }
 
 impl eframe::App for RustReplayApp {
@@ -661,6 +680,7 @@ impl eframe::App for RustReplayApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.maintain_startup_tray_hidden(ctx);
         self.handle_close_request(ctx);
         self.receive_probe();
         for line in self.controller.drain_log_messages() {
@@ -1242,6 +1262,85 @@ fn current_cursor_physical_pos() -> Option<egui::Pos2> {
 #[cfg(not(windows))]
 fn current_cursor_physical_pos() -> Option<egui::Pos2> {
     None
+}
+
+#[cfg(windows)]
+fn prepare_root_window_for_tray_start() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SW_HIDE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW,
+    };
+
+    let Some(hwnd) = find_root_window() else {
+        return;
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let style = (style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            -32_000,
+            -32_000,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+        );
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+#[cfg(not(windows))]
+fn prepare_root_window_for_tray_start() {}
+
+#[cfg(windows)]
+fn restore_root_window_from_tray_start() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+
+    let Some(hwnd) = find_root_window() else {
+        return;
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let style = (style & !WS_EX_TOOLWINDOW.0) | WS_EX_APPWINDOW.0;
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            80,
+            80,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_root_window_from_tray_start() {}
+
+#[cfg(windows)]
+fn find_root_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = "RustReplay 即时回放"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let hwnd = unsafe {
+        FindWindowW(
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR(title.as_ptr()),
+        )
+    }
+    .ok()?;
+    (!hwnd.0.is_null()).then_some(hwnd)
 }
 
 fn draw_indicator_image(

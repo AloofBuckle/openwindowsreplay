@@ -37,7 +37,8 @@ fn run() -> anyhow::Result<()> {
             .with_decorations(false)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([980.0, 620.0])
-            .with_visible(!start_to_tray),
+            .with_visible(!start_to_tray)
+            .with_taskbar(!start_to_tray),
         ..Default::default()
     };
 
