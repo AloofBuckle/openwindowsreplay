@@ -7,6 +7,7 @@ mod app;
 mod backend;
 mod config;
 mod error;
+mod hotkey;
 mod rate_control;
 mod ring;
 

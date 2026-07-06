@@ -2,7 +2,8 @@
 
 use crate::backend::session::{ReplayController, ReplayState};
 use crate::backend::{ProbeCaps, RateControlFeatureSupport};
-use crate::config::{AppConfig, CaptureBackend};
+use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey};
+use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use eframe::egui;
 use std::sync::Arc;
@@ -18,6 +19,9 @@ pub struct RustReplayApp {
     loop_log: Vec<String>,
     last_status_refresh: Instant,
     last_saved_config_json: String,
+    hotkey: HotkeyRuntime,
+    waiting_save_hotkey: bool,
+    hotkey_bind_message: Option<String>,
 }
 
 impl RustReplayApp {
@@ -36,6 +40,7 @@ impl RustReplayApp {
             ),
         };
         let last_saved_config_json = config.stable_json();
+        let initial_save_hotkey = config.save_hotkey;
         let mut this = Self {
             config,
             caps: None,
@@ -49,6 +54,12 @@ impl RustReplayApp {
             loop_log: vec!["循环器尚未启动。".to_owned()],
             last_status_refresh: Instant::now(),
             last_saved_config_json,
+            hotkey: HotkeyRuntime::new(initial_save_hotkey),
+            waiting_save_hotkey: false,
+            hotkey_bind_message: Some(format!(
+                "当前保存即时回放热键：{}",
+                initial_save_hotkey.label()
+            )),
         };
         this.start_probe();
         this
@@ -277,6 +288,98 @@ impl RustReplayApp {
         }
     }
 
+    fn begin_save_hotkey_binding(&mut self) {
+        self.waiting_save_hotkey = true;
+        self.hotkey_bind_message = Some("请按新的保存即时回放热键；Esc 取消。".to_owned());
+        self.hotkey.set_hotkey(None);
+    }
+
+    fn cancel_save_hotkey_binding(&mut self) {
+        self.waiting_save_hotkey = false;
+        self.hotkey_bind_message = Some(format!(
+            "已取消更改，继续使用：{}",
+            self.config.save_hotkey.label()
+        ));
+        self.hotkey.set_hotkey(Some(self.config.save_hotkey));
+    }
+
+    fn apply_save_hotkey_binding(&mut self, hotkey: HotkeyConfig) {
+        self.config.save_hotkey = hotkey;
+        self.waiting_save_hotkey = false;
+        self.hotkey_bind_message = Some(format!("保存即时回放热键已改为：{}", hotkey.label()));
+        self.hotkey.set_hotkey(Some(hotkey));
+    }
+
+    fn handle_save_hotkey_binding_input(&mut self, ctx: &egui::Context) {
+        if !self.waiting_save_hotkey {
+            return;
+        }
+
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+
+            if key == egui::Key::Escape {
+                self.cancel_save_hotkey_binding();
+                return;
+            }
+            if is_modifier_key(key) {
+                continue;
+            }
+
+            let Some(hotkey_key) = egui_key_to_hotkey_key(key) else {
+                self.hotkey_bind_message = Some(
+                    "这个按键暂不支持；请使用 F1-F24，或 Ctrl/Alt/Shift + 字母/数字。".to_owned(),
+                );
+                return;
+            };
+
+            let hotkey = HotkeyConfig {
+                ctrl: modifiers.ctrl,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                key: hotkey_key,
+            };
+            if !hotkey.is_safe_global_binding() {
+                self.hotkey_bind_message = Some(
+                    "字母/数字单键会拦截普通输入；请按 Ctrl/Alt/Shift + 字母/数字，或直接使用 F1-F24。"
+                        .to_owned(),
+                );
+                return;
+            }
+
+            self.apply_save_hotkey_binding(hotkey);
+            return;
+        }
+    }
+
+    fn handle_hotkey_events(&mut self) {
+        for event in self.hotkey.drain_events() {
+            match event {
+                HotkeyEvent::Pressed => {
+                    if self.waiting_save_hotkey {
+                        continue;
+                    }
+                    self.loop_log.push(format!(
+                        "保存即时回放热键触发：{}",
+                        self.config.save_hotkey.label()
+                    ));
+                    self.click_save();
+                }
+                HotkeyEvent::Status(line) => self.loop_log.push(line),
+            }
+        }
+    }
+
     fn status_text(&self) -> String {
         match self.controller.state() {
             ReplayState::Idle => "状态：空闲".to_owned(),
@@ -298,6 +401,8 @@ impl eframe::App for RustReplayApp {
         for line in self.controller.drain_log_messages() {
             self.loop_log.push(line);
         }
+        self.handle_save_hotkey_binding_input(ctx);
+        self.handle_hotkey_events();
         if self.last_status_refresh.elapsed() > Duration::from_millis(500) {
             ctx.request_repaint_after(Duration::from_millis(500));
             self.last_status_refresh = Instant::now();
@@ -463,13 +568,30 @@ impl RustReplayApp {
 
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.label("后端硬约束");
-            ui.small("Capture 必须输出同一 DXGI adapter 上的 ID3D11Texture2D。 ");
-            ui.small("ColorTransform / ChromaWriter 只允许 Compute Shader / Video Processor / GPU copy。 ");
-            ui.small(
-                "oneVPL 输入只允许 D3D11 video-memory surface；生产路线最多一次 GPU CopyResource，失败则 UnsupportedGpuPath。 ",
-            );
-            ui.small("禁止 Map / Readback / Staging texture / CPU memcpy raw frame。 ");
+            ui.label("保存热键");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("保存即时重放：");
+                ui.monospace(self.config.save_hotkey.label());
+                let change_label = if self.waiting_save_hotkey {
+                    "等待按键…"
+                } else {
+                    "更改…"
+                };
+                if ui.button(change_label).clicked() {
+                    self.begin_save_hotkey_binding();
+                }
+                if self.waiting_save_hotkey && ui.button("取消").clicked() {
+                    self.cancel_save_hotkey_binding();
+                }
+                if ui.button("恢复默认").clicked() {
+                    self.apply_save_hotkey_binding(HotkeyConfig::default());
+                }
+            });
+            ui.small("只允许更改“保存即时重放”的热键；触发效果等同点击顶部“保存即时回放”。");
+            ui.small("字母/数字必须搭配 Ctrl/Alt/Shift；F1-F24 可单独使用。");
+            if let Some(message) = &self.hotkey_bind_message {
+                ui.small(message);
+            }
         });
     }
 }
@@ -717,6 +839,86 @@ fn max_frame_size_field(ui: &mut egui::Ui, cfg: &mut RateControlConfig) {
                 .range(0..=100_000_000),
         );
     });
+}
+
+fn egui_key_to_hotkey_key(key: egui::Key) -> Option<HotkeyKey> {
+    Some(match key {
+        egui::Key::Num0 => HotkeyKey::Num0,
+        egui::Key::Num1 => HotkeyKey::Num1,
+        egui::Key::Num2 => HotkeyKey::Num2,
+        egui::Key::Num3 => HotkeyKey::Num3,
+        egui::Key::Num4 => HotkeyKey::Num4,
+        egui::Key::Num5 => HotkeyKey::Num5,
+        egui::Key::Num6 => HotkeyKey::Num6,
+        egui::Key::Num7 => HotkeyKey::Num7,
+        egui::Key::Num8 => HotkeyKey::Num8,
+        egui::Key::Num9 => HotkeyKey::Num9,
+        egui::Key::A => HotkeyKey::A,
+        egui::Key::B => HotkeyKey::B,
+        egui::Key::C => HotkeyKey::C,
+        egui::Key::D => HotkeyKey::D,
+        egui::Key::E => HotkeyKey::E,
+        egui::Key::F => HotkeyKey::F,
+        egui::Key::G => HotkeyKey::G,
+        egui::Key::H => HotkeyKey::H,
+        egui::Key::I => HotkeyKey::I,
+        egui::Key::J => HotkeyKey::J,
+        egui::Key::K => HotkeyKey::K,
+        egui::Key::L => HotkeyKey::L,
+        egui::Key::M => HotkeyKey::M,
+        egui::Key::N => HotkeyKey::N,
+        egui::Key::O => HotkeyKey::O,
+        egui::Key::P => HotkeyKey::P,
+        egui::Key::Q => HotkeyKey::Q,
+        egui::Key::R => HotkeyKey::R,
+        egui::Key::S => HotkeyKey::S,
+        egui::Key::T => HotkeyKey::T,
+        egui::Key::U => HotkeyKey::U,
+        egui::Key::V => HotkeyKey::V,
+        egui::Key::W => HotkeyKey::W,
+        egui::Key::X => HotkeyKey::X,
+        egui::Key::Y => HotkeyKey::Y,
+        egui::Key::Z => HotkeyKey::Z,
+        egui::Key::F1 => HotkeyKey::F1,
+        egui::Key::F2 => HotkeyKey::F2,
+        egui::Key::F3 => HotkeyKey::F3,
+        egui::Key::F4 => HotkeyKey::F4,
+        egui::Key::F5 => HotkeyKey::F5,
+        egui::Key::F6 => HotkeyKey::F6,
+        egui::Key::F7 => HotkeyKey::F7,
+        egui::Key::F8 => HotkeyKey::F8,
+        egui::Key::F9 => HotkeyKey::F9,
+        egui::Key::F10 => HotkeyKey::F10,
+        egui::Key::F11 => HotkeyKey::F11,
+        egui::Key::F12 => HotkeyKey::F12,
+        egui::Key::F13 => HotkeyKey::F13,
+        egui::Key::F14 => HotkeyKey::F14,
+        egui::Key::F15 => HotkeyKey::F15,
+        egui::Key::F16 => HotkeyKey::F16,
+        egui::Key::F17 => HotkeyKey::F17,
+        egui::Key::F18 => HotkeyKey::F18,
+        egui::Key::F19 => HotkeyKey::F19,
+        egui::Key::F20 => HotkeyKey::F20,
+        egui::Key::F21 => HotkeyKey::F21,
+        egui::Key::F22 => HotkeyKey::F22,
+        egui::Key::F23 => HotkeyKey::F23,
+        egui::Key::F24 => HotkeyKey::F24,
+        _ => return None,
+    })
+}
+
+fn is_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
 }
 
 fn install_chinese_font(ctx: &egui::Context) -> String {
