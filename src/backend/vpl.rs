@@ -1089,6 +1089,7 @@ pub struct VplOutputTrackInfo {
 }
 
 pub trait VplOneCopyRecordSink {
+    fn status(&mut self, _message: &str) {}
     fn video_track_started(&mut self, info: VplOutputTrackInfo);
     fn hevc_access_unit(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit);
     fn aac_access_unit(&mut self, _sample: &crate::backend::mp4_mux::AacAccessUnit) {}
@@ -1311,6 +1312,13 @@ enum RecordCaptureSource {
 impl RecordCaptureSource {
     fn is_wgc(self) -> bool {
         matches!(self, Self::Wgc)
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dda => "DDA",
+            Self::Wgc => "WGC",
+        }
     }
 }
 
@@ -1574,6 +1582,29 @@ impl RecordAudioCapture {
         self.drain_incoming();
         std::mem::take(&mut self.frames)
     }
+
+    fn stop_without_reencode(&mut self, notes: &mut Vec<String>) {
+        let started = std::time::Instant::now();
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        while let Some(handle) = self.handles.pop() {
+            match handle.join() {
+                Ok((source, Ok(stats))) => notes.push(format!(
+                    "WASAPI {:?} 快速停止：packet={} pcm_frames={}",
+                    source, stats.packet_count, stats.pcm_frames
+                )),
+                Ok((source, Err(err))) => {
+                    notes.push(format!("WASAPI {:?} 快速停止时不可用：{err}", source));
+                }
+                Err(_) => notes.push("WASAPI 快速停止时捕获线程 panic；该音源被跳过".to_owned()),
+            }
+        }
+        self.drain_incoming();
+        self.frames.clear();
+        notes.push(format!(
+            "音频快速停止完成：跳过停止时完整 AAC 重建，耗时 {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
 }
 
 #[cfg(windows)]
@@ -1706,8 +1737,37 @@ fn record_d3d11_onecopy_mp4_impl(
 
     validate_rate_control_config(rate_control)?;
 
+    let record_started = Instant::now();
+    let record_stop = external_stop
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    sink_status(
+        &mut encoded_sink,
+        format!(
+            "录制后端初始化开始：capture={} chroma={} rc={}",
+            capture_source.label(),
+            requested_chroma.doc_label(),
+            rate_control.method.short_name()
+        ),
+    );
+    if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BackendError::unsupported(
+            "录制后端初始化",
+            "用户停止请求",
+            "停止请求发生在 oneVPL/D3D11 初始化前，已中止当前片段",
+        ));
+    }
+
+    let phase_started = Instant::now();
     let (api, dll_path) =
         VplApi::load().map_err(|err| BackendError::unsupported("oneVPL", "DLL", err))?;
+    sink_status(
+        &mut encoded_sink,
+        format!(
+            "初始化阶段：加载 oneVPL DLL 完成，用时 {:.1}ms",
+            phase_started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
     let mut notes = vec![format!("oneVPL DLL: {}", dll_path.display())];
 
     unsafe {
@@ -1762,8 +1822,18 @@ fn record_d3d11_onecopy_mp4_impl(
         let aligned_height = align16(capture_height);
         // 自动同步路线集中在录制后端内部：前端只表达目标色度采样，
         // DDA/WGC 的颜色空间/range/bit-depth 由当前显示器状态和捕获数据决定。
+        let route_probe_started = Instant::now();
         let record_route_candidates =
             select_record_route_candidates_for_output(&output0, requested_chroma, &mut notes)?;
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：DXGI 输出/桌面模式 route 探测完成，候选={}，累计 {:.1}ms，本阶段 {:.1}ms",
+                record_route_candidates.len(),
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                route_probe_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         if record_route_candidates
             .iter()
             .any(|route| !route.supports_requested_chroma(requested_chroma))
@@ -1783,6 +1853,15 @@ fn record_d3d11_onecopy_mp4_impl(
                 "返回空 loader",
             ));
         }
+        if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            (api.mfx_unload)(loader);
+            return Err(BackendError::unsupported(
+                "录制后端初始化",
+                "用户停止请求",
+                "停止请求发生在 oneVPL loader 创建后，已中止当前片段",
+            ));
+        }
+        let session_started = Instant::now();
         let mut session: MfxSession = ptr::null_mut();
         let create_status = (api.mfx_create_session)(loader, 0, &mut session);
         if create_status != MFX_ERR_NONE || session.is_null() {
@@ -1792,6 +1871,14 @@ fn record_d3d11_onecopy_mp4_impl(
                 status: create_status,
             });
         }
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：MFXCreateSession 完成，累计 {:.1}ms，本阶段 {:.1}ms",
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                session_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         let record_async_depth = std::env::var("RUST_REPLAY_VPL_ASYNC_DEPTH")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -1922,6 +2009,14 @@ fn record_d3d11_onecopy_mp4_impl(
             "oneVPL record route selected: {}",
             record_route.summary()
         ));
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：oneVPL Query/QueryIOSurf 选路完成：{}，累计 {:.1}ms",
+                record_route.summary(),
+                record_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         let mut param = queried;
         apply_record_route_to_param(&mut param, record_route);
         apply_rate_control_config_to_param(&mut param, rate_control);
@@ -1939,6 +2034,16 @@ fn record_d3d11_onecopy_mp4_impl(
         param.mfx.IdrInterval = record_idr_interval;
         param.mfx.LowPower = MFX_CODINGOPTION_ON;
         param.mfx.TargetUsage = 7;
+        if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            return Err(BackendError::unsupported(
+                "录制后端初始化",
+                "用户停止请求",
+                "停止请求发生在 MFXVideoENCODE_Init 前，已中止当前片段",
+            ));
+        }
+        let init_started = Instant::now();
         let init_status = (api.mfx_video_encode_init)(session, &mut param);
         if init_status < MFX_ERR_NONE {
             let _ = (api.mfx_close)(session);
@@ -1948,6 +2053,15 @@ fn record_d3d11_onecopy_mp4_impl(
                 status: init_status,
             });
         }
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：MFXVideoENCODE_Init 完成 status={}，累计 {:.1}ms，本阶段 {:.1}ms",
+                init_status,
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                init_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         if let Some(sink) = encoded_sink.as_deref_mut() {
             sink.video_track_started(VplOutputTrackInfo {
                 width: capture_width,
@@ -1991,6 +2105,7 @@ fn record_d3d11_onecopy_mp4_impl(
         }
         let mut first_native: MfxHDL = ptr::null_mut();
         let mut first_native_type = 0u32;
+        let surface_started = Instant::now();
         let native_status = ((*first_interface).GetNativeHandle)(
             first_surface,
             &mut first_native,
@@ -2050,6 +2165,14 @@ fn record_d3d11_onecopy_mp4_impl(
                 "GetDeviceHandle 返回值不是 ID3D11Device",
             ));
         };
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：oneVPL video-memory surface/native D3D11 device 就绪，累计 {:.1}ms，本阶段 {:.1}ms",
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                surface_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
 
         let immediate: ID3D11DeviceContext =
             vpl_device
@@ -2093,8 +2216,17 @@ fn record_d3d11_onecopy_mp4_impl(
                 .to_owned(),
         );
         let record_route_dxgi_format = record_route.try_dxgi_format()?;
+        let gpu_route_started = Instant::now();
         let route_intermediate =
             create_route_intermediate(vpl_device, &target_desc, record_route, true)?;
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：GPU route intermediate texture 就绪，累计 {:.1}ms，本阶段 {:.1}ms",
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                gpu_route_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         match capture_source {
             RecordCaptureSource::Dda => notes.push(
                 "固定 DDA 路线：独立 D3D11 capture device CopyResource 到 keyed shared snapshot pool 后立即 ReleaseFrame，编码线程按自动 route GPU shader 全帧写目标 FourCC，再一次 CopyResource 到 oneVPL surface"
@@ -2151,17 +2283,26 @@ fn record_d3d11_onecopy_mp4_impl(
         let start = Instant::now();
         let end_at = start + capture_duration;
         let qpc_frequency = query_performance_frequency().unwrap_or(0);
+        let audio_started = Instant::now();
         let mut audio_capture =
             RecordAudioCapture::start(capture_duration + Duration::from_secs(5), &mut notes);
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "初始化阶段：音频线程启动阶段完成 enabled={}，累计 {:.1}ms，本阶段 {:.1}ms",
+                audio_capture.is_some(),
+                record_started.elapsed().as_secs_f64() * 1000.0,
+                audio_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
 
         {
             let capture_pool_size = 32usize;
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
             let (free_tx, free_rx) = std::sync::mpsc::channel::<SnapshotSlot>();
-            let stop = external_stop
-                .clone()
-                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let stop = record_stop.clone();
+            let capture_thread_started = Instant::now();
             let capture_handle = match capture_source {
                 RecordCaptureSource::Dda => {
                     let (capture_device, capture_context) =
@@ -2198,6 +2339,15 @@ fn record_d3d11_onecopy_mp4_impl(
                     free_rx,
                 ),
             };
+            sink_status(
+                &mut encoded_sink,
+                format!(
+                    "初始化阶段：{} capture thread 已启动，累计 {:.1}ms，本阶段 {:.1}ms；后续若仍无正式帧，多半处于 capture/warmup 阶段",
+                    capture_source.label(),
+                    record_started.elapsed().as_secs_f64() * 1000.0,
+                    capture_thread_started.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
             notes.push(format!(
                 "capture snapshot pool: textures={}, queue={}",
                 capture_pool_size, capture_queue_size
@@ -2623,6 +2773,14 @@ fn record_d3d11_onecopy_mp4_impl(
                             }
 
                             if first_video_timestamp_100ns.is_none() {
+                                sink_status(
+                                    &mut encoded_sink,
+                                    format!(
+                                        "初始化阶段结束：首个正式源视频帧进入编码，累计 {:.1}ms；此前耗时属于 oneVPL/D3D11 初始化 + {} capture warmup",
+                                        record_started.elapsed().as_secs_f64() * 1000.0,
+                                        capture_source.label()
+                                    ),
+                                );
                                 first_video_timestamp_100ns = timestamp_100ns;
                             }
                             let first_ts = *first_sample_timestamp_90k.get_or_insert(timestamp_90k);
@@ -2752,6 +2910,61 @@ fn record_d3d11_onecopy_mp4_impl(
                 perf.dda_accumulated_frames_max = stats.accumulated_frames_max;
                 notes.push(stats.summary());
             }
+        }
+
+        if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let stop_cleanup_started = Instant::now();
+            sink_status(
+                &mut encoded_sink,
+                format!(
+                    "停止排查：capture thread 已退出，开始快速释放；跳过段尾 60s 同步等待、encoder flush 和完整 AAC 重建，in_flight={}",
+                    in_flight.len()
+                ),
+            );
+            if let Some(surface) = pending_surface.take() {
+                let frame_interface = (*surface).FrameInterface;
+                if !frame_interface.is_null() {
+                    let _ = ((*frame_interface).Release)(surface);
+                }
+            }
+            let short_drain_deadline = Instant::now() + Duration::from_millis(200);
+            while !in_flight.is_empty() && Instant::now() < short_drain_deadline {
+                match try_sync_one_async_encode(
+                    &api,
+                    session,
+                    &mut in_flight,
+                    &mut bitstream_pool,
+                    0,
+                )? {
+                    TrySyncResult::Ready(Some(sample)) => {
+                        push_record_hevc_sample(&mut samples, sample, &mut encoded_sink)
+                    }
+                    TrySyncResult::Ready(None) => break,
+                    TrySyncResult::NotReady => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            if let Some(capture) = audio_capture.as_mut() {
+                capture.stop_without_reencode(&mut notes);
+            }
+            let close_status = (api.mfx_video_encode_close)(session);
+            let mfx_close_status = (api.mfx_close)(session);
+            (api.mfx_unload)(loader);
+            sink_status(
+                &mut encoded_sink,
+                format!(
+                    "停止排查：快速释放完成，close_status={} mfx_close_status={} leftover_in_flight={} cleanup={:.1}ms total={:.1}ms",
+                    close_status,
+                    mfx_close_status,
+                    in_flight.len(),
+                    stop_cleanup_started.elapsed().as_secs_f64() * 1000.0,
+                    record_started.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
+            return Err(BackendError::unsupported(
+                "停止即时回放",
+                "用户停止请求",
+                "已快速中止当前录制片段；停止路径不再等待正常段结束的 flush/AAC 完整重建",
+            ));
         }
 
         while !in_flight.is_empty() {
@@ -2922,6 +3135,17 @@ fn record_d3d11_onecopy_mp4_impl(
             video_processor_format_flags_out: format_flags_out,
             notes,
         };
+
+        sink_status(
+            &mut encoded_sink,
+            format!(
+                "录制段正常结束并完成封装准备：captured_frames={} video_au={} audio_au={} total={:.1}ms",
+                captured_frames,
+                encoded_samples,
+                audio_access_units,
+                record_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
 
         Ok(VplOneCopyRecordOutput {
             report,
@@ -3129,6 +3353,12 @@ struct AsyncEncode {
 enum TrySyncResult {
     Ready(Option<crate::backend::mp4_mux::HevcAccessUnit>),
     NotReady,
+}
+
+fn sink_status(encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>, message: impl AsRef<str>) {
+    if let Some(sink) = encoded_sink.as_deref_mut() {
+        sink.status(message.as_ref());
+    }
 }
 
 fn push_record_hevc_sample(

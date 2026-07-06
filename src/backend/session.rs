@@ -40,6 +40,7 @@ struct CompletedClip {
 #[derive(Debug)]
 enum ReplayEvent {
     SegmentStarted { index: u64, path: PathBuf },
+    BackendStatus { index: u64, message: String },
     SegmentReady { index: u64, clip: CompletedClip },
     Error(String),
     Stopped,
@@ -83,6 +84,9 @@ impl ReplayController {
                         "后台即时回放片段 #{index} 开始录制到内存 encoded ring（调试路径标识：{}）",
                         path.display()
                     )),
+                    Ok(ReplayEvent::BackendStatus { index, message }) => {
+                        out.push(format!("后台即时回放片段 #{index}：{message}"));
+                    }
                     Ok(ReplayEvent::SegmentReady { index, clip }) => {
                         out.push(format!(
                             "后台即时回放片段 #{index} 已完成：{}，frames={} video_au={} audio_au={} duration={:.3}s，encoded_ring packets={} bytes={}",
@@ -330,6 +334,8 @@ fn run_segment_worker(
         let (result, sink_started) = {
             let mut sink = SessionRingSink {
                 ring: encoded_ring.clone(),
+                tx: tx.clone(),
+                segment_index,
                 started: false,
             };
             let result = pipeline::record_once_gpu_only_memory_output_with_sink_cancelable(
@@ -410,11 +416,21 @@ fn run_segment_worker(
 
 struct SessionRingSink {
     ring: Arc<Mutex<EncodedReplayRing>>,
+    tx: Sender<ReplayEvent>,
+    segment_index: u64,
     started: bool,
 }
 
 impl super::vpl::VplOneCopyRecordSink for SessionRingSink {
+    fn status(&mut self, message: &str) {
+        let _ = self.tx.send(ReplayEvent::BackendStatus {
+            index: self.segment_index,
+            message: message.to_owned(),
+        });
+    }
+
     fn video_track_started(&mut self, info: super::vpl::VplOutputTrackInfo) {
+        self.status("oneVPL 编码器已 Init，encoded ring 元数据已建立。");
         if let Ok(mut ring) = self.ring.lock() {
             ring.start_segment(EncodedReplayMetadata {
                 width: info.width,
