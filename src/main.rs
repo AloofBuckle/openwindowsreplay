@@ -8,6 +8,7 @@ mod backend;
 mod config;
 mod error;
 mod hotkey;
+mod indicator_overlay;
 mod rate_control;
 mod ring;
 mod tray;

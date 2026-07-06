@@ -4,6 +4,7 @@ use crate::backend::session::{ReplayController, ReplayState};
 use crate::backend::{ProbeCaps, RateControlFeatureSupport};
 use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
+use crate::indicator_overlay::{IndicatorOverlayRuntime, NativeIndicatorImage};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use crate::tray::{TrayEvent, TrayRuntime};
 use eframe::egui;
@@ -88,8 +89,10 @@ pub struct RustReplayApp {
     last_saved_config_json: String,
     hotkey: HotkeyRuntime,
     tray: TrayRuntime,
+    indicator_overlay: IndicatorOverlayRuntime,
     indicator_images: IndicatorImages,
     indicator_flash: Option<(IndicatorColor, Instant)>,
+    last_indicator_color: Option<IndicatorColor>,
     configuring_indicator_position: bool,
     waiting_save_hotkey: bool,
     allow_exit: bool,
@@ -113,6 +116,9 @@ impl RustReplayApp {
         let last_saved_config_json = config.stable_json();
         let initial_save_hotkey = config.save_hotkey;
         let (indicator_images, indicator_status) = build_indicator_images_for_config(&config);
+        let native_indicator_images = native_images_from_indicator_images(&indicator_images);
+        let indicator_x = config.indicator.position_x.round() as i32;
+        let indicator_y = config.indicator.position_y.round() as i32;
         let mut this = Self {
             config,
             caps: None,
@@ -128,8 +134,14 @@ impl RustReplayApp {
             last_saved_config_json,
             hotkey: HotkeyRuntime::new(initial_save_hotkey, cc.egui_ctx.clone()),
             tray: TrayRuntime::new(cc.egui_ctx.clone()),
+            indicator_overlay: IndicatorOverlayRuntime::new(
+                indicator_x,
+                indicator_y,
+                native_indicator_images,
+            ),
             indicator_images,
             indicator_flash: None,
+            last_indicator_color: None,
             configuring_indicator_position: false,
             waiting_save_hotkey: false,
             allow_exit: false,
@@ -499,7 +511,6 @@ impl RustReplayApp {
     fn update_indicator_runtime(&mut self, ctx: &egui::Context) {
         if !self.replay_indicator_visible() {
             self.indicator_flash = None;
-            return;
         }
 
         if self
@@ -512,6 +523,7 @@ impl RustReplayApp {
         } else if self.indicator_flash.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.sync_indicator_overlay();
     }
 
     fn replay_indicator_visible(&self) -> bool {
@@ -532,9 +544,30 @@ impl RustReplayApp {
     fn rebuild_indicator_images(&mut self) {
         let (images, status) = build_indicator_images_for_config(&self.config);
         self.indicator_images = images;
+        self.configure_indicator_overlay();
         if let Some(status) = status {
             self.loop_log.push(status);
         }
+    }
+
+    fn configure_indicator_overlay(&self) {
+        self.indicator_overlay.configure(
+            self.config.indicator.position_x.round() as i32,
+            self.config.indicator.position_y.round() as i32,
+            native_images_from_indicator_images(&self.indicator_images),
+        );
+    }
+
+    fn sync_indicator_overlay(&mut self) {
+        let desired = self.current_indicator_color();
+        if desired == self.last_indicator_color {
+            return;
+        }
+        match desired {
+            Some(color) => self.indicator_overlay.show(color.index()),
+            None => self.indicator_overlay.hide(),
+        }
+        self.last_indicator_color = desired;
     }
 
     fn import_indicator_image(&mut self) {
@@ -675,32 +708,6 @@ impl RustReplayApp {
     }
 
     fn show_indicator_viewports(&mut self, ctx: &egui::Context) {
-        if let Some(color) = self.current_indicator_color() {
-            let size = self.indicator_size_points(ctx);
-            let image = self.indicator_images.image(color);
-            let pos = egui::pos2(
-                self.config.indicator.position_x,
-                self.config.indicator.position_y,
-            );
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("rustreplay_status_indicator"),
-                egui::ViewportBuilder::default()
-                    .with_title("RustReplay 状态指示器")
-                    .with_decorations(false)
-                    .with_transparent(true)
-                    .with_always_on_top()
-                    .with_mouse_passthrough(true)
-                    .with_resizable(false)
-                    .with_position(pos)
-                    .with_inner_size([size, size]),
-                move |ui, _class| {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-                    draw_indicator_image(ui, &image, size, None);
-                },
-            );
-        }
-
         if self.configuring_indicator_position {
             let size = self.indicator_size_points(ctx);
             let image = self.indicator_images.image(IndicatorColor::Purple);
@@ -745,6 +752,7 @@ impl RustReplayApp {
                 self.config.indicator.position_x = pos.x;
                 self.config.indicator.position_y = pos.y;
                 self.configuring_indicator_position = false;
+                self.configure_indicator_overlay();
                 self.loop_log.push(format!(
                     "状态指示器位置已设置为 ({:.0}, {:.0})。",
                     pos.x, pos.y
@@ -1125,6 +1133,32 @@ fn draw_indicator_image(
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+}
+
+fn native_images_from_indicator_images(images: &IndicatorImages) -> Vec<NativeIndicatorImage> {
+    images
+        .images
+        .iter()
+        .map(native_image_from_color_image)
+        .collect()
+}
+
+fn native_image_from_color_image(image: &egui::ColorImage) -> NativeIndicatorImage {
+    let mut premul_bgra = Vec::with_capacity(image.pixels.len() * 4);
+    for pixel in &image.pixels {
+        let [red, green, blue, alpha] = pixel.to_srgba_unmultiplied();
+        let alpha_u16 = alpha as u16;
+        let premul = |channel: u8| ((channel as u16 * alpha_u16 + 127) / 255) as u8;
+        premul_bgra.push(premul(blue));
+        premul_bgra.push(premul(green));
+        premul_bgra.push(premul(red));
+        premul_bgra.push(alpha);
+    }
+    NativeIndicatorImage {
+        width: image.size[0] as i32,
+        height: image.size[1] as i32,
+        premul_bgra,
+    }
 }
 
 fn build_indicator_images_for_config(config: &AppConfig) -> (IndicatorImages, Option<String>) {
