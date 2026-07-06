@@ -13,6 +13,7 @@ mod rate_control;
 mod ring;
 mod tray;
 
+use config::AppConfig;
 use eframe::egui;
 
 fn main() {
@@ -25,12 +26,18 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     set_process_dpi_awareness();
 
+    let start_to_tray = AppConfig::load_from_disk()
+        .ok()
+        .flatten()
+        .is_some_and(|config| config.start_minimized_to_tray);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RustReplay 即时回放")
             .with_decorations(false)
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([980.0, 620.0]),
+            .with_min_inner_size([980.0, 620.0])
+            .with_visible(!start_to_tray),
         ..Default::default()
     };
 

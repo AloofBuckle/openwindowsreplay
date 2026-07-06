@@ -96,7 +96,6 @@ pub struct RustReplayApp {
     configuring_indicator_position: bool,
     waiting_save_hotkey: bool,
     startup_auto_start_pending: bool,
-    startup_minimize_pending: bool,
     allow_exit: bool,
 }
 
@@ -123,7 +122,6 @@ impl RustReplayApp {
         let indicator_y = config.indicator.position_y.round() as i32;
         let indicator_text_enabled = config.indicator.text_enabled;
         let startup_auto_start_pending = config.start_recording_on_launch;
-        let startup_minimize_pending = config.start_minimized_to_tray;
         let mut this = Self {
             config,
             caps: None,
@@ -151,7 +149,6 @@ impl RustReplayApp {
             configuring_indicator_position: false,
             waiting_save_hotkey: false,
             startup_auto_start_pending,
-            startup_minimize_pending,
             allow_exit: false,
         };
         if let Some(status) = indicator_status {
@@ -554,7 +551,6 @@ impl RustReplayApp {
         self.indicator_flash = None;
         self.waiting_save_hotkey = false;
         self.startup_auto_start_pending = false;
-        self.startup_minimize_pending = false;
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
         self.last_saved_config_json.clear();
         self.persist_config_if_changed();
@@ -657,16 +653,6 @@ impl RustReplayApp {
     fn is_initializing(&self) -> bool {
         self.probe_rx.is_some()
     }
-
-    fn apply_startup_window_mode(&mut self, ctx: &egui::Context) {
-        if !self.startup_minimize_pending {
-            return;
-        }
-        self.startup_minimize_pending = false;
-        self.loop_log
-            .push("启动自动折叠已启用，主界面已折叠，可从托盘打开。".to_owned());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-    }
 }
 
 impl eframe::App for RustReplayApp {
@@ -676,7 +662,6 @@ impl eframe::App for RustReplayApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
-        self.apply_startup_window_mode(ctx);
         self.receive_probe();
         for line in self.controller.drain_log_messages() {
             self.loop_log.push(line);
