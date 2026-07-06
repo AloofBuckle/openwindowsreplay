@@ -4396,12 +4396,12 @@ unsafe fn run_dda_capture_thread(
     let mut last_accepted_present_qpc: Option<i64> = None;
     let mut encoder_warmup_pending = false;
     let mut encoder_warmup_done = false;
-    let dda_pipeline_warmup_frames = 8u32;
+    let dda_pipeline_warmup_frames = 4u32;
     // DDA can report a burst of accumulated frames immediately after the
-    // encoder/copy workload starts. Require about 0.4s of stable 144Hz source
+    // encoder/copy workload starts. Require about 0.2s of stable 144Hz source
     // intervals before anchoring the official timeline so short recordings do
     // not begin on a startup burst.
-    let dda_pipeline_warmup_stable_intervals_required = 60u32;
+    let dda_pipeline_warmup_stable_intervals_required = 30u32;
     let mut dda_pipeline_warmup_remaining = 0u32;
     let mut dda_pipeline_warmup_stable_intervals = 0u32;
     let mut dda_pipeline_warmup_last_present_qpc: Option<i64> = None;
@@ -4833,7 +4833,7 @@ unsafe fn run_wgc_capture_thread(
 
     const WGC_WARMUP_MIN_DELTA_100NS: i64 = 60_000;
     const WGC_WARMUP_MAX_DELTA_100NS: i64 = 80_000;
-    const WGC_WARMUP_STABLE_INTERVALS: u32 = 144;
+    const WGC_WARMUP_STABLE_INTERVALS: u32 = 72;
 
     let capture_duration = end_at.saturating_duration_since(start);
     let ro_guard = match RoInitialize(RO_INIT_MULTITHREADED) {
@@ -4912,8 +4912,8 @@ unsafe fn run_wgc_capture_thread(
     // 固定 WGC 路线：按后端选择的 SDR/HDR route 捕获为 BGRA8/FP16，
     // 捕获线程 GPU shader 写目标 FourCC surface；编码线程仅 CopyResource 到 oneVPL surface。
     let wgc_frame_pool_size = 4;
-    let post_warmup_discard_frames = 60;
-    let pipeline_warmup_frames = 119;
+    let post_warmup_discard_frames = 24;
+    let pipeline_warmup_frames = 48;
     let pipeline_warmup_stable_intervals_required = 0;
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,

@@ -1,6 +1,6 @@
 //! egui 中文界面。
 
-use crate::backend::session::{ReplayController, ReplayState};
+use crate::backend::session::{ReplayController, ReplaySaveReadiness, ReplayState};
 use crate::backend::{ProbeCaps, RateControlFeatureSupport};
 use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
@@ -393,6 +393,32 @@ impl RustReplayApp {
                 .push("等待初始化完成，暂不能保存回放。".to_owned());
             return;
         }
+        for line in self.controller.drain_log_messages() {
+            self.loop_log.push(line);
+        }
+        match self.controller.save_readiness() {
+            ReplaySaveReadiness::Ready => {}
+            ReplaySaveReadiness::Idle => {
+                self.loop_log
+                    .push("当前没有正在运行的后台录制，不能保存回放。".to_owned());
+                return;
+            }
+            ReplaySaveReadiness::Starting => {
+                self.indicator_flash = Some((IndicatorColor::Yellow, Instant::now()));
+                self.loop_log.push(
+                    "后台录制正在初始化，等待 encoded ring 收到首批 HEVC/AAC 后再保存。".to_owned(),
+                );
+                return;
+            }
+            ReplaySaveReadiness::WaitingForAudio => {
+                self.indicator_flash = Some((IndicatorColor::Yellow, Instant::now()));
+                self.loop_log.push(
+                    "后台录制已有视频 access unit，仍在等待音频 access unit；请稍后保存。"
+                        .to_owned(),
+                );
+                return;
+            }
+        }
         match self.controller.save(&self.config) {
             Ok(()) => {
                 self.indicator_flash = Some((IndicatorColor::Green, Instant::now()));
@@ -655,10 +681,24 @@ impl RustReplayApp {
         }
         match self.controller.state() {
             ReplayState::Idle => "状态：空闲".to_owned(),
-            ReplayState::Running { started_at } => format!(
-                "状态：录制中，已运行 {:.1}s",
-                started_at.elapsed().as_secs_f32()
-            ),
+            ReplayState::Running { started_at } => match self.controller.save_readiness() {
+                ReplaySaveReadiness::Starting => format!(
+                    "状态：录制初始化中，已运行 {:.1}s",
+                    started_at.elapsed().as_secs_f32()
+                ),
+                ReplaySaveReadiness::WaitingForAudio => format!(
+                    "状态：录制中，等待音频，已运行 {:.1}s",
+                    started_at.elapsed().as_secs_f32()
+                ),
+                ReplaySaveReadiness::Ready => format!(
+                    "状态：录制中，可保存，已运行 {:.1}s",
+                    started_at.elapsed().as_secs_f32()
+                ),
+                ReplaySaveReadiness::Idle => format!(
+                    "状态：录制中，已运行 {:.1}s",
+                    started_at.elapsed().as_secs_f32()
+                ),
+            },
             ReplayState::Stopping { started_at } => format!(
                 "状态：正在停止后台录制，已运行 {:.1}s",
                 started_at.elapsed().as_secs_f32()
@@ -670,6 +710,10 @@ impl RustReplayApp {
         self.probe_rx.is_none()
             && self.caps.is_some()
             && matches!(self.controller.state(), ReplayState::Idle)
+    }
+
+    fn can_save_replay(&self) -> bool {
+        !self.is_initializing() && self.controller.save_readiness().can_save()
     }
 
     fn is_initializing(&self) -> bool {
@@ -798,8 +842,8 @@ impl RustReplayApp {
                 self.click_start();
             }
             if ui
-                .add_enabled(!initializing, egui::Button::new(save_label))
-                .on_disabled_hover_text("等待初始化")
+                .add_enabled(self.can_save_replay(), egui::Button::new(save_label))
+                .on_disabled_hover_text("等待后台录制产生可保存的 HEVC/AAC")
                 .clicked()
             {
                 self.click_save();

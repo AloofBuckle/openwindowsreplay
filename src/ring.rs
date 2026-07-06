@@ -154,6 +154,15 @@ pub struct EncodedReplaySnapshot {
     pub audio_track: Option<AacLcMp4Track>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodedReplayAvailability {
+    pub metadata_ready: bool,
+    pub video_packets: usize,
+    pub audio_packets: usize,
+    pub pending_video_packet: bool,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedReplayRing {
     ring: EncodedRingBuffer,
@@ -397,6 +406,26 @@ impl EncodedReplayRing {
         })
     }
 
+    pub fn availability(&self) -> EncodedReplayAvailability {
+        EncodedReplayAvailability {
+            metadata_ready: self.metadata.is_some(),
+            video_packets: self
+                .ring
+                .packets
+                .iter()
+                .filter(|packet| packet.stream == EncodedStreamKind::Video)
+                .count(),
+            audio_packets: self
+                .ring
+                .packets
+                .iter()
+                .filter(|packet| packet.stream == EncodedStreamKind::Audio)
+                .count(),
+            pending_video_packet: self.pending_video.is_some(),
+            bytes: self.ring.bytes(),
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.ring.bytes()
     }
@@ -497,6 +526,34 @@ mod tests {
         assert_eq!(snap.video_track.samples[0].timestamp_90k, 0);
         assert!(snap.video_track.samples[0].is_sync);
         assert_eq!(snap.audio_track.unwrap().samples[0].timestamp_ticks, 0);
+    }
+
+    #[test]
+    fn replay_ring_availability_separates_metadata_pending_video_and_audio() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(EncodedReplayMetadata {
+            width: 16,
+            height: 16,
+            color: NclxColorMetadata::bt709_full(),
+            codec: HevcCodecMetadata::main_420_8(),
+            audio_sample_rate: 48_000,
+            audio_channel_count: 2,
+        });
+        let availability = replay.availability();
+        assert!(availability.metadata_ready);
+        assert_eq!(availability.video_packets, 0);
+        assert_eq!(availability.audio_packets, 0);
+
+        replay.push_video_au_90k(&hevc(0, true));
+        let availability = replay.availability();
+        assert_eq!(availability.video_packets, 0);
+        assert!(availability.pending_video_packet);
+
+        replay.push_video_au_90k(&hevc(90_000, false));
+        replay.push_audio_au_ticks(&aac(0), 48_000);
+        let availability = replay.availability();
+        assert_eq!(availability.video_packets, 1);
+        assert_eq!(availability.audio_packets, 1);
     }
 
     fn pkt(pts_ns: u64) -> EncodedPacket {

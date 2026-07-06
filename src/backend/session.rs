@@ -24,6 +24,20 @@ pub enum ReplayState {
     Stopping { started_at: Instant },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaySaveReadiness {
+    Idle,
+    Starting,
+    WaitingForAudio,
+    Ready,
+}
+
+impl ReplaySaveReadiness {
+    pub const fn can_save(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompletedClip {
     cache_path: PathBuf,
@@ -72,6 +86,32 @@ impl Default for ReplayController {
 impl ReplayController {
     pub fn state(&self) -> &ReplayState {
         &self.state
+    }
+
+    pub fn save_readiness(&self) -> ReplaySaveReadiness {
+        if self.latest_clip.is_some() {
+            return ReplaySaveReadiness::Ready;
+        }
+        if !matches!(
+            self.state,
+            ReplayState::Running { .. } | ReplayState::Stopping { .. }
+        ) {
+            return ReplaySaveReadiness::Idle;
+        }
+        let Some(ring) = &self.live_ring else {
+            return ReplaySaveReadiness::Starting;
+        };
+        let Ok(ring) = ring.lock() else {
+            return ReplaySaveReadiness::Starting;
+        };
+        let availability = ring.availability();
+        if availability.video_packets > 0 && availability.audio_packets > 0 {
+            ReplaySaveReadiness::Ready
+        } else if availability.video_packets > 0 || availability.pending_video_packet {
+            ReplaySaveReadiness::WaitingForAudio
+        } else {
+            ReplaySaveReadiness::Starting
+        }
     }
 
     pub fn drain_log_messages(&mut self) -> Vec<String> {
