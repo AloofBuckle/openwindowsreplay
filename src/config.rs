@@ -6,9 +6,12 @@
 
 use crate::rate_control::RateControlConfig;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
+    pub capture_backend: CaptureBackend,
     pub chroma: Option<ChromaSampling>,
     pub rate_control: RateControlConfig,
     pub cache_dir: String,
@@ -19,11 +22,77 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            capture_backend: CaptureBackend::Wgc,
             chroma: None,
             rate_control: RateControlConfig::default(),
             cache_dir: "cache".to_owned(),
             save_dir: "replays".to_owned(),
             replay_minutes: 3.0,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn config_path() -> PathBuf {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("RustReplay").join("config.json")
+    }
+
+    pub fn load_from_disk() -> Result<Option<Self>, String> {
+        let path = Self::config_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| format!("读取配置文件 {} 失败：{err}", path.display()))?;
+        serde_json::from_str::<Self>(&text)
+            .map(Some)
+            .map_err(|err| format!("解析配置文件 {} 失败：{err}", path.display()))
+    }
+
+    pub fn save_to_disk(&self) -> Result<(), String> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("创建配置目录 {} 失败：{err}", parent.display()))?;
+        }
+        let text =
+            serde_json::to_string_pretty(self).map_err(|err| format!("序列化配置失败：{err}"))?;
+        std::fs::write(&path, text)
+            .map_err(|err| format!("写入配置文件 {} 失败：{err}", path.display()))
+    }
+
+    pub fn stable_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureBackend {
+    Dda,
+    #[default]
+    Wgc,
+}
+
+impl CaptureBackend {
+    pub const fn all() -> [Self; 2] {
+        [Self::Wgc, Self::Dda]
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dda => "DDA（不录光标）",
+            Self::Wgc => "WGC（录制光标）",
+        }
+    }
+
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            Self::Dda => "DDA",
+            Self::Wgc => "WGC",
         }
     }
 }

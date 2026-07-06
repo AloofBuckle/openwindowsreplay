@@ -2,7 +2,7 @@
 
 use crate::backend::session::{ReplayController, ReplayState};
 use crate::backend::{ProbeCaps, RateControlFeatureSupport};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CaptureBackend};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use eframe::egui;
 use std::sync::Arc;
@@ -17,19 +17,38 @@ pub struct RustReplayApp {
     encoder_log: Vec<String>,
     loop_log: Vec<String>,
     last_status_refresh: Instant,
+    last_saved_config_json: String,
 }
 
 impl RustReplayApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let font_status = install_chinese_font(&cc.egui_ctx);
+        let config_path = AppConfig::config_path();
+        let (config, config_status) = match AppConfig::load_from_disk() {
+            Ok(Some(config)) => (config, format!("配置已加载：{}", config_path.display())),
+            Ok(None) => (
+                AppConfig::default(),
+                format!("未找到配置文件，将使用默认配置：{}", config_path.display()),
+            ),
+            Err(err) => (
+                AppConfig::default(),
+                format!("配置加载失败，已使用默认配置：{err}"),
+            ),
+        };
+        let last_saved_config_json = config.stable_json();
         let mut this = Self {
-            config: AppConfig::default(),
+            config,
             caps: None,
             probe_rx: None,
             controller: ReplayController::default(),
-            encoder_log: vec![font_status, "正在启动能力探测线程……".to_owned()],
+            encoder_log: vec![
+                font_status,
+                config_status,
+                "正在启动能力探测线程……".to_owned(),
+            ],
             loop_log: vec!["循环器尚未启动。".to_owned()],
             last_status_refresh: Instant::now(),
+            last_saved_config_json,
         };
         this.start_probe();
         this
@@ -215,6 +234,23 @@ impl RustReplayApp {
         self.caps = Some(caps);
     }
 
+    fn persist_config_if_changed(&mut self) {
+        let current = self.config.stable_json();
+        if current == self.last_saved_config_json {
+            return;
+        }
+        match self.config.save_to_disk() {
+            Ok(()) => {
+                self.last_saved_config_json = current;
+                self.encoder_log.push(format!(
+                    "配置已保存：{}",
+                    AppConfig::config_path().display()
+                ));
+            }
+            Err(err) => self.encoder_log.push(format!("配置保存失败：{err}")),
+        }
+    }
+
     fn click_start(&mut self) {
         let Some(caps) = &self.caps else {
             self.loop_log
@@ -266,6 +302,7 @@ impl eframe::App for RustReplayApp {
             ctx.request_repaint_after(Duration::from_millis(500));
             self.last_status_refresh = Instant::now();
         }
+        self.persist_config_if_changed();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -386,6 +423,15 @@ impl RustReplayApp {
     fn right_loop_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("录制循环器参数");
         ui.group(|ui| {
+            ui.label("捕获后端");
+            for backend in CaptureBackend::all() {
+                ui.radio_value(&mut self.config.capture_backend, backend, backend.label());
+            }
+            ui.small(format!(
+                "当前选择：{}；DDA 不录制鼠标光标，WGC 录制鼠标光标。",
+                self.config.capture_backend.short_name()
+            ));
+            ui.separator();
             ui.horizontal(|ui| {
                 ui.label("循环缓存的目录 {dir：}");
                 ui.text_edit_singleline(&mut self.config.cache_dir);

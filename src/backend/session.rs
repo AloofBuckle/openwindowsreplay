@@ -6,7 +6,7 @@
 //! 不重编码、不复制 raw frame，也不绕开生产编码路径。
 
 use super::{ProbeCaps, pipeline};
-use crate::config::{AppConfig, ChromaSampling};
+use crate::config::{AppConfig, CaptureBackend, ChromaSampling};
 use crate::error::BackendError;
 use crate::ring::{EncodedReplayMetadata, EncodedReplayRing};
 use std::fs;
@@ -148,9 +148,7 @@ impl ReplayController {
         fs::create_dir_all(&cache_dir).map_err(|err| BackendError::Io(err.to_string()))?;
 
         let request = pipeline::RecordingRequest {
-            // GUI 没有捕获后端选择项；成品固定优先使用 WGC，因为它负责录制光标。
-            // DDA 仍作为后端固定路线存在，但不在 GUI 中暴露切换项。
-            capture_backend: pipeline::CaptureBackendKind::Wgc,
+            capture_backend: capture_backend_for_config(config.capture_backend),
             color_transform: pipeline::ColorTransformKind::AutoFromDisplay,
             chroma_writer: chroma_writer_for_chroma(chroma),
             rate_control: config.rate_control.clone(),
@@ -285,6 +283,13 @@ fn chroma_writer_for_chroma(chroma: ChromaSampling) -> pipeline::ChromaWriterKin
         ChromaSampling::Yuv420 => pipeline::ChromaWriterKind::Auto420,
         ChromaSampling::Yuv422 => pipeline::ChromaWriterKind::Auto422,
         ChromaSampling::Yuv444 => pipeline::ChromaWriterKind::Auto444,
+    }
+}
+
+fn capture_backend_for_config(backend: CaptureBackend) -> pipeline::CaptureBackendKind {
+    match backend {
+        CaptureBackend::Dda => pipeline::CaptureBackendKind::Dda,
+        CaptureBackend::Wgc => pipeline::CaptureBackendKind::Wgc,
     }
 }
 

@@ -5,9 +5,9 @@ RustReplay 是一个 Windows 桌面即时回放程序，GUI 使用 `egui/eframe`
 当前成品范围：
 
 - 启动即打开中文 GUI；不保留调试命令行、无窗口探测或自检入口。
-- GUI：开始/保存/停止即时回放、色度采样、oneVPL RateControlMethod 引导式参数、循环缓存目录/保存目录/回放时长、双日志区。
+- GUI：开始/保存/停止即时回放、DDA/WGC 捕获后端、色度采样、oneVPL RateControlMethod 引导式参数、循环缓存目录/保存目录/回放时长、双日志区。
 - 启动能力探测：DXGI adapter LUID、oneVPL dispatcher/implementation、HEVC profile、输入 FourCC、RateControlMethod、当前显示器可生产路线。
-- 前端规则：当前机器/路径不可用的字段直接隐藏；详细原因写入日志。
+- 前端规则：当前机器/路径不可用的字段直接隐藏；详细原因写入日志。配置自动保存到 `%APPDATA%\RustReplay\config.json`。
 - 视频生产路线：DDA texture 或 WGC BGRA8/FP16 → GPU shader/VideoProcessor 转换到目标 FourCC → 一次 GPU `CopyResource` 写入 oneVPL 内部分配 D3D11 surface → HEVC → MP4。
 - 发布规则：发布包包含 `rust_replay.exe`，并打包 `libvpl.dll` / `libvpl-2.dll` 等用户态依赖；GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提。
 - 色彩策略：按当前显示器状态与 DDA/WGC 实际给到的数据做高保真；未实现或不能保证的桌面模式返回 `UnsupportedGpuPath`，原因包含 `不支持的桌面模式`，不会伪装降级。
