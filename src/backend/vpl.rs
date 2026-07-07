@@ -2563,7 +2563,8 @@ fn record_d3d11_onecopy_mp4_impl(
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
             let (free_tx, free_rx) = std::sync::mpsc::channel::<SnapshotSlot>();
-            let stop = record_stop.clone();
+            let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop = capture_stop.clone();
             let capture_thread_started = Instant::now();
             let capture_handle = match capture_source {
                 RecordCaptureSource::Dda => {
@@ -2625,6 +2626,10 @@ fn record_d3d11_onecopy_mp4_impl(
             let mut pending_free_slots: Vec<SnapshotSlot> = Vec::new();
 
             loop {
+                if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
                 return_ready_snapshot_slots(&mut pending_free_slots, &immediate, &free_tx, false)?;
                 let msg = match frame_rx.recv_timeout(Duration::from_millis(2)) {
                     Ok(msg) => msg,
