@@ -9,7 +9,8 @@ use super::{ProbeCaps, pipeline};
 use crate::config::{AppConfig, CaptureBackend, ChromaSampling};
 use crate::error::BackendError;
 use crate::ring::{EncodedReplayMetadata, EncodedReplayRing};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -190,6 +191,8 @@ impl ReplayController {
         let chroma = validate_config(config, caps)?;
         let cache_dir = PathBuf::from(&config.cache_dir);
         fs::create_dir_all(&cache_dir).map_err(|err| BackendError::Io(err.to_string()))?;
+        reset_backend_timing_log();
+        append_backend_timing_log("ReplayController::start accepted; spawning backend worker");
 
         let request = pipeline::RecordingRequest {
             capture_backend: capture_backend_for_config(config.capture_backend),
@@ -524,6 +527,7 @@ impl super::vpl::VplOneCopyRecordSink for SessionRingSink {
 
 impl SessionRingSink {
     fn send_status(&mut self, message: &str) {
+        append_backend_timing_log(message);
         let _ = self.tx.send(ReplayEvent::BackendStatus {
             index: self.segment_index,
             message: message.to_owned(),
@@ -538,6 +542,31 @@ impl SessionRingSink {
                 self.created_at.elapsed().as_secs_f64() * 1000.0
             ));
         }
+    }
+}
+
+fn backend_timing_log_path() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("OneVPL Replay").join("backend_timing.log")
+}
+
+fn reset_backend_timing_log() {
+    let path = backend_timing_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, "");
+}
+
+fn append_backend_timing_log(message: &str) {
+    let path = backend_timing_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
     }
 }
 
