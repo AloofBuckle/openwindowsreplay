@@ -856,8 +856,8 @@ impl DiskSegmentSink {
     }
 
     fn hevc_access_unit(&mut self, sample: &HevcAccessUnit) {
+        self.remember_parameter_sets(sample);
         if sample.discard_from_track {
-            self.header_units.push(sample.clone());
             return;
         }
         let Some(metadata) = self.metadata.clone() else {
@@ -921,6 +921,29 @@ impl DiskSegmentSink {
         {
             current.push_audio(sample);
         }
+    }
+
+    fn remember_parameter_sets(&mut self, sample: &HevcAccessUnit) {
+        if !sample.discard_from_track && !sample.is_sync && !self.header_units.is_empty() {
+            return;
+        }
+        let Some(data) = super::mp4_mux::hevc_annex_b_parameter_set_access_unit(&sample.data)
+        else {
+            return;
+        };
+        if self
+            .header_units
+            .iter()
+            .any(|header| header.data.as_slice() == data.as_slice())
+        {
+            return;
+        }
+        self.header_units.push(HevcAccessUnit {
+            timestamp_90k: 0,
+            data,
+            is_sync: false,
+            discard_from_track: true,
+        });
     }
 
     fn flush_ready_pending(&mut self) {

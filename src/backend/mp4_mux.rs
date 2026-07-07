@@ -435,6 +435,60 @@ fn hevc_annex_b_to_length_prefixed(
     Ok((out, is_sync, sets))
 }
 
+pub(crate) fn hevc_annex_b_is_sync(data: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while let Some((start, code_len)) = find_start_code(data, pos) {
+        let nal_start = start + code_len;
+        let next = find_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(data.len());
+        pos = next;
+        if nal_start >= next {
+            continue;
+        }
+        let mut nal = &data[nal_start..next];
+        while nal.last().copied() == Some(0) {
+            nal = &nal[..nal.len() - 1];
+        }
+        if nal.len() < 2 {
+            continue;
+        }
+        let nal_type = (nal[0] >> 1) & 0x3f;
+        if matches!(nal_type, 19..=21) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn hevc_annex_b_parameter_set_access_unit(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some((start, code_len)) = find_start_code(data, pos) {
+        let nal_start = start + code_len;
+        let next = find_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(data.len());
+        pos = next;
+        if nal_start >= next {
+            continue;
+        }
+        let mut nal = &data[nal_start..next];
+        while nal.last().copied() == Some(0) {
+            nal = &nal[..nal.len() - 1];
+        }
+        if nal.len() < 2 {
+            continue;
+        }
+        let nal_type = (nal[0] >> 1) & 0x3f;
+        if matches!(nal_type, 32..=34) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(nal);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     while i + 3 <= data.len() {
@@ -1215,6 +1269,17 @@ mod tests {
                 String::from_utf8_lossy(needle)
             );
         }
+    }
+
+    #[test]
+    fn hevc_annex_b_detects_sync_and_extracts_parameter_sets() {
+        let au = fake_hevc_annex_b_access_unit();
+
+        assert!(hevc_annex_b_is_sync(&au));
+
+        let sets = hevc_annex_b_parameter_set_access_unit(&au).unwrap();
+        assert!(sets.windows(2).any(|window| window == [0, 1]));
+        assert!(!sets.windows(2).any(|window| window == [38, 1]));
     }
 
     #[test]

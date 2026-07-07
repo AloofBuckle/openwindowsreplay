@@ -3842,20 +3842,17 @@ unsafe fn finish_synced_async_encode(
         bitstream_pool.push(flight.storage);
         return Ok(None);
     }
-    if flight.discard {
-        bitstream_pool.push(flight.storage);
-        return Ok(None);
-    }
     let start = flight
         .bitstream
         .Data
         .add(flight.bitstream.DataOffset as usize);
     let data = std::slice::from_raw_parts(start, len).to_vec();
+    let is_sync = flight.is_sync || crate::backend::mp4_mux::hevc_annex_b_is_sync(&data);
     bitstream_pool.push(flight.storage);
     Ok(Some(crate::backend::mp4_mux::HevcAccessUnit {
         timestamp_90k: flight.timestamp_90k,
         data,
-        is_sync: flight.is_sync,
+        is_sync,
         discard_from_track: flight.discard,
     }))
 }
@@ -3972,12 +3969,13 @@ unsafe fn flush_encoder(
                 skipped_non_monotonic = skipped_non_monotonic.saturating_add(1);
                 continue;
             }
+            let is_sync = crate::backend::mp4_mux::hevc_annex_b_is_sync(&encoded.bytes);
             push_record_hevc_sample(
                 samples,
                 crate::backend::mp4_mux::HevcAccessUnit {
                     timestamp_90k,
                     data: encoded.bytes,
-                    is_sync: false,
+                    is_sync,
                     discard_from_track: false,
                 },
                 encoded_sink,
