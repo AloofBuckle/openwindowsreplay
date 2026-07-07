@@ -15,7 +15,7 @@ use crate::error::BackendError;
 use crate::ring::{EncodedReplayMetadata, EncodedReplayRing};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1336,7 +1336,8 @@ fn write_disk_segment_sidecar(
     {
         fs::create_dir_all(parent).map_err(|err| BackendError::Io(err.to_string()))?;
     }
-    let mut file = fs::File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let file = fs::File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let mut file = BufWriter::with_capacity(1024 * 1024, file);
     file.write_all(DISK_SEGMENT_SIDECAR_MAGIC)
         .map_err(|err| BackendError::Io(err.to_string()))?;
     write_u16(&mut file, segment.video_track.width)?;
@@ -1371,7 +1372,8 @@ fn write_disk_segment_sidecar(
 }
 
 fn read_disk_segment_sidecar(path: &Path) -> Result<DiskSegmentTracks, BackendError> {
-    let mut file = fs::File::open(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let file = fs::File::open(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let mut file = BufReader::with_capacity(1024 * 1024, file);
     let mut magic = [0u8; 8];
     file.read_exact(&mut magic)
         .map_err(|err| BackendError::Io(err.to_string()))?;

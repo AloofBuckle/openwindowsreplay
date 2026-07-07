@@ -7,7 +7,7 @@ use crate::error::BackendError;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 const VIDEO_TIMESCALE: u32 = 90_000;
@@ -246,7 +246,8 @@ pub fn write_hevc_aac_mp4(
     {
         fs::create_dir_all(parent).map_err(|err| BackendError::Io(err.to_string()))?;
     }
-    let mut file = File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let file = File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let mut file = BufWriter::with_capacity(1024 * 1024, file);
     file.write_all(&ftyp)
         .map_err(|err| BackendError::Io(err.to_string()))?;
     file.write_all(&mdat_header)
@@ -505,7 +506,7 @@ fn make_mdat_header(payload_len: u64) -> Vec<u8> {
 }
 
 fn write_mdat_payload(
-    out: &mut File,
+    out: &mut impl Write,
     video_samples: &[PreparedSample],
     audio_samples: Option<&[PreparedAudioSample]>,
 ) -> Result<(), BackendError> {
