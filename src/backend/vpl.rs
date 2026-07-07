@@ -3544,6 +3544,7 @@ struct EncodedSurfaceBytes {
     encode_status: i32,
     sync_status: i32,
     timestamp_90k: u64,
+    frame_type: u16,
     bytes: Vec<u8>,
 }
 
@@ -3675,6 +3676,10 @@ fn push_record_hevc_sample(
     if retain_sample || sample.discard_from_track {
         samples.push(sample);
     }
+}
+
+fn mfx_frame_type_is_sync(frame_type: u16) -> bool {
+    frame_type & (MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_I) != 0
 }
 
 unsafe fn submit_encode_async(
@@ -3847,7 +3852,7 @@ unsafe fn finish_synced_async_encode(
         .Data
         .add(flight.bitstream.DataOffset as usize);
     let data = std::slice::from_raw_parts(start, len).to_vec();
-    let is_sync = flight.is_sync || crate::backend::mp4_mux::hevc_annex_b_is_sync(&data);
+    let is_sync = flight.is_sync || mfx_frame_type_is_sync(flight.bitstream.FrameType);
     bitstream_pool.push(flight.storage);
     Ok(Some(crate::backend::mp4_mux::HevcAccessUnit {
         timestamp_90k: flight.timestamp_90k,
@@ -3909,6 +3914,7 @@ unsafe fn encode_surface_or_flush_bytes(
             encode_status,
             sync_status: i32::MIN,
             timestamp_90k: 0,
+            frame_type: 0,
             bytes: Vec::new(),
         });
     }
@@ -3942,6 +3948,7 @@ unsafe fn encode_surface_or_flush_bytes(
         encode_status,
         sync_status,
         timestamp_90k: bitstream.TimeStamp,
+        frame_type: bitstream.FrameType,
         bytes,
     })
 }
@@ -3969,7 +3976,7 @@ unsafe fn flush_encoder(
                 skipped_non_monotonic = skipped_non_monotonic.saturating_add(1);
                 continue;
             }
-            let is_sync = crate::backend::mp4_mux::hevc_annex_b_is_sync(&encoded.bytes);
+            let is_sync = mfx_frame_type_is_sync(encoded.frame_type);
             push_record_hevc_sample(
                 samples,
                 crate::backend::mp4_mux::HevcAccessUnit {
