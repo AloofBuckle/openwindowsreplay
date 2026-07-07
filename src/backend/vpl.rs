@@ -5262,9 +5262,7 @@ unsafe fn run_wgc_capture_thread(
         true,
     )
     .map_err(|err| err.to_string())?;
-    let shader_source_texture = create_dda_snapshot_texture(&device, &initial_source_desc)
-        .map_err(|err| err.to_string())?;
-    let capture_route_path = (route_intermediate, route_converter, shader_source_texture);
+    let capture_route_path = (route_intermediate, route_converter);
     initial_state.source_desc = Some(initial_snapshot_desc);
     for id in 0..pool_size {
         initial_state.free_slots.push_back(
@@ -5452,9 +5450,9 @@ unsafe fn run_wgc_capture_thread(
         slot.capture_mutex
             .AcquireSync(0, 1_000)
             .map_err(|err| format!("IDXGIKeyedMutex::AcquireSync(WGC capture thread): {err}"))?;
-        let (route_intermediate, route_converter, shader_source_texture) = &capture_route_path;
-        copy_texture_resource(&context, &source, shader_source_texture)
-            .and_then(|()| route_converter.convert(shader_source_texture))
+        let (route_intermediate, route_converter) = &capture_route_path;
+        route_converter
+            .convert(&source)
             .and_then(|()| {
                 copy_texture_resource(&context, route_intermediate, &slot.capture_texture)
             })
