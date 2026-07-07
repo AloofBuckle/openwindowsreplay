@@ -377,6 +377,10 @@ fn run_segment_worker(
                 tx: tx.clone(),
                 segment_index,
                 started: false,
+                created_at: Instant::now(),
+                first_video_au_seen: false,
+                first_audio_au_seen: false,
+                ready_seen: false,
             };
             let result = pipeline::record_once_gpu_only_memory_output_with_sink_cancelable(
                 &request,
@@ -459,14 +463,15 @@ struct SessionRingSink {
     tx: Sender<ReplayEvent>,
     segment_index: u64,
     started: bool,
+    created_at: Instant,
+    first_video_au_seen: bool,
+    first_audio_au_seen: bool,
+    ready_seen: bool,
 }
 
 impl super::vpl::VplOneCopyRecordSink for SessionRingSink {
     fn status(&mut self, message: &str) {
-        let _ = self.tx.send(ReplayEvent::BackendStatus {
-            index: self.segment_index,
-            message: message.to_owned(),
-        });
+        self.send_status(message);
     }
 
     fn video_track_started(&mut self, info: super::vpl::VplOutputTrackInfo) {
@@ -485,18 +490,53 @@ impl super::vpl::VplOneCopyRecordSink for SessionRingSink {
     }
 
     fn hevc_access_unit(&mut self, sample: &super::mp4_mux::HevcAccessUnit) {
+        if !sample.discard_from_track && !self.first_video_au_seen {
+            self.first_video_au_seen = true;
+            self.send_status(&format!(
+                "encoded ring 首个 HEVC access unit 到达：启动后 {:.1}ms",
+                self.created_at.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         if self.started
             && let Ok(mut ring) = self.ring.lock()
         {
             ring.push_video_au_90k(sample);
         }
+        self.report_ready_if_needed();
     }
 
     fn aac_access_unit(&mut self, sample: &super::mp4_mux::AacAccessUnit) {
+        if !self.first_audio_au_seen {
+            self.first_audio_au_seen = true;
+            self.send_status(&format!(
+                "encoded ring 首个 AAC access unit 到达：启动后 {:.1}ms",
+                self.created_at.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         if self.started
             && let Ok(mut ring) = self.ring.lock()
         {
             ring.push_audio_au_ticks(sample, crate::backend::audio::TARGET_SAMPLE_RATE);
+        }
+        self.report_ready_if_needed();
+    }
+}
+
+impl SessionRingSink {
+    fn send_status(&mut self, message: &str) {
+        let _ = self.tx.send(ReplayEvent::BackendStatus {
+            index: self.segment_index,
+            message: message.to_owned(),
+        });
+    }
+
+    fn report_ready_if_needed(&mut self) {
+        if !self.ready_seen && self.first_video_au_seen && self.first_audio_au_seen {
+            self.ready_seen = true;
+            self.send_status(&format!(
+                "encoded ring 已可保存：首批 HEVC/AAC 均到达，启动后 {:.1}ms",
+                self.created_at.elapsed().as_secs_f64() * 1000.0
+            ));
         }
     }
 }

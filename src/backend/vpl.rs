@@ -519,6 +519,125 @@ fn select_record_route_for_output(
         })
 }
 
+fn record_route_from_display_plan(
+    plan: &VplCurrentDisplayRouteInfo,
+) -> Result<VplRecordRoute, BackendError> {
+    let fourcc = fourcc_from_name(&plan.fourcc).ok_or_else(|| {
+        BackendError::unsupported(
+            "录制 RoutePlan",
+            format!("FourCC={}", plan.fourcc),
+            "不支持的桌面模式",
+        )
+    })?;
+    if plan.vpl_chroma == 0 || plan.vpl_profile == 0 || plan.bit_depth == 0 {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            plan.route_summary.clone(),
+            "能力探测没有提供完整 route 元数据，请重新探测能力",
+        ));
+    }
+    Ok(VplRecordRoute {
+        label: "Probe RoutePlan",
+        fourcc,
+        chroma: plan.vpl_chroma,
+        bit_depth: plan.bit_depth,
+        profile: plan.vpl_profile,
+        mp4_color: NclxColorMetadata {
+            colour_primaries: plan.nclx_colour_primaries,
+            transfer_characteristics: plan.nclx_transfer_characteristics,
+            matrix_coefficients: plan.nclx_matrix_coefficients,
+            full_range: plan.nclx_full_range,
+        },
+        mp4_codec: HevcCodecMetadata {
+            profile_idc: plan.codec_profile_idc,
+            chroma_format_idc: plan.codec_chroma_format_idc,
+            bit_depth_luma_minus8: plan.codec_bit_depth_luma_minus8,
+            bit_depth_chroma_minus8: plan.codec_bit_depth_chroma_minus8,
+        },
+    })
+}
+
+#[cfg(windows)]
+fn validate_current_display_route_plan(
+    plan: &VplCurrentDisplayRouteInfo,
+    adapter_index: u32,
+    output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+    output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
+    requested_chroma: ChromaSampling,
+) -> Result<(), BackendError> {
+    use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
+    use windows::core::Interface;
+
+    if plan.chroma != requested_chroma || plan.fourcc.is_empty() {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            format!(
+                "requested={} plan_chroma={} fourcc={}",
+                requested_chroma.doc_label(),
+                plan.chroma.doc_label(),
+                plan.fourcc
+            ),
+            "能力探测没有当前色度的可录制 route，请重新探测能力",
+        ));
+    }
+    if plan.adapter_index != adapter_index || plan.output_index != 0 {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            format!(
+                "plan adapter/output={}/{} current adapter/output={}/0",
+                plan.adapter_index, plan.output_index, adapter_index
+            ),
+            "显示输出已变化，请重新探测能力",
+        ));
+    }
+    let rect = output_desc.DesktopCoordinates;
+    if plan.desktop_left != rect.left
+        || plan.desktop_top != rect.top
+        || plan.desktop_right != rect.right
+        || plan.desktop_bottom != rect.bottom
+    {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            format!(
+                "plan rect={},{},{},{} current rect={},{},{},{}",
+                plan.desktop_left,
+                plan.desktop_top,
+                plan.desktop_right,
+                plan.desktop_bottom,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom
+            ),
+            "显示输出区域已变化，请重新探测能力",
+        ));
+    }
+    let output6 = output.cast::<IDXGIOutput6>().map_err(|_| {
+        BackendError::unsupported(
+            "录制 RoutePlan",
+            "IDXGIOutput6::GetDesc1",
+            "不支持的桌面模式",
+        )
+    })?;
+    let desc1 = unsafe {
+        output6.GetDesc1().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput6::GetDesc1(record RoutePlan guard)",
+            message: err.to_string(),
+        })?
+    };
+    if plan.color_space != desc1.ColorSpace.0 as u32 || plan.bits_per_color != desc1.BitsPerColor {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            format!(
+                "plan ColorSpace={} BitsPerColor={} current ColorSpace={} BitsPerColor={}",
+                plan.color_space, plan.bits_per_color, desc1.ColorSpace.0, desc1.BitsPerColor
+            ),
+            "显示色彩状态已变化，请重新探测能力",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 impl VplRecordRoute {
     fn try_dxgi_format(
@@ -668,10 +787,28 @@ pub struct VplRateControlFeatureProbe {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VplCurrentDisplayRouteInfo {
+    pub adapter_index: u32,
+    pub output_index: u32,
+    pub color_space: u32,
+    pub bits_per_color: u32,
+    pub desktop_left: i32,
+    pub desktop_top: i32,
+    pub desktop_right: i32,
+    pub desktop_bottom: i32,
     pub chroma: ChromaSampling,
     pub fourcc: String,
     pub bit_depth: u16,
+    pub vpl_chroma: u16,
+    pub vpl_profile: u16,
     pub profile: String,
+    pub nclx_colour_primaries: u16,
+    pub nclx_transfer_characteristics: u16,
+    pub nclx_matrix_coefficients: u16,
+    pub nclx_full_range: bool,
+    pub codec_profile_idc: u8,
+    pub codec_chroma_format_idc: u8,
+    pub codec_bit_depth_luma_minus8: u8,
+    pub codec_bit_depth_chroma_minus8: u8,
     pub route_summary: String,
     pub note: String,
 }
@@ -849,7 +986,8 @@ pub fn probe_vpl() -> VplProbeInfo {
 fn probe_current_display_record_routes(
     adapter_index: u32,
 ) -> Result<Vec<VplCurrentDisplayRouteInfo>, BackendError> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};
+    use windows::core::Interface;
 
     unsafe {
         let factory: IDXGIFactory1 =
@@ -870,6 +1008,21 @@ fn probe_current_display_record_routes(
                 func: "IDXGIAdapter1::EnumOutputs(0 current display route)",
                 message: err.to_string(),
             })?;
+        let output_desc = output.GetDesc().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput::GetDesc(current display route)",
+            message: err.to_string(),
+        })?;
+        let output6 = output.cast::<IDXGIOutput6>().map_err(|_| {
+            BackendError::unsupported(
+                "当前显示器 route 探测",
+                "IDXGIOutput6::GetDesc1",
+                "不支持的桌面模式",
+            )
+        })?;
+        let desc1 = output6.GetDesc1().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput6::GetDesc1(current display route)",
+            message: err.to_string(),
+        })?;
 
         let mut routes = Vec::new();
         for chroma in [
@@ -882,20 +1035,56 @@ fn probe_current_display_record_routes(
                 Ok(candidates) => {
                     for (index, route) in candidates.into_iter().enumerate() {
                         routes.push(VplCurrentDisplayRouteInfo {
+                            adapter_index,
+                            output_index: 0,
+                            color_space: desc1.ColorSpace.0 as u32,
+                            bits_per_color: desc1.BitsPerColor,
+                            desktop_left: output_desc.DesktopCoordinates.left,
+                            desktop_top: output_desc.DesktopCoordinates.top,
+                            desktop_right: output_desc.DesktopCoordinates.right,
+                            desktop_bottom: output_desc.DesktopCoordinates.bottom,
                             chroma,
                             fourcc: fourcc_to_string(route.fourcc),
                             bit_depth: route.bit_depth,
+                            vpl_chroma: route.chroma,
+                            vpl_profile: route.profile,
                             profile: hevc_profile_name(u32::from(route.profile)).to_owned(),
+                            nclx_colour_primaries: route.mp4_color.colour_primaries,
+                            nclx_transfer_characteristics: route.mp4_color.transfer_characteristics,
+                            nclx_matrix_coefficients: route.mp4_color.matrix_coefficients,
+                            nclx_full_range: route.mp4_color.full_range,
+                            codec_profile_idc: route.mp4_codec.profile_idc,
+                            codec_chroma_format_idc: route.mp4_codec.chroma_format_idc,
+                            codec_bit_depth_luma_minus8: route.mp4_codec.bit_depth_luma_minus8,
+                            codec_bit_depth_chroma_minus8: route.mp4_codec.bit_depth_chroma_minus8,
                             route_summary: route.summary(),
                             note: format!("{}；candidate_order={}", notes.join("；"), index + 1),
                         });
                     }
                 }
                 Err(err) => routes.push(VplCurrentDisplayRouteInfo {
+                    adapter_index,
+                    output_index: 0,
+                    color_space: desc1.ColorSpace.0 as u32,
+                    bits_per_color: desc1.BitsPerColor,
+                    desktop_left: output_desc.DesktopCoordinates.left,
+                    desktop_top: output_desc.DesktopCoordinates.top,
+                    desktop_right: output_desc.DesktopCoordinates.right,
+                    desktop_bottom: output_desc.DesktopCoordinates.bottom,
                     chroma,
                     fourcc: String::new(),
                     bit_depth: 0,
+                    vpl_chroma: 0,
+                    vpl_profile: 0,
                     profile: String::new(),
+                    nclx_colour_primaries: 0,
+                    nclx_transfer_characteristics: 0,
+                    nclx_matrix_coefficients: 0,
+                    nclx_full_range: false,
+                    codec_profile_idc: 0,
+                    codec_chroma_format_idc: 0,
+                    codec_bit_depth_luma_minus8: 0,
+                    codec_bit_depth_chroma_minus8: 0,
                     route_summary: format!("{} 当前显示状态无可用 route", chroma.doc_label()),
                     note: err.to_string(),
                 }),
@@ -1166,6 +1355,7 @@ pub fn record_d3d11_onecopy_mp4_output_cancelable(
         external_stop,
         true,
         None,
+        None,
     )
 }
 
@@ -1186,10 +1376,12 @@ pub fn record_d3d11_onecopy_memory_output_cancelable(
         requested_chroma,
         external_stop,
         None,
+        None,
     )
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn record_d3d11_onecopy_memory_output_with_sink_cancelable(
     adapter_index: u32,
     output: &Path,
@@ -1198,6 +1390,7 @@ pub fn record_d3d11_onecopy_memory_output_with_sink_cancelable(
     requested_chroma: ChromaSampling,
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     encoded_sink: Option<&mut dyn VplOneCopyRecordSink>,
+    route_plan: Option<&VplCurrentDisplayRouteInfo>,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
     record_d3d11_onecopy_mp4_impl(
         adapter_index,
@@ -1209,6 +1402,7 @@ pub fn record_d3d11_onecopy_memory_output_with_sink_cancelable(
         external_stop,
         false,
         encoded_sink,
+        route_plan,
     )
 }
 
@@ -1269,6 +1463,7 @@ pub fn record_wgc_d3d11_onecopy_mp4_output_cancelable(
         external_stop,
         true,
         None,
+        None,
     )
 }
 
@@ -1289,10 +1484,12 @@ pub fn record_wgc_d3d11_onecopy_memory_output_cancelable(
         requested_chroma,
         external_stop,
         None,
+        None,
     )
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
     adapter_index: u32,
     output: &Path,
@@ -1301,6 +1498,7 @@ pub fn record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
     requested_chroma: ChromaSampling,
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     encoded_sink: Option<&mut dyn VplOneCopyRecordSink>,
+    route_plan: Option<&VplCurrentDisplayRouteInfo>,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
     record_d3d11_onecopy_mp4_impl(
         adapter_index,
@@ -1312,6 +1510,7 @@ pub fn record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
         external_stop,
         false,
         encoded_sink,
+        route_plan,
     )
 }
 
@@ -1740,6 +1939,7 @@ fn record_d3d11_onecopy_mp4_impl(
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     write_output_mp4: bool,
     mut encoded_sink: Option<&mut dyn VplOneCopyRecordSink>,
+    route_plan: Option<&VplCurrentDisplayRouteInfo>,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
     use crate::backend::mp4_mux::{HevcMp4Track, write_hevc_aac_mp4};
     use std::time::{Duration, Instant};
@@ -1834,15 +2034,43 @@ fn record_d3d11_onecopy_mp4_impl(
             .max(1) as u16;
         let aligned_width = align16(capture_width);
         let aligned_height = align16(capture_height);
-        // 自动同步路线集中在录制后端内部：前端只表达目标色度采样，
-        // DDA/WGC 的颜色空间/range/bit-depth 由当前显示器状态和捕获数据决定。
+        // 自动同步路线集中在录制后端内部：前端只表达目标色度采样；
+        // 能力探测阶段已经把当前显示器状态解析为 RoutePlan。启动时只做
+        // 轻量一致性校验，避免重复完整 route 现场探测。
         let route_probe_started = Instant::now();
-        let record_route_candidates =
-            select_record_route_candidates_for_output(&output0, requested_chroma, &mut notes)?;
+        let record_route_candidates = if let Some(plan) = route_plan {
+            validate_current_display_route_plan(
+                plan,
+                adapter_index,
+                &output_desc,
+                &output0,
+                requested_chroma,
+            )?;
+            let route = record_route_from_display_plan(plan)?;
+            notes.push(format!(
+                "record RoutePlan accepted: adapter={} output={} ColorSpace={} BitsPerColor={} rect={},{},{},{} route={}",
+                plan.adapter_index,
+                plan.output_index,
+                plan.color_space,
+                plan.bits_per_color,
+                plan.desktop_left,
+                plan.desktop_top,
+                plan.desktop_right,
+                plan.desktop_bottom,
+                route.summary()
+            ));
+            vec![route]
+        } else {
+            notes.push(
+                "record RoutePlan missing; falling back to startup-time display route probing"
+                    .to_owned(),
+            );
+            select_record_route_candidates_for_output(&output0, requested_chroma, &mut notes)?
+        };
         sink_status(
             &mut encoded_sink,
             format!(
-                "初始化阶段：DXGI 输出/桌面模式 route 探测完成，候选={}，累计 {:.1}ms，本阶段 {:.1}ms",
+                "初始化阶段：DXGI 输出/桌面模式 RoutePlan 准备完成，候选={}，累计 {:.1}ms，本阶段 {:.1}ms",
                 record_route_candidates.len(),
                 record_started.elapsed().as_secs_f64() * 1000.0,
                 route_probe_started.elapsed().as_secs_f64() * 1000.0
@@ -1920,7 +2148,27 @@ fn record_d3d11_onecopy_mp4_impl(
 
         let mut query_failures = Vec::new();
         let mut selected_route: Option<(VplRecordRoute, MfxVideoParam, i32)> = None;
-        for candidate in &record_route_candidates {
+        if route_plan.is_some() {
+            let candidate = record_route_candidates[0];
+            let mut param = make_query_param(
+                rate_control,
+                candidate.fourcc,
+                candidate.chroma,
+                candidate.bit_depth,
+                candidate.profile,
+            );
+            param.AsyncDepth = record_async_depth;
+            notes.push(format!(
+                "record RoutePlan: 跳过启动阶段 MFXVideoENCODE_Query/QueryIOSurf；使用能力探测阶段已验证 route={} rc={}",
+                candidate.summary(),
+                rate_control.method.short_name()
+            ));
+            selected_route = Some((candidate, param, MFX_ERR_NONE));
+        }
+        for candidate in record_route_candidates
+            .iter()
+            .filter(|_| route_plan.is_none())
+        {
             let mut query_param = make_query_param(
                 rate_control,
                 candidate.fourcc,
@@ -9856,6 +10104,14 @@ fn fourcc_to_string(value: u32) -> String {
     } else {
         format!("0x{value:08X}")
     }
+}
+
+fn fourcc_from_name(name: &str) -> Option<u32> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 4 {
+        return None;
+    }
+    Some(make_fourcc(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
 
 fn chroma_from_fourcc_name(name: &str) -> Option<ChromaSampling> {

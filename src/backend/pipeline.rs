@@ -211,6 +211,11 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
 ) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
     validate_record_request(request, caps)?;
     let requested_chroma = request.chroma_writer.chroma();
+    let route_plan = caps
+        .vpl
+        .current_display_routes
+        .iter()
+        .find(|route| route.chroma == requested_chroma && !route.fourcc.is_empty());
     match request.capture_backend {
         CaptureBackendKind::Dda => {
             super::vpl::record_d3d11_onecopy_memory_output_with_sink_cancelable(
@@ -221,6 +226,7 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
                 requested_chroma,
                 external_stop,
                 encoded_sink,
+                route_plan,
             )
         }
         CaptureBackendKind::Wgc => {
@@ -232,6 +238,7 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
                 requested_chroma,
                 external_stop,
                 encoded_sink,
+                route_plan,
             )
         }
     }
