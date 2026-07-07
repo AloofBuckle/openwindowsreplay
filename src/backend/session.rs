@@ -1043,7 +1043,7 @@ impl DiskSegmentBuilder {
         let audio_track = if self.audio_samples.is_empty() {
             None
         } else {
-            let duration_ticks = self
+            let sample_duration_ticks = self
                 .audio_samples
                 .iter()
                 .map(|sample| {
@@ -1054,10 +1054,12 @@ impl DiskSegmentBuilder {
                 .max()
                 .unwrap_or(1)
                 .max(1);
+            let segment_duration_ticks =
+                scale_90k_to_ticks(duration_90k, self.metadata.audio_sample_rate);
             Some(AacLcMp4Track {
                 sample_rate: self.metadata.audio_sample_rate,
                 channel_count: self.metadata.audio_channel_count,
-                duration_ticks,
+                duration_ticks: sample_duration_ticks.max(segment_duration_ticks).max(1),
                 samples: self.audio_samples,
             })
         };
@@ -1454,6 +1456,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn disk_segment_builder_keeps_audio_duration_aligned_to_video_segment() {
+        let metadata = EncodedReplayMetadata {
+            width: 16,
+            height: 16,
+            color: NclxColorMetadata::bt709_full(),
+            codec: HevcCodecMetadata::main_420_8(),
+            audio_sample_rate: 48_000,
+            audio_channel_count: 2,
+        };
+        let mut builder = DiskSegmentBuilder::new(metadata, 90_000, 48_000);
+        builder.end_90k = Some(180_000);
+        builder.push_video(&HevcAccessUnit {
+            timestamp_90k: 90_000,
+            data: vec![0, 0, 1, 38, 1],
+            is_sync: true,
+            discard_from_track: false,
+        });
+        builder.push_audio(&AacAccessUnit {
+            timestamp_ticks: 48_000,
+            duration_ticks: 1024,
+            data: vec![0x21, 0x10],
+        });
+
+        let segment = builder.into_tracks(&[]).unwrap();
+
+        assert_eq!(segment.audio_track.unwrap().duration_ticks, 48_000);
     }
 
     fn segment(
