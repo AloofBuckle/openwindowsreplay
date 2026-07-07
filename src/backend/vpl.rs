@@ -1735,7 +1735,18 @@ impl RecordAudioCapture {
                 .saturating_add(crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64);
         }
         self.live_submitted_until_ticks = submitted_until_ticks;
+        self.prune_live_pcm_frames(video_start_100ns);
         Ok(())
+    }
+
+    fn prune_live_pcm_frames(&mut self, video_start_100ns: i64) {
+        let keep_from_ticks = self
+            .live_submitted_until_ticks
+            .saturating_sub(crate::backend::audio::TARGET_SAMPLE_RATE as u64);
+        let keep_from_100ns =
+            video_start_100ns.saturating_add(audio_ticks_to_100ns(keep_from_ticks));
+        self.frames
+            .retain(|frame| frame.end_time_100ns() >= keep_from_100ns);
     }
 
     fn finish_live_aac(
@@ -2501,6 +2512,7 @@ fn record_d3d11_onecopy_mp4_impl(
         }
 
         let mut samples = Vec::new();
+        let retain_output_samples = write_output_mp4 || encoded_sink.is_none();
         let mut captured_frames = 0u32;
         let mut warmup_encoded_frames = 0u32;
         let mut dda_timeouts = 0u32;
@@ -2649,9 +2661,12 @@ fn record_d3d11_onecopy_mp4_impl(
                                 &mut bitstream_pool,
                                 0,
                             )? {
-                                TrySyncResult::Ready(Some(sample)) => {
-                                    push_record_hevc_sample(&mut samples, sample, &mut encoded_sink)
-                                }
+                                TrySyncResult::Ready(Some(sample)) => push_record_hevc_sample(
+                                    &mut samples,
+                                    sample,
+                                    &mut encoded_sink,
+                                    retain_output_samples,
+                                ),
                                 TrySyncResult::Ready(None) => break,
                                 TrySyncResult::NotReady => break,
                             }
@@ -2895,6 +2910,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                                 &mut samples,
                                                 sample,
                                                 &mut encoded_sink,
+                                                retain_output_samples,
                                             );
                                         }
                                     }
@@ -2938,6 +2954,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                                 &mut samples,
                                                 sample,
                                                 &mut encoded_sink,
+                                                retain_output_samples,
                                             );
                                         }
                                     }
@@ -2955,6 +2972,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                                     &mut samples,
                                                     sample,
                                                     &mut encoded_sink,
+                                                    retain_output_samples,
                                                 )
                                             }
                                             TrySyncResult::Ready(None) => break,
@@ -3068,6 +3086,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                             &mut samples,
                                             sample,
                                             &mut encoded_sink,
+                                            retain_output_samples,
                                         );
                                     }
                                 }
@@ -3111,6 +3130,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                         &mut samples,
                                         sample,
                                         &mut encoded_sink,
+                                        retain_output_samples,
                                     ),
                                     TrySyncResult::Ready(None) => break,
                                     TrySyncResult::NotReady => break,
@@ -3127,6 +3147,7 @@ fn record_d3d11_onecopy_mp4_impl(
                                         &mut samples,
                                         sample,
                                         &mut encoded_sink,
+                                        retain_output_samples,
                                     );
                                 }
                             }
@@ -3203,9 +3224,12 @@ fn record_d3d11_onecopy_mp4_impl(
                     &mut bitstream_pool,
                     0,
                 )? {
-                    TrySyncResult::Ready(Some(sample)) => {
-                        push_record_hevc_sample(&mut samples, sample, &mut encoded_sink)
-                    }
+                    TrySyncResult::Ready(Some(sample)) => push_record_hevc_sample(
+                        &mut samples,
+                        sample,
+                        &mut encoded_sink,
+                        retain_output_samples,
+                    ),
                     TrySyncResult::Ready(None) => break,
                     TrySyncResult::NotReady => std::thread::sleep(Duration::from_millis(1)),
                 }
@@ -3238,10 +3262,21 @@ fn record_d3d11_onecopy_mp4_impl(
             if let Some(sample) =
                 sync_one_async_encode(&api, session, &mut in_flight, &mut bitstream_pool)?
             {
-                push_record_hevc_sample(&mut samples, sample, &mut encoded_sink);
+                push_record_hevc_sample(
+                    &mut samples,
+                    sample,
+                    &mut encoded_sink,
+                    retain_output_samples,
+                );
             }
         }
-        let skipped_flush_samples = flush_encoder(&api, session, &mut samples, &mut encoded_sink)?;
+        let skipped_flush_samples = flush_encoder(
+            &api,
+            session,
+            &mut samples,
+            &mut encoded_sink,
+            retain_output_samples,
+        )?;
         let duration_90k = encoded_timeline_duration_90k(
             &samples,
             requested_duration_90k,
@@ -3632,11 +3667,14 @@ fn push_record_hevc_sample(
     samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
     sample: crate::backend::mp4_mux::HevcAccessUnit,
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    retain_sample: bool,
 ) {
     if let Some(sink) = encoded_sink.as_deref_mut() {
         sink.hevc_access_unit(&sample);
     }
-    samples.push(sample);
+    if retain_sample || sample.discard_from_track {
+        samples.push(sample);
+    }
 }
 
 unsafe fn submit_encode_async(
@@ -3916,6 +3954,7 @@ unsafe fn flush_encoder(
     session: MfxSession,
     samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    retain_output_samples: bool,
 ) -> Result<u32, BackendError> {
     let mut skipped_non_monotonic = 0u32;
     loop {
@@ -3942,6 +3981,7 @@ unsafe fn flush_encoder(
                     discard_from_track: false,
                 },
                 encoded_sink,
+                retain_output_samples,
             );
         } else {
             break;
