@@ -4631,8 +4631,6 @@ unsafe fn run_dda_capture_thread(
     let mut route_intermediate: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
         None;
     let mut route_converter: Option<GpuRecordConverter> = None;
-    let mut shader_source_texture: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
-        None;
     let mut capture_index = 0u64;
     let mut timestamp_origin_qpc: Option<i64> = None;
     let mut last_timestamp_90k: Option<u64> = None;
@@ -4757,10 +4755,6 @@ unsafe fn run_dda_capture_thread(
                     )
                     .map_err(|err| err.to_string())?,
                 );
-                shader_source_texture = Some(
-                    create_dda_snapshot_texture(&device, &source_desc)
-                        .map_err(|err| err.to_string())?,
-                );
                 snapshot_desc0 = Some(snapshot_desc);
                 free_slots.clear();
                 for id in 0..pool_size {
@@ -4795,17 +4789,14 @@ unsafe fn run_dda_capture_thread(
                 slot.capture_mutex
                     .AcquireSync(0, 1_000)
                     .map_err(|err| format!("IDXGIKeyedMutex::AcquireSync(capture): {err}"))?;
-                let shader_source = shader_source_texture
-                    .as_ref()
-                    .ok_or_else(|| "DDA shader source texture missing".to_owned())?;
                 let intermediate = route_intermediate
                     .as_ref()
                     .ok_or_else(|| "DDA route intermediate missing".to_owned())?;
                 let converter = route_converter
                     .as_ref()
                     .ok_or_else(|| "DDA route converter missing".to_owned())?;
-                copy_texture_resource(&context, &source, shader_source)
-                    .and_then(|()| converter.convert(shader_source))
+                converter
+                    .convert(&source)
                     .and_then(|()| {
                         copy_texture_resource(&context, intermediate, &slot.capture_texture)
                     })
