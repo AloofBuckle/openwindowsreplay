@@ -7,8 +7,10 @@
 
 use super::{ProbeCaps, pipeline};
 use crate::backend::mp4_mux::{
-    AacAccessUnit, AacLcMp4Track, HevcAccessUnit, HevcCodecMetadata, HevcMp4Track,
-    NclxColorMetadata,
+    AacAccessUnit, AacIndexedMp4Track, AacIndexedSample, AacLcMp4Track, AacPreparedMp4Track,
+    AacPreparedSample, HevcAacMp4Index, HevcAccessUnit, HevcCodecMetadata, HevcIndexedMp4Track,
+    HevcIndexedSample, HevcMp4Track, HevcParameterSets, HevcPreparedMp4Track, HevcPreparedSample,
+    Mp4SampleFileRange, NclxColorMetadata,
 };
 use crate::config::{AppConfig, CaptureBackend, ChromaSampling, ReplayBufferMode};
 use crate::error::BackendError;
@@ -25,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIVE_RECORD_SECONDS: f32 = 24.0 * 60.0 * 60.0;
 const DISK_SEGMENT_TARGET_SECONDS: f32 = 10.0;
-const DISK_SEGMENT_SIDECAR_MAGIC: &[u8; 8] = b"RRSEG001";
+const DISK_SEGMENT_SIDECAR_MAGIC: &[u8; 8] = b"RRSEG002";
 const VIDEO_CLOCK_HZ: u64 = 90_000;
 
 #[derive(Debug, Clone)]
@@ -354,7 +356,7 @@ impl ReplayController {
                 .snapshot_recent_tracks(replay_duration)?;
             if let Some(snapshot) = snapshot {
                 if snapshot.audio_track.is_some() {
-                    super::mp4_mux::write_hevc_aac_mp4(
+                    super::mp4_mux::write_prepared_hevc_aac_mp4(
                         &dst,
                         &snapshot.video_track,
                         snapshot.audio_track.as_ref(),
@@ -740,16 +742,19 @@ impl DiskReplayStore {
     fn snapshot_recent_tracks(
         &self,
         duration: Duration,
-    ) -> Result<Option<crate::ring::EncodedReplaySnapshot>, BackendError> {
+    ) -> Result<Option<DiskPreparedReplaySnapshot>, BackendError> {
         let selected = self.select_recent_segments(duration);
         if selected.is_empty() {
             return Ok(None);
         }
         let mut segments = Vec::with_capacity(selected.len());
         for meta in selected {
-            segments.push(read_disk_segment_sidecar(&meta.sidecar_path)?);
+            segments.push(DiskSegmentIndexedTracks {
+                mp4_path: meta.mp4_path.clone(),
+                index: read_disk_segment_sidecar(&meta.sidecar_path)?,
+            });
         }
-        Ok(concat_disk_segments(&segments))
+        Ok(concat_disk_indexed_segments(&segments))
     }
 
     fn select_recent_segments(&self, duration: Duration) -> Vec<DiskSegmentMeta> {
@@ -879,7 +884,7 @@ fn write_disk_segment_job(
         .reserve_segment_paths()?;
 
     let mux_started = Instant::now();
-    super::mp4_mux::write_hevc_aac_mp4(
+    let index = super::mp4_mux::write_hevc_aac_mp4_with_index(
         &reservation.mp4_path,
         &job.segment.video_track,
         job.segment.audio_track.as_ref(),
@@ -887,7 +892,7 @@ fn write_disk_segment_job(
     let mux_write = mux_started.elapsed();
 
     let sidecar_started = Instant::now();
-    write_disk_segment_sidecar(&reservation.sidecar_path, &job.segment)?;
+    write_disk_segment_sidecar(&reservation.sidecar_path, &index)?;
     let sidecar_write = sidecar_started.elapsed();
 
     let bytes = fs::metadata(&reservation.mp4_path)
@@ -900,9 +905,8 @@ fn write_disk_segment_job(
         index: reservation.index,
         mp4_path: reservation.mp4_path,
         sidecar_path: reservation.sidecar_path,
-        duration_90k: job.segment.video_track.duration_90k,
-        audio_access_units: job
-            .segment
+        duration_90k: index.video_track.duration_90k,
+        audio_access_units: index
             .audio_track
             .as_ref()
             .map(|track| track.samples.len())
@@ -1253,84 +1257,107 @@ struct DiskSegmentTracks {
     audio_track: Option<AacLcMp4Track>,
 }
 
-fn concat_disk_segments(
-    segments: &[DiskSegmentTracks],
-) -> Option<crate::ring::EncodedReplaySnapshot> {
+#[derive(Debug, Clone)]
+struct DiskSegmentIndexedTracks {
+    mp4_path: PathBuf,
+    index: HevcAacMp4Index,
+}
+
+#[derive(Debug, Clone)]
+struct DiskPreparedReplaySnapshot {
+    video_track: HevcPreparedMp4Track,
+    audio_track: Option<AacPreparedMp4Track>,
+}
+
+fn concat_disk_indexed_segments(
+    segments: &[DiskSegmentIndexedTracks],
+) -> Option<DiskPreparedReplaySnapshot> {
     let first = segments.first()?;
     let mut video_samples = Vec::new();
     let mut audio_samples = Vec::new();
+    let mut parameter_sets = first.index.video_track.parameter_sets.clone();
     let mut video_base_90k = 0u64;
     let mut audio_base_ticks = 0u64;
     let mut audio_sample_rate = 48_000;
     let mut audio_channel_count = 2;
     for segment in segments {
-        video_samples.extend(
-            segment
-                .video_track
-                .samples
-                .iter()
-                .cloned()
-                .map(|mut sample| {
-                    sample.timestamp_90k = video_base_90k.saturating_add(sample.timestamp_90k);
-                    sample
-                }),
+        merge_hevc_parameter_sets(
+            &mut parameter_sets,
+            &segment.index.video_track.parameter_sets,
         );
-        video_base_90k = video_base_90k.saturating_add(segment.video_track.duration_90k);
-        if let Some(audio) = &segment.audio_track {
+        video_samples.extend(segment.index.video_track.samples.iter().map(|sample| {
+            HevcPreparedSample {
+                duration_90k: sample.duration_90k,
+                is_sync: sample.is_sync,
+                data: Mp4SampleFileRange {
+                    path: segment.mp4_path.clone(),
+                    offset: sample.offset,
+                    len: sample.len,
+                },
+            }
+        }));
+        video_base_90k = video_base_90k.saturating_add(segment.index.video_track.duration_90k);
+        if let Some(audio) = &segment.index.audio_track {
             audio_sample_rate = audio.sample_rate;
             audio_channel_count = audio.channel_count;
-            audio_samples.extend(audio.samples.iter().cloned().map(|mut sample| {
-                sample.timestamp_ticks = audio_base_ticks.saturating_add(sample.timestamp_ticks);
-                sample
+            audio_samples.extend(audio.samples.iter().map(|sample| AacPreparedSample {
+                duration_ticks: sample.duration_ticks,
+                data: Mp4SampleFileRange {
+                    path: segment.mp4_path.clone(),
+                    offset: sample.offset,
+                    len: sample.len,
+                },
             }));
             audio_base_ticks = audio_base_ticks.saturating_add(audio.duration_ticks);
         } else {
             audio_base_ticks = audio_base_ticks.saturating_add(scale_90k_to_ticks(
-                segment.video_track.duration_90k,
+                segment.index.video_track.duration_90k,
                 audio_sample_rate,
             ));
         }
     }
-    if video_samples.iter().all(|sample| sample.discard_from_track) {
+    if video_samples.is_empty() {
         return None;
     }
     let audio_track = if audio_samples.is_empty() {
         None
     } else {
-        let sample_duration_ticks = audio_samples
-            .iter()
-            .map(|sample| {
-                sample
-                    .timestamp_ticks
-                    .saturating_add(u64::from(sample.duration_ticks))
-            })
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        Some(AacLcMp4Track {
+        Some(AacPreparedMp4Track {
             sample_rate: audio_sample_rate,
             channel_count: audio_channel_count,
-            duration_ticks: sample_duration_ticks.max(audio_base_ticks).max(1),
+            duration_ticks: audio_base_ticks.max(1),
             samples: audio_samples,
         })
     };
-    Some(crate::ring::EncodedReplaySnapshot {
-        video_track: HevcMp4Track {
-            width: first.video_track.width,
-            height: first.video_track.height,
+    Some(DiskPreparedReplaySnapshot {
+        video_track: HevcPreparedMp4Track {
+            width: first.index.video_track.width,
+            height: first.index.video_track.height,
             duration_90k: video_base_90k.max(1),
-            color: first.video_track.color,
-            codec: first.video_track.codec,
+            color: first.index.video_track.color,
+            codec: first.index.video_track.codec,
+            parameter_sets,
             samples: video_samples,
         },
         audio_track,
     })
 }
 
-fn write_disk_segment_sidecar(
-    path: &Path,
-    segment: &DiskSegmentTracks,
-) -> Result<(), BackendError> {
+fn merge_hevc_parameter_sets(dst: &mut HevcParameterSets, src: &HevcParameterSets) {
+    append_unique_bytes(&mut dst.vps, &src.vps);
+    append_unique_bytes(&mut dst.sps, &src.sps);
+    append_unique_bytes(&mut dst.pps, &src.pps);
+}
+
+fn append_unique_bytes(dst: &mut Vec<Vec<u8>>, src: &[Vec<u8>]) {
+    for item in src {
+        if !dst.iter().any(|seen| seen == item) {
+            dst.push(item.clone());
+        }
+    }
+}
+
+fn write_disk_segment_sidecar(path: &Path, index: &HevcAacMp4Index) -> Result<(), BackendError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1340,12 +1367,20 @@ fn write_disk_segment_sidecar(
     let mut file = BufWriter::with_capacity(1024 * 1024, file);
     file.write_all(DISK_SEGMENT_SIDECAR_MAGIC)
         .map_err(|err| BackendError::Io(err.to_string()))?;
-    write_u16(&mut file, segment.video_track.width)?;
-    write_u16(&mut file, segment.video_track.height)?;
-    write_color(&mut file, segment.video_track.color)?;
-    write_codec(&mut file, segment.video_track.codec)?;
-    write_u64(&mut file, segment.video_track.duration_90k)?;
-    match &segment.audio_track {
+    write_u16(&mut file, index.video_track.width)?;
+    write_u16(&mut file, index.video_track.height)?;
+    write_color(&mut file, index.video_track.color)?;
+    write_codec(&mut file, index.video_track.codec)?;
+    write_parameter_sets(&mut file, &index.video_track.parameter_sets)?;
+    write_u64(&mut file, index.video_track.duration_90k)?;
+    write_u64(&mut file, index.video_track.samples.len() as u64)?;
+    for sample in &index.video_track.samples {
+        write_u32(&mut file, sample.duration_90k)?;
+        write_u8(&mut file, u8::from(sample.is_sync))?;
+        write_u64(&mut file, sample.offset)?;
+        write_u64(&mut file, sample.len)?;
+    }
+    match &index.audio_track {
         Some(audio) => {
             write_u8(&mut file, 1)?;
             write_u32(&mut file, audio.sample_rate)?;
@@ -1353,25 +1388,18 @@ fn write_disk_segment_sidecar(
             write_u64(&mut file, audio.duration_ticks)?;
             write_u64(&mut file, audio.samples.len() as u64)?;
             for sample in &audio.samples {
-                write_u64(&mut file, sample.timestamp_ticks)?;
                 write_u32(&mut file, sample.duration_ticks)?;
-                write_bytes(&mut file, &sample.data)?;
+                write_u64(&mut file, sample.offset)?;
+                write_u64(&mut file, sample.len)?;
             }
         }
         None => write_u8(&mut file, 0)?,
-    }
-    write_u64(&mut file, segment.video_track.samples.len() as u64)?;
-    for sample in &segment.video_track.samples {
-        write_u64(&mut file, sample.timestamp_90k)?;
-        write_u8(&mut file, u8::from(sample.is_sync))?;
-        write_u8(&mut file, u8::from(sample.discard_from_track))?;
-        write_bytes(&mut file, &sample.data)?;
     }
     file.flush()
         .map_err(|err| BackendError::Io(err.to_string()))
 }
 
-fn read_disk_segment_sidecar(path: &Path) -> Result<DiskSegmentTracks, BackendError> {
+fn read_disk_segment_sidecar(path: &Path) -> Result<HevcAacMp4Index, BackendError> {
     let file = fs::File::open(path).map_err(|err| BackendError::Io(err.to_string()))?;
     let mut file = BufReader::with_capacity(1024 * 1024, file);
     let mut magic = [0u8; 8];
@@ -1388,7 +1416,18 @@ fn read_disk_segment_sidecar(path: &Path) -> Result<DiskSegmentTracks, BackendEr
     let height = read_u16(&mut file)?;
     let color = read_color(&mut file)?;
     let codec = read_codec(&mut file)?;
+    let parameter_sets = read_parameter_sets(&mut file)?;
     let duration_90k = read_u64(&mut file)?;
+    let video_sample_count = read_len(&mut file)?;
+    let mut video_samples = Vec::with_capacity(video_sample_count);
+    for _ in 0..video_sample_count {
+        video_samples.push(HevcIndexedSample {
+            duration_90k: read_u32(&mut file)?,
+            is_sync: read_u8(&mut file)? != 0,
+            offset: read_u64(&mut file)?,
+            len: read_u64(&mut file)?,
+        });
+    }
     let audio_track = if read_u8(&mut file)? != 0 {
         let sample_rate = read_u32(&mut file)?;
         let channel_count = read_u16(&mut file)?;
@@ -1396,13 +1435,13 @@ fn read_disk_segment_sidecar(path: &Path) -> Result<DiskSegmentTracks, BackendEr
         let sample_count = read_len(&mut file)?;
         let mut samples = Vec::with_capacity(sample_count);
         for _ in 0..sample_count {
-            samples.push(AacAccessUnit {
-                timestamp_ticks: read_u64(&mut file)?,
+            samples.push(AacIndexedSample {
                 duration_ticks: read_u32(&mut file)?,
-                data: read_bytes(&mut file)?,
+                offset: read_u64(&mut file)?,
+                len: read_u64(&mut file)?,
             });
         }
-        Some(AacLcMp4Track {
+        Some(AacIndexedMp4Track {
             sample_rate,
             channel_count,
             duration_ticks,
@@ -1411,24 +1450,15 @@ fn read_disk_segment_sidecar(path: &Path) -> Result<DiskSegmentTracks, BackendEr
     } else {
         None
     };
-    let sample_count = read_len(&mut file)?;
-    let mut samples = Vec::with_capacity(sample_count);
-    for _ in 0..sample_count {
-        samples.push(HevcAccessUnit {
-            timestamp_90k: read_u64(&mut file)?,
-            is_sync: read_u8(&mut file)? != 0,
-            discard_from_track: read_u8(&mut file)? != 0,
-            data: read_bytes(&mut file)?,
-        });
-    }
-    Ok(DiskSegmentTracks {
-        video_track: HevcMp4Track {
+    Ok(HevcAacMp4Index {
+        video_track: HevcIndexedMp4Track {
             width,
             height,
             duration_90k,
             color,
             codec,
-            samples,
+            parameter_sets,
+            samples: video_samples,
         },
         audio_track,
     })
@@ -1464,6 +1494,40 @@ fn read_codec(input: &mut impl Read) -> Result<HevcCodecMetadata, BackendError> 
         bit_depth_luma_minus8: read_u8(input)?,
         bit_depth_chroma_minus8: read_u8(input)?,
     })
+}
+
+fn write_parameter_sets(
+    out: &mut impl Write,
+    sets: &HevcParameterSets,
+) -> Result<(), BackendError> {
+    write_nal_array(out, &sets.vps)?;
+    write_nal_array(out, &sets.sps)?;
+    write_nal_array(out, &sets.pps)
+}
+
+fn read_parameter_sets(input: &mut impl Read) -> Result<HevcParameterSets, BackendError> {
+    Ok(HevcParameterSets {
+        vps: read_nal_array(input)?,
+        sps: read_nal_array(input)?,
+        pps: read_nal_array(input)?,
+    })
+}
+
+fn write_nal_array(out: &mut impl Write, nals: &[Vec<u8>]) -> Result<(), BackendError> {
+    write_u64(out, nals.len() as u64)?;
+    for nal in nals {
+        write_bytes(out, nal)?;
+    }
+    Ok(())
+}
+
+fn read_nal_array(input: &mut impl Read) -> Result<Vec<Vec<u8>>, BackendError> {
+    let count = read_len(input)?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(read_bytes(input)?);
+    }
+    Ok(out)
 }
 
 fn write_bytes(out: &mut impl Write, bytes: &[u8]) -> Result<(), BackendError> {
@@ -1570,35 +1634,51 @@ mod tests {
     fn disk_segment_sidecar_roundtrips_tracks() {
         let dir = unique_temp_dir("sidecar_roundtrip");
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("segment.rrseg");
         let segment = segment(0, 90_000, 0, 48_000);
+        let indexed = write_indexed_segment(&dir, "segment", &segment);
 
-        write_disk_segment_sidecar(&path, &segment).unwrap();
-        let read = read_disk_segment_sidecar(&path).unwrap();
+        let read = read_disk_segment_sidecar(&indexed_sidecar(&dir, "segment")).unwrap();
 
         assert_eq!(read.video_track.width, segment.video_track.width);
         assert_eq!(read.video_track.duration_90k, 90_000);
-        assert_eq!(read.video_track.samples.len(), 2);
+        assert_eq!(read.video_track.samples.len(), 1);
         assert_eq!(
             read.audio_track.as_ref().unwrap().duration_ticks,
             segment.audio_track.as_ref().unwrap().duration_ticks
+        );
+        assert!(
+            fs::metadata(indexed_sidecar(&dir, "segment"))
+                .unwrap()
+                .len()
+                < fs::metadata(indexed.mp4_path).unwrap().len()
         );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn disk_segment_concat_rebases_timestamps() {
-        let first = segment(0, 90_000, 0, 48_000);
-        let second = segment(0, 45_000, 0, 24_000);
+        let dir = unique_temp_dir("concat_index");
+        fs::create_dir_all(&dir).unwrap();
+        let first = write_indexed_segment(&dir, "first", &segment(0, 90_000, 0, 48_000));
+        let second = write_indexed_segment(&dir, "second", &segment(0, 45_000, 0, 24_000));
 
-        let snapshot = concat_disk_segments(&[first, second]).unwrap();
+        let snapshot = concat_disk_indexed_segments(&[first, second]).unwrap();
 
         assert_eq!(snapshot.video_track.duration_90k, 135_000);
-        assert_eq!(snapshot.video_track.samples[0].timestamp_90k, 0);
-        assert_eq!(snapshot.video_track.samples[2].timestamp_90k, 90_000);
+        assert_eq!(snapshot.video_track.samples[0].duration_90k, 90_000);
+        assert_eq!(snapshot.video_track.samples[1].duration_90k, 45_000);
         let audio = snapshot.audio_track.unwrap();
         assert_eq!(audio.duration_ticks, 72_000);
-        assert_eq!(audio.samples[2].timestamp_ticks, 48_000);
+        assert_eq!(audio.samples.len(), 4);
+        let out = dir.join("final.mp4");
+        crate::backend::mp4_mux::write_prepared_hevc_aac_mp4(
+            &out,
+            &snapshot.video_track,
+            Some(&audio),
+        )
+        .unwrap();
+        assert!(fs::metadata(&out).unwrap().len() > 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1675,13 +1755,13 @@ mod tests {
                 samples: vec![
                     HevcAccessUnit {
                         timestamp_90k: video_start_90k,
-                        data: vec![0, 0, 1, 32, 1],
+                        data: fake_hevc_parameter_sets(),
                         is_sync: false,
                         discard_from_track: true,
                     },
                     HevcAccessUnit {
                         timestamp_90k: video_start_90k,
-                        data: vec![0, 0, 1, 38, 1],
+                        data: fake_hevc_idr(),
                         is_sync: true,
                         discard_from_track: false,
                     },
@@ -1705,6 +1785,51 @@ mod tests {
                 ],
             }),
         }
+    }
+
+    fn write_indexed_segment(
+        dir: &Path,
+        name: &str,
+        segment: &DiskSegmentTracks,
+    ) -> DiskSegmentIndexedTracks {
+        let mp4_path = dir.join(format!("{name}.mp4"));
+        let sidecar_path = indexed_sidecar(dir, name);
+        let index = crate::backend::mp4_mux::write_hevc_aac_mp4_with_index(
+            &mp4_path,
+            &segment.video_track,
+            segment.audio_track.as_ref(),
+        )
+        .unwrap();
+        write_disk_segment_sidecar(&sidecar_path, &index).unwrap();
+        DiskSegmentIndexedTracks {
+            mp4_path,
+            index: read_disk_segment_sidecar(&sidecar_path).unwrap(),
+        }
+    }
+
+    fn indexed_sidecar(dir: &Path, name: &str) -> PathBuf {
+        dir.join(format!("{name}.rrseg"))
+    }
+
+    fn fake_hevc_parameter_sets() -> Vec<u8> {
+        let mut out = Vec::new();
+        append_fake_nal(&mut out, 32, &[1, 2, 3]);
+        append_fake_nal(&mut out, 33, &[4, 5, 6]);
+        append_fake_nal(&mut out, 34, &[7, 8, 9]);
+        out
+    }
+
+    fn fake_hevc_idr() -> Vec<u8> {
+        let mut out = Vec::new();
+        append_fake_nal(&mut out, 19, &[10, 11, 12]);
+        out
+    }
+
+    fn append_fake_nal(out: &mut Vec<u8>, nal_type: u8, payload: &[u8]) {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.push(nal_type << 1);
+        out.push(1);
+        out.extend_from_slice(payload);
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {

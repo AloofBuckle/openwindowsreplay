@@ -7,8 +7,8 @@ use crate::error::BackendError;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 const VIDEO_TIMESCALE: u32 = 90_000;
 const MOVIE_TIMESCALE: u32 = 1_000;
@@ -160,14 +160,29 @@ impl NclxColorMetadata {
 #[derive(Debug, Clone)]
 struct PreparedSample {
     duration_90k: u32,
-    data: Vec<u8>,
+    data: SamplePayload,
     is_sync: bool,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedAudioSample {
     duration_ticks: u32,
-    data: Vec<u8>,
+    data: SamplePayload,
+}
+
+#[derive(Debug, Clone)]
+enum SamplePayload {
+    Memory(Vec<u8>),
+    FileRange(Mp4SampleFileRange),
+}
+
+impl SamplePayload {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(data) => data.len() as u64,
+            Self::FileRange(range) => range.len,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,10 +193,89 @@ struct PreparedAacTrackRef<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct ParameterSets {
-    vps: Vec<Vec<u8>>,
-    sps: Vec<Vec<u8>>,
-    pps: Vec<Vec<u8>>,
+pub(crate) struct HevcParameterSets {
+    pub(crate) vps: Vec<Vec<u8>>,
+    pub(crate) sps: Vec<Vec<u8>>,
+    pub(crate) pps: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Mp4SampleFileRange {
+    pub(crate) path: PathBuf,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HevcIndexedSample {
+    pub(crate) duration_90k: u32,
+    pub(crate) is_sync: bool,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AacIndexedSample {
+    pub(crate) duration_ticks: u32,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HevcIndexedMp4Track {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) duration_90k: u64,
+    pub(crate) color: NclxColorMetadata,
+    pub(crate) codec: HevcCodecMetadata,
+    pub(crate) parameter_sets: HevcParameterSets,
+    pub(crate) samples: Vec<HevcIndexedSample>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AacIndexedMp4Track {
+    pub(crate) sample_rate: u32,
+    pub(crate) channel_count: u16,
+    pub(crate) duration_ticks: u64,
+    pub(crate) samples: Vec<AacIndexedSample>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HevcAacMp4Index {
+    pub(crate) video_track: HevcIndexedMp4Track,
+    pub(crate) audio_track: Option<AacIndexedMp4Track>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HevcPreparedSample {
+    pub(crate) duration_90k: u32,
+    pub(crate) is_sync: bool,
+    pub(crate) data: Mp4SampleFileRange,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AacPreparedSample {
+    pub(crate) duration_ticks: u32,
+    pub(crate) data: Mp4SampleFileRange,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HevcPreparedMp4Track {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) duration_90k: u64,
+    pub(crate) color: NclxColorMetadata,
+    pub(crate) codec: HevcCodecMetadata,
+    pub(crate) parameter_sets: HevcParameterSets,
+    pub(crate) samples: Vec<HevcPreparedSample>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AacPreparedMp4Track {
+    pub(crate) sample_rate: u32,
+    pub(crate) channel_count: u16,
+    pub(crate) duration_ticks: u64,
+    pub(crate) samples: Vec<AacPreparedSample>,
 }
 
 #[allow(dead_code)]
@@ -194,6 +288,14 @@ pub fn write_hevc_aac_mp4(
     video_track: &HevcMp4Track,
     audio_track: Option<&AacLcMp4Track>,
 ) -> Result<(), BackendError> {
+    write_hevc_aac_mp4_with_index(path, video_track, audio_track).map(|_| ())
+}
+
+pub(crate) fn write_hevc_aac_mp4_with_index(
+    path: &Path,
+    video_track: &HevcMp4Track,
+    audio_track: Option<&AacLcMp4Track>,
+) -> Result<HevcAacMp4Index, BackendError> {
     if let Some(audio) = audio_track {
         validate_aac_track(audio)?;
     }
@@ -202,10 +304,10 @@ pub fn write_hevc_aac_mp4(
     let prepared_audio = audio_track.map(prepare_audio_track).transpose()?;
 
     let ftyp = make_ftyp();
-    let mdat_payload_len: u64 = converted.iter().map(|s| s.data.len() as u64).sum::<u64>()
+    let mdat_payload_len: u64 = converted.iter().map(|s| s.data.len()).sum::<u64>()
         + prepared_audio
             .as_ref()
-            .map(|audio| audio.iter().map(|s| s.data.len() as u64).sum::<u64>())
+            .map(|audio| audio.iter().map(|s| s.data.len()).sum::<u64>())
             .unwrap_or(0);
     let mdat_header = make_mdat_header(mdat_payload_len);
     let first_sample_offset = ftyp.len() as u64 + mdat_header.len() as u64;
@@ -213,14 +315,14 @@ pub fn write_hevc_aac_mp4(
     let mut video_offsets = Vec::with_capacity(converted.len());
     for sample in &converted {
         video_offsets.push(cursor);
-        cursor += sample.data.len() as u64;
+        cursor += sample.data.len();
     }
     let mut audio_offsets = Vec::new();
     if let Some(audio_samples) = &prepared_audio {
         audio_offsets.reserve(audio_samples.len());
         for sample in audio_samples {
             audio_offsets.push(cursor);
-            cursor += sample.data.len() as u64;
+            cursor += sample.data.len();
         }
     }
 
@@ -256,12 +358,163 @@ pub fn write_hevc_aac_mp4(
     file.write_all(&moov)
         .map_err(|err| BackendError::Io(err.to_string()))?;
     file.flush()
+        .map_err(|err| BackendError::Io(err.to_string()))?;
+
+    Ok(HevcAacMp4Index {
+        video_track: HevcIndexedMp4Track {
+            width: video_track.width,
+            height: video_track.height,
+            duration_90k: final_video_duration_90k,
+            color: video_track.color,
+            codec: video_track.codec,
+            parameter_sets,
+            samples: converted
+                .into_iter()
+                .zip(video_offsets)
+                .map(|(sample, offset)| HevcIndexedSample {
+                    duration_90k: sample.duration_90k,
+                    is_sync: sample.is_sync,
+                    offset,
+                    len: sample.data.len(),
+                })
+                .collect(),
+        },
+        audio_track: match (audio_track, prepared_audio, audio_offsets) {
+            (Some(track), Some(samples), offsets) => Some(AacIndexedMp4Track {
+                sample_rate: track.sample_rate,
+                channel_count: track.channel_count,
+                duration_ticks: track.duration_ticks,
+                samples: samples
+                    .into_iter()
+                    .zip(offsets)
+                    .map(|(sample, offset)| AacIndexedSample {
+                        duration_ticks: sample.duration_ticks,
+                        offset,
+                        len: sample.data.len(),
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        },
+    })
+}
+
+pub(crate) fn write_prepared_hevc_aac_mp4(
+    path: &Path,
+    video_track: &HevcPreparedMp4Track,
+    audio_track: Option<&AacPreparedMp4Track>,
+) -> Result<(), BackendError> {
+    if let Some(audio) = audio_track
+        && audio.sample_rate == 0
+    {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "AAC sample_rate=0",
+            "音轨 timescale/采样率必须大于 0",
+        ));
+    }
+
+    let converted = video_track
+        .samples
+        .iter()
+        .map(|sample| PreparedSample {
+            duration_90k: sample.duration_90k,
+            data: SamplePayload::FileRange(sample.data.clone()),
+            is_sync: sample.is_sync,
+        })
+        .collect::<Vec<_>>();
+    if converted.is_empty() {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "HEVC prepared video track",
+            "没有可封装的视频 sample",
+        ));
+    }
+    let prepared_audio = audio_track.map(|track| {
+        track
+            .samples
+            .iter()
+            .map(|sample| PreparedAudioSample {
+                duration_ticks: sample.duration_ticks,
+                data: SamplePayload::FileRange(sample.data.clone()),
+            })
+            .collect::<Vec<_>>()
+    });
+    let video_meta = HevcMp4Track {
+        width: video_track.width,
+        height: video_track.height,
+        duration_90k: video_track.duration_90k,
+        color: video_track.color,
+        codec: video_track.codec,
+        samples: Vec::new(),
+    };
+    let audio_meta = audio_track.map(|track| AacLcMp4Track {
+        sample_rate: track.sample_rate,
+        channel_count: track.channel_count,
+        duration_ticks: track.duration_ticks,
+        samples: Vec::new(),
+    });
+
+    let ftyp = make_ftyp();
+    let mdat_payload_len: u64 = converted.iter().map(|s| s.data.len()).sum::<u64>()
+        + prepared_audio
+            .as_ref()
+            .map(|audio| audio.iter().map(|s| s.data.len()).sum::<u64>())
+            .unwrap_or(0);
+    let mdat_header = make_mdat_header(mdat_payload_len);
+    let first_sample_offset = ftyp.len() as u64 + mdat_header.len() as u64;
+    let mut cursor = first_sample_offset;
+    let mut video_offsets = Vec::with_capacity(converted.len());
+    for sample in &converted {
+        video_offsets.push(cursor);
+        cursor += sample.data.len();
+    }
+    let mut audio_offsets = Vec::new();
+    if let Some(audio_samples) = &prepared_audio {
+        audio_offsets.reserve(audio_samples.len());
+        for sample in audio_samples {
+            audio_offsets.push(cursor);
+            cursor += sample.data.len();
+        }
+    }
+    let audio_ref = match (audio_meta.as_ref(), prepared_audio.as_deref()) {
+        (Some(track), Some(samples)) => Some(PreparedAacTrackRef {
+            track,
+            samples,
+            offsets: &audio_offsets,
+        }),
+        _ => None,
+    };
+    let moov = make_moov(
+        &video_meta,
+        video_track.duration_90k,
+        &converted,
+        &video_offsets,
+        &video_track.parameter_sets,
+        audio_ref,
+    )?;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| BackendError::Io(err.to_string()))?;
+    }
+    let file = File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
+    let mut file = BufWriter::with_capacity(1024 * 1024, file);
+    file.write_all(&ftyp)
+        .map_err(|err| BackendError::Io(err.to_string()))?;
+    file.write_all(&mdat_header)
+        .map_err(|err| BackendError::Io(err.to_string()))?;
+    write_mdat_payload(&mut file, &converted, prepared_audio.as_deref())?;
+    file.write_all(&moov)
+        .map_err(|err| BackendError::Io(err.to_string()))?;
+    file.flush()
         .map_err(|err| BackendError::Io(err.to_string()))
 }
 
 fn prepare_video_track(
     track: &HevcMp4Track,
-) -> Result<(Vec<PreparedSample>, ParameterSets, u64), BackendError> {
+) -> Result<(Vec<PreparedSample>, HevcParameterSets, u64), BackendError> {
     let playable_samples = track
         .samples
         .iter()
@@ -275,7 +528,7 @@ fn prepare_video_track(
         ));
     }
 
-    let mut parameter_sets = ParameterSets {
+    let mut parameter_sets = HevcParameterSets {
         vps: Vec::new(),
         sps: Vec::new(),
         pps: Vec::new(),
@@ -292,7 +545,7 @@ fn prepare_video_track(
         playable_index += 1;
         converted.push(PreparedSample {
             duration_90k,
-            data,
+            data: SamplePayload::Memory(data),
             is_sync: sample.is_sync || is_sync || converted.is_empty(),
         });
     }
@@ -353,7 +606,7 @@ fn prepare_audio_track(track: &AacLcMp4Track) -> Result<Vec<PreparedAudioSample>
         };
         prepared.push(PreparedAudioSample {
             duration_ticks,
-            data: sample.data.clone(),
+            data: SamplePayload::Memory(sample.data.clone()),
         });
     }
     Ok(prepared)
@@ -368,7 +621,7 @@ fn sample_duration(samples: &[&HevcAccessUnit], track_duration_90k: u64, index: 
     next.saturating_sub(current).max(1).min(u32::MAX as u64) as u32
 }
 
-fn merge_parameter_sets(dst: &mut ParameterSets, src: ParameterSets) {
+fn merge_parameter_sets(dst: &mut HevcParameterSets, src: HevcParameterSets) {
     append_unique(&mut dst.vps, src.vps);
     append_unique(&mut dst.sps, src.sps);
     append_unique(&mut dst.pps, src.pps);
@@ -385,9 +638,9 @@ fn append_unique(dst: &mut Vec<Vec<u8>>, src: Vec<Vec<u8>>) {
 
 fn hevc_annex_b_to_length_prefixed(
     data: &[u8],
-) -> Result<(Vec<u8>, bool, ParameterSets), BackendError> {
+) -> Result<(Vec<u8>, bool, HevcParameterSets), BackendError> {
     let mut out = Vec::with_capacity(data.len());
-    let mut sets = ParameterSets {
+    let mut sets = HevcParameterSets {
         vps: Vec::new(),
         sps: Vec::new(),
         pps: Vec::new(),
@@ -510,17 +763,65 @@ fn write_mdat_payload(
     video_samples: &[PreparedSample],
     audio_samples: Option<&[PreparedAudioSample]>,
 ) -> Result<(), BackendError> {
+    let mut cache = FileRangeReadCache::default();
     for sample in video_samples {
-        out.write_all(&sample.data)
-            .map_err(|err| BackendError::Io(err.to_string()))?;
+        write_sample_payload(out, &sample.data, &mut cache)?;
     }
     if let Some(audio_samples) = audio_samples {
         for sample in audio_samples {
-            out.write_all(&sample.data)
-                .map_err(|err| BackendError::Io(err.to_string()))?;
+            write_sample_payload(out, &sample.data, &mut cache)?;
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct FileRangeReadCache {
+    path: Option<PathBuf>,
+    file: Option<BufReader<File>>,
+}
+
+fn write_sample_payload(
+    out: &mut impl Write,
+    payload: &SamplePayload,
+    cache: &mut FileRangeReadCache,
+) -> Result<(), BackendError> {
+    match payload {
+        SamplePayload::Memory(data) => out
+            .write_all(data)
+            .map_err(|err| BackendError::Io(err.to_string())),
+        SamplePayload::FileRange(range) => {
+            let needs_open = cache.path.as_ref() != Some(&range.path);
+            if needs_open {
+                let file =
+                    File::open(&range.path).map_err(|err| BackendError::Io(err.to_string()))?;
+                cache.file = Some(BufReader::with_capacity(1024 * 1024, file));
+                cache.path = Some(range.path.clone());
+            }
+            let file = cache.file.as_mut().ok_or_else(|| {
+                BackendError::unsupported(
+                    "MP4 封装",
+                    range.path.display().to_string(),
+                    "file range reader 未初始化",
+                )
+            })?;
+            file.seek(SeekFrom::Start(range.offset))
+                .map_err(|err| BackendError::Io(err.to_string()))?;
+            let copied = io::copy(&mut file.take(range.len), out)
+                .map_err(|err| BackendError::Io(err.to_string()))?;
+            if copied != range.len {
+                return Err(BackendError::unsupported(
+                    "MP4 封装",
+                    range.path.display().to_string(),
+                    format!(
+                        "file range 读取长度不匹配：offset={} expected={} copied={}",
+                        range.offset, range.len, copied
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn make_moov(
@@ -528,7 +829,7 @@ fn make_moov(
     video_duration_90k: u64,
     video_samples: &[PreparedSample],
     video_offsets: &[u64],
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
     audio: Option<PreparedAacTrackRef<'_>>,
 ) -> Result<Vec<u8>, BackendError> {
     let video_duration_ms = scale_duration(video_duration_90k, VIDEO_TIMESCALE, MOVIE_TIMESCALE);
@@ -587,7 +888,7 @@ fn make_video_trak(
     duration_90k: u64,
     samples: &[PreparedSample],
     offsets: &[u64],
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
     track_duration_ms: u32,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
@@ -644,7 +945,7 @@ fn make_mdia(
     duration_90k: u64,
     samples: &[PreparedSample],
     offsets: &[u64],
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
     p.extend(make_mdhd(VIDEO_TIMESCALE, duration_90k));
@@ -692,7 +993,7 @@ fn make_minf(
     track: &HevcMp4Track,
     samples: &[PreparedSample],
     offsets: &[u64],
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
     p.extend(make_vmhd());
@@ -741,7 +1042,7 @@ fn make_stbl(
     track: &HevcMp4Track,
     samples: &[PreparedSample],
     offsets: &[u64],
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
     p.extend(make_stsd(track, sets)?);
@@ -767,7 +1068,7 @@ fn make_audio_stbl(
     Ok(mp4_box(*b"stbl", p))
 }
 
-fn make_stsd(track: &HevcMp4Track, sets: &ParameterSets) -> Result<Vec<u8>, BackendError> {
+fn make_stsd(track: &HevcMp4Track, sets: &HevcParameterSets) -> Result<Vec<u8>, BackendError> {
     let hvc1 = make_hvc1_sample_entry(track, sets)?;
     let mut p = Vec::new();
     be32(&mut p, 1);
@@ -785,7 +1086,7 @@ fn make_audio_stsd(track: &AacLcMp4Track) -> Result<Vec<u8>, BackendError> {
 
 fn make_hvc1_sample_entry(
     track: &HevcMp4Track,
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
     p.extend_from_slice(&[0; 6]);
@@ -910,7 +1211,7 @@ fn aac_sample_rate_index(sample_rate: u32) -> Option<u8> {
 }
 
 fn make_hvcc_with_codec(
-    sets: &ParameterSets,
+    sets: &HevcParameterSets,
     codec: HevcCodecMetadata,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = vec![
