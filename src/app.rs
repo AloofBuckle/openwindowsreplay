@@ -158,6 +158,11 @@ impl RustReplayApp {
             this.loop_log.push(status);
         }
         this.start_probe();
+        if startup_hidden_to_tray || startup_auto_start_pending {
+            cc.egui_ctx.request_repaint();
+            cc.egui_ctx
+                .request_repaint_after(Duration::from_millis(100));
+        }
         this
     }
 

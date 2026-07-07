@@ -2502,7 +2502,7 @@ fn record_d3d11_onecopy_mp4_impl(
         );
         match capture_source {
             RecordCaptureSource::Dda => notes.push(
-                "固定 DDA 路线：独立 D3D11 capture device CopyResource 到 keyed shared snapshot pool 后立即 ReleaseFrame，编码线程按自动 route GPU shader 全帧写目标 FourCC，再一次 CopyResource 到 oneVPL surface"
+                "固定 DDA 路线：独立 D3D11 capture device 获取 DDA 帧，捕获线程按自动 route GPU shader 写目标 FourCC keyed shared snapshot 后立即 ReleaseFrame，编码线程复制目标 FourCC snapshot 到 oneVPL surface"
                     .to_owned(),
             ),
             RecordCaptureSource::Wgc => notes.push(
@@ -2593,6 +2593,8 @@ fn record_d3d11_onecopy_mp4_impl(
                         source_stop_90k,
                         qpc_frequency,
                         record_route,
+                        target_desc.Width,
+                        target_desc.Height,
                         capture_pool_size,
                         stop.clone(),
                         frame_tx,
@@ -2784,57 +2786,6 @@ fn record_d3d11_onecopy_mp4_impl(
                             if move_rect_bytes > 0 {
                                 move_metadata_frames += 1;
                             }
-                            slot.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
-                                BackendError::WindowsApi {
-                                    func: "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
-                                    message: err.to_string(),
-                                }
-                            })?;
-                            let conversion_source = slot.encoder_texture.clone();
-                            let convert_started = Instant::now();
-                            if direct_route_snapshot {
-                                copy_texture_resource(
-                                    &immediate,
-                                    &conversion_source,
-                                    &route_intermediate,
-                                )?;
-                                full_convert_frames += 1;
-                            } else if same_route_format {
-                                copy_texture_subresource_region(
-                                    &immediate,
-                                    &conversion_source,
-                                    &route_intermediate,
-                                    source_desc.Width.min(target_desc.Width),
-                                    source_desc.Height.min(target_desc.Height),
-                                )?;
-                                full_convert_frames += 1;
-                            } else if let Some(converter) = &route_converter {
-                                converter.convert(&conversion_source)?;
-                                full_convert_frames += 1;
-                            } else {
-                                return Err(BackendError::unsupported(
-                                    "GPU shader -> route YUV plane",
-                                    format!("DXGI_FORMAT({}) 输入", source_desc.Format.0),
-                                    "固定路线未初始化目标 YUV 转换器",
-                                ));
-                            }
-                            perf.convert.add(convert_started.elapsed());
-
-                            let fence_started = Instant::now();
-                            slot.encoder_fence.mark(&immediate);
-                            perf.source_fence.add(fence_started.elapsed());
-
-                            slot.encoder_mutex.ReleaseSync(0).map_err(|err| {
-                                BackendError::WindowsApi {
-                                    func: "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
-                                    message: err.to_string(),
-                                }
-                            })?;
-                            // The free slot is returned after encoder-side conversion commands have
-                            // been submitted, the keyed mutex has been released, and a D3D11 event
-                            // query later confirms the GPU has consumed the snapshot.
-                            pending_free_slots.push(slot);
-
                             let surface_started = Instant::now();
                             let surface = if let Some(surface) = pending_surface.take() {
                                 surface
@@ -2887,9 +2838,63 @@ fn record_d3d11_onecopy_mp4_impl(
                             };
                             perf.surface.add(surface_started.elapsed());
 
-                            let copy_started = Instant::now();
-                            copy_texture_resource(&immediate, &route_intermediate, target)?;
-                            perf.copy.add(copy_started.elapsed());
+                            slot.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
+                                BackendError::WindowsApi {
+                                    func: "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
+                                    message: err.to_string(),
+                                }
+                            })?;
+                            let conversion_source = slot.encoder_texture.clone();
+                            if direct_route_snapshot {
+                                let copy_started = Instant::now();
+                                copy_texture_resource(&immediate, &conversion_source, target)?;
+                                perf.copy.add(copy_started.elapsed());
+                                full_convert_frames += 1;
+                            } else if same_route_format {
+                                let copy_started = Instant::now();
+                                copy_texture_subresource_region(
+                                    &immediate,
+                                    &conversion_source,
+                                    target,
+                                    source_desc.Width.min(target_desc.Width),
+                                    source_desc.Height.min(target_desc.Height),
+                                )?;
+                                perf.copy.add(copy_started.elapsed());
+                                full_convert_frames += 1;
+                            } else if let Some(converter) = &route_converter {
+                                let convert_started = Instant::now();
+                                converter.convert(&conversion_source)?;
+                                perf.convert.add(convert_started.elapsed());
+                                full_convert_frames += 1;
+                            } else {
+                                let _ = ((*frame_interface).Release)(surface);
+                                return Err(BackendError::unsupported(
+                                    "GPU shader -> route YUV plane",
+                                    format!("DXGI_FORMAT({}) 输入", source_desc.Format.0),
+                                    "固定路线未初始化目标 YUV 转换器",
+                                ));
+                            }
+
+                            let fence_started = Instant::now();
+                            slot.encoder_fence.mark(&immediate);
+                            perf.source_fence.add(fence_started.elapsed());
+
+                            slot.encoder_mutex.ReleaseSync(0).map_err(|err| {
+                                BackendError::WindowsApi {
+                                    func: "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
+                                    message: err.to_string(),
+                                }
+                            })?;
+                            // The free slot is returned after encoder-side conversion/copy commands
+                            // have been submitted, the keyed mutex has been released, and a D3D11
+                            // event query later confirms the GPU has consumed the snapshot.
+                            pending_free_slots.push(slot);
+
+                            if !same_route_format {
+                                let copy_started = Instant::now();
+                                copy_texture_resource(&immediate, &route_intermediate, target)?;
+                                perf.copy.add(copy_started.elapsed());
+                            }
 
                             if warmup {
                                 let warmup_ts90 = u64::from(warmup_encoded_frames)
@@ -2981,78 +2986,6 @@ fn record_d3d11_onecopy_mp4_impl(
                                     }
                                 }
                                 perf.sync.add(warmup_sync_started.elapsed());
-                                let warmup_copies =
-                                    std::env::var("RUST_REPLAY_VPL_SURFACE_WARMUP_COPIES")
-                                        .ok()
-                                        .and_then(|value| value.parse::<usize>().ok())
-                                        .unwrap_or(if rate_control.low_delay_brc { 1 } else { 4 })
-                                        .clamp(1, record_async_depth as usize);
-                                for _ in 1..warmup_copies {
-                                    let surface_started = Instant::now();
-                                    let mut warm_surface: *mut MfxFrameSurface1 = ptr::null_mut();
-                                    let status = (api.mfx_memory_get_surface_for_encode)(
-                                        session,
-                                        &mut warm_surface,
-                                    );
-                                    if status != MFX_ERR_NONE || warm_surface.is_null() {
-                                        return Err(BackendError::unsupported(
-                                            "oneVPL D3D11 surface import",
-                                            format!(
-                                                "{} + {}",
-                                                record_route.summary(),
-                                                rate_control.method.short_name()
-                                            ),
-                                            format!(
-                                                "MFXMemory_GetSurfaceForEncode(warmup) 返回 status={status}；该具体 route/码控字段组合无法提供预热 video-memory surface，禁止 CPU fallback"
-                                            ),
-                                        ));
-                                    }
-                                    let warm_interface = (*warm_surface).FrameInterface;
-                                    let mut warm_native: MfxHDL = ptr::null_mut();
-                                    let mut warm_native_type = 0u32;
-                                    let status = ((*warm_interface).GetNativeHandle)(
-                                        warm_surface,
-                                        &mut warm_native,
-                                        &mut warm_native_type,
-                                    );
-                                    if status != MFX_ERR_NONE
-                                        || warm_native_type != MFX_RESOURCE_DX11_TEXTURE
-                                    {
-                                        let _ = ((*warm_interface).Release)(warm_surface);
-                                        return Err(BackendError::VplStatus {
-                                            func: "mfxFrameSurfaceInterface::GetNativeHandle(warmup)",
-                                            status,
-                                        });
-                                    }
-                                    let Some(warm_target) =
-                                        <ID3D11Texture2D as Interface>::from_raw_borrowed(
-                                            &warm_native,
-                                        )
-                                    else {
-                                        let _ = ((*warm_interface).Release)(warm_surface);
-                                        return Err(BackendError::unsupported(
-                                            "oneVPL record",
-                                            "native texture warmup",
-                                            "GetNativeHandle 返回值不是 ID3D11Texture2D",
-                                        ));
-                                    };
-                                    perf.surface.add(surface_started.elapsed());
-
-                                    let copy_started = Instant::now();
-                                    copy_texture_resource(
-                                        &immediate,
-                                        &route_intermediate,
-                                        warm_target,
-                                    )?;
-                                    perf.copy.add(copy_started.elapsed());
-                                    let release_status = ((*warm_interface).Release)(warm_surface);
-                                    if release_status != MFX_ERR_NONE {
-                                        return Err(BackendError::VplStatus {
-                                            func: "mfxFrameSurfaceInterface::Release(warmup extra)",
-                                            status: release_status,
-                                        });
-                                    }
-                                }
                                 perf.frame.add(frame_started.elapsed());
                                 return Ok(());
                             }
@@ -4621,6 +4554,8 @@ fn spawn_dda_capture_thread(
     source_stop_90k: u64,
     qpc_frequency: i64,
     route: VplRecordRoute,
+    target_width: u32,
+    target_height: u32,
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
@@ -4639,6 +4574,8 @@ fn spawn_dda_capture_thread(
                 source_stop_90k,
                 qpc_frequency,
                 route,
+                target_width,
+                target_height,
                 pool_size,
                 stop,
                 &frame_tx,
@@ -4669,6 +4606,8 @@ unsafe fn run_dda_capture_thread(
     source_stop_90k: u64,
     qpc_frequency: i64,
     route: VplRecordRoute,
+    target_width: u32,
+    target_height: u32,
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: &std::sync::mpsc::Sender<CaptureMsg>,
@@ -4688,6 +4627,12 @@ unsafe fn run_dda_capture_thread(
     let mut stats = CaptureStats::new();
     let mut free_slots: VecDeque<SnapshotSlot> = VecDeque::new();
     let mut source_desc0: Option<D3D11_TEXTURE2D_DESC> = None;
+    let mut snapshot_desc0: Option<D3D11_TEXTURE2D_DESC> = None;
+    let mut route_intermediate: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
+        None;
+    let mut route_converter: Option<GpuRecordConverter> = None;
+    let mut shader_source_texture: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
+        None;
     let mut capture_index = 0u64;
     let mut timestamp_origin_qpc: Option<i64> = None;
     let mut last_timestamp_90k: Option<u64> = None;
@@ -4717,7 +4662,7 @@ unsafe fn run_dda_capture_thread(
                 last_timestamp_90k = None;
                 last_accepted_present_qpc = None;
             }
-            if source_desc0
+            if snapshot_desc0
                 .as_ref()
                 .is_none_or(|desc| snapshot_slot_matches(&slot, desc))
             {
@@ -4773,31 +4718,64 @@ unsafe fn run_dda_capture_thread(
                 return Ok(());
             }
 
-            if let Some(first) = source_desc0 {
-                if first.Width != source_desc.Width
+            let source_changed = source_desc0.is_none_or(|first| {
+                first.Width != source_desc.Width
                     || first.Height != source_desc.Height
                     || first.Format.0 != source_desc.Format.0
-                {
-                    free_slots.clear();
-                    source_desc0 = Some(source_desc);
-                    for id in 0..pool_size {
-                        let slot =
-                            create_shared_snapshot_slot(id, &device, &encoder_device, &source_desc)
-                                .map_err(|err| err.to_string())?;
-                        free_slots.push_back(slot);
-                    }
-                }
-            } else {
+            });
+            if source_changed {
+                let first_source = source_desc0.is_none();
                 source_desc0 = Some(source_desc);
+                let snapshot_desc = D3D11_TEXTURE2D_DESC {
+                    Width: target_width.max(1),
+                    Height: target_height.max(1),
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: route.try_dxgi_format().map_err(|err| err.to_string())?,
+                    SampleDesc: source_desc.SampleDesc,
+                    Usage: source_desc.Usage,
+                    BindFlags: 0,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                route_intermediate = Some(
+                    create_route_intermediate(&device, &snapshot_desc, route, true)
+                        .map_err(|err| err.to_string())?,
+                );
+                let intermediate = route_intermediate
+                    .as_ref()
+                    .ok_or_else(|| "DDA route intermediate missing after create".to_owned())?;
+                route_converter = Some(
+                    GpuRecordConverter::new(
+                        route,
+                        &device,
+                        &context,
+                        intermediate,
+                        source_desc.Width,
+                        source_desc.Height,
+                        true,
+                    )
+                    .map_err(|err| err.to_string())?,
+                );
+                shader_source_texture = Some(
+                    create_dda_snapshot_texture(&device, &source_desc)
+                        .map_err(|err| err.to_string())?,
+                );
+                snapshot_desc0 = Some(snapshot_desc);
+                free_slots.clear();
                 for id in 0..pool_size {
                     let slot =
-                        create_shared_snapshot_slot(id, &device, &encoder_device, &source_desc)
+                        create_shared_snapshot_slot(id, &device, &encoder_device, &snapshot_desc)
                             .map_err(|err| err.to_string())?;
                     free_slots.push_back(slot);
                 }
-                stats.dropped_warmup += 1;
-                return Ok(());
+                if first_source {
+                    stats.dropped_warmup += 1;
+                    return Ok(());
+                }
             }
+            let snapshot_desc =
+                snapshot_desc0.ok_or_else(|| "DDA route snapshot desc missing".to_owned())?;
 
             if encoder_warmup_pending {
                 if frame_info.LastPresentTime > 0 {
@@ -4817,7 +4795,20 @@ unsafe fn run_dda_capture_thread(
                 slot.capture_mutex
                     .AcquireSync(0, 1_000)
                     .map_err(|err| format!("IDXGIKeyedMutex::AcquireSync(capture): {err}"))?;
-                copy_texture_resource(&context, &source, &slot.capture_texture)
+                let shader_source = shader_source_texture
+                    .as_ref()
+                    .ok_or_else(|| "DDA shader source texture missing".to_owned())?;
+                let intermediate = route_intermediate
+                    .as_ref()
+                    .ok_or_else(|| "DDA route intermediate missing".to_owned())?;
+                let converter = route_converter
+                    .as_ref()
+                    .ok_or_else(|| "DDA route converter missing".to_owned())?;
+                copy_texture_resource(&context, &source, shader_source)
+                    .and_then(|()| converter.convert(shader_source))
+                    .and_then(|()| {
+                        copy_texture_resource(&context, intermediate, &slot.capture_texture)
+                    })
                     .map_err(|err| err.to_string())?;
                 slot.capture_mutex
                     .ReleaseSync(1)
@@ -4830,7 +4821,7 @@ unsafe fn run_dda_capture_thread(
             if !encoder_warmup_done {
                 let captured = CapturedSnapshot {
                     slot,
-                    source_desc,
+                    source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
                     timestamp_90k: 0,
@@ -4881,7 +4872,7 @@ unsafe fn run_dda_capture_thread(
                 last_timestamp_90k = None;
                 let captured = CapturedSnapshot {
                     slot,
-                    source_desc,
+                    source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
                     timestamp_90k: 0,
@@ -4933,7 +4924,7 @@ unsafe fn run_dda_capture_thread(
             reached_source_end = timestamp_90k >= source_stop_90k;
             let captured = CapturedSnapshot {
                 slot,
-                source_desc,
+                source_desc: snapshot_desc,
                 move_rect_bytes: frame_metadata.move_rect_bytes,
                 dirty_rects: frame_metadata.dirty_rects,
                 timestamp_90k,
