@@ -357,6 +357,10 @@ fn run_segment_worker(
             timestamp_for_filename(),
             segment_index
         ));
+        append_backend_timing_log(&format!(
+            "segment #{segment_index} worker started; output={}",
+            output.display()
+        ));
         let _ = tx.send(ReplayEvent::SegmentStarted {
             index: segment_index,
             path: output.clone(),
@@ -385,6 +389,7 @@ fn run_segment_worker(
                 first_audio_au_seen: false,
                 ready_seen: false,
             };
+            append_backend_timing_log(&format!("segment #{segment_index} entering GPU pipeline"));
             let result = pipeline::record_once_gpu_only_memory_output_with_sink_cancelable(
                 &request,
                 &caps,
@@ -449,6 +454,7 @@ fn run_segment_worker(
                 });
             }
             Err(err) => {
+                append_backend_timing_log(&format!("segment #{segment_index} failed: {err}"));
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
