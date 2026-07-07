@@ -14,9 +14,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const INDICATOR_FLASH_DURATION: Duration = Duration::from_secs(2);
-const STARTUP_AUTO_START_DELAY: Duration = Duration::from_secs(5);
-const STARTUP_AUTO_START_STALL_TIMEOUT: Duration = Duration::from_secs(45);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndicatorColor {
     Blue,
@@ -98,12 +95,7 @@ pub struct RustReplayApp {
     configuring_indicator_position: bool,
     waiting_save_hotkey: bool,
     startup_auto_start_pending: bool,
-    startup_auto_start_due: Option<Instant>,
-    startup_auto_start_min_ui_frame: u64,
-    startup_auto_recording_started_at: Option<Instant>,
-    startup_auto_retried: bool,
     startup_hidden_to_tray: bool,
-    ui_frame_count: u64,
     allow_exit: bool,
 }
 
@@ -158,12 +150,7 @@ impl RustReplayApp {
             configuring_indicator_position: false,
             waiting_save_hotkey: false,
             startup_auto_start_pending,
-            startup_auto_start_due: None,
-            startup_auto_start_min_ui_frame: 0,
-            startup_auto_recording_started_at: None,
-            startup_auto_retried: false,
             startup_hidden_to_tray,
-            ui_frame_count: 0,
             allow_exit: false,
         };
         if let Some(status) = indicator_status {
@@ -347,19 +334,10 @@ impl RustReplayApp {
         sanitize_config_against_caps(&mut self.config, &caps);
         self.caps = Some(caps);
         if self.startup_auto_start_pending && self.config.start_recording_on_launch {
-            self.startup_auto_start_pending = false;
-            self.startup_auto_start_due = Some(Instant::now() + STARTUP_AUTO_START_DELAY);
-            self.startup_auto_start_min_ui_frame = self.ui_frame_count.saturating_add(3);
-            self.startup_auto_recording_started_at = None;
-            self.startup_auto_retried = false;
-            self.loop_log.push(format!(
-                "随启动开始已启用，初始化完成后等待 {:.1}s 再自动开始录制。",
-                STARTUP_AUTO_START_DELAY.as_secs_f32()
-            ));
+            self.loop_log
+                .push("随启动开始已启用，等待开始按钮可用后自动开始录制。".to_owned());
         } else {
             self.startup_auto_start_pending = false;
-            self.startup_auto_start_due = None;
-            self.startup_auto_recording_started_at = None;
         }
     }
 
@@ -611,10 +589,6 @@ impl RustReplayApp {
         self.indicator_flash = None;
         self.waiting_save_hotkey = false;
         self.startup_auto_start_pending = false;
-        self.startup_auto_start_due = None;
-        self.startup_auto_start_min_ui_frame = 0;
-        self.startup_auto_recording_started_at = None;
-        self.startup_auto_retried = false;
         self.startup_hidden_to_tray = false;
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
         self.last_saved_config_json.clear();
@@ -696,9 +670,7 @@ impl RustReplayApp {
         if self.is_initializing() {
             return "状态：等待初始化".to_owned();
         }
-        if self.startup_auto_start_due.is_some()
-            && matches!(self.controller.state(), ReplayState::Idle)
-        {
+        if self.startup_auto_start_pending && matches!(self.controller.state(), ReplayState::Idle) {
             return "状态：等待随启动开始".to_owned();
         }
         match self.controller.state() {
@@ -738,6 +710,10 @@ impl RustReplayApp {
         !self.is_initializing() && self.controller.save_readiness().can_save()
     }
 
+    fn config_is_persisted(&self) -> bool {
+        self.config.stable_json() == self.last_saved_config_json
+    }
+
     fn is_initializing(&self) -> bool {
         self.probe_rx.is_some()
     }
@@ -752,65 +728,21 @@ impl RustReplayApp {
     }
 
     fn maybe_run_startup_auto_start(&mut self, ctx: &egui::Context) {
-        let Some(due) = self.startup_auto_start_due else {
+        if !self.startup_auto_start_pending {
             return;
-        };
+        }
         if !self.config.start_recording_on_launch {
-            self.startup_auto_start_due = None;
+            self.startup_auto_start_pending = false;
             return;
         }
-        if self.is_initializing() || self.caps.is_none() {
+        if !self.config_is_persisted() || !self.can_start_replay() {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
-        if self.ui_frame_count < self.startup_auto_start_min_ui_frame {
-            ctx.request_repaint_after(Duration::from_millis(100));
-            return;
-        }
-        let now = Instant::now();
-        if now < due {
-            ctx.request_repaint_after(due.saturating_duration_since(now));
-            return;
-        }
-        if !matches!(self.controller.state(), ReplayState::Idle) {
-            ctx.request_repaint_after(Duration::from_millis(200));
-            return;
-        }
-        self.startup_auto_start_due = None;
+        self.startup_auto_start_pending = false;
         self.loop_log
-            .push("随启动开始：初始化稳定后开始录制。".to_owned());
-        if self.click_start() {
-            self.startup_auto_recording_started_at = Some(Instant::now());
-        }
-    }
-
-    fn recover_stalled_startup_auto_start(&mut self, ctx: &egui::Context) {
-        let Some(started_at) = self.startup_auto_recording_started_at else {
-            return;
-        };
-        if self.controller.save_readiness().can_save() {
-            self.startup_auto_recording_started_at = None;
-            return;
-        }
-        if !matches!(self.controller.state(), ReplayState::Running { .. }) {
-            self.startup_auto_recording_started_at = None;
-            return;
-        }
-        if self.startup_auto_retried || started_at.elapsed() < STARTUP_AUTO_START_STALL_TIMEOUT {
-            ctx.request_repaint_after(Duration::from_millis(500));
-            return;
-        }
-
-        self.startup_auto_retried = true;
-        self.startup_auto_recording_started_at = None;
-        self.startup_auto_start_due = Some(Instant::now() + STARTUP_AUTO_START_DELAY);
-        self.startup_auto_start_min_ui_frame = self.ui_frame_count.saturating_add(3);
-        self.loop_log.push(format!(
-            "随启动开始：后台录制 {:.0}s 内未产生可保存数据，自动停止并重试一次。",
-            STARTUP_AUTO_START_STALL_TIMEOUT.as_secs_f32()
-        ));
-        let _ = self.controller.stop();
-        ctx.request_repaint_after(Duration::from_millis(500));
+            .push("随启动开始：开始按钮可用，自动开始录制。".to_owned());
+        let _ = self.click_start();
     }
 }
 
@@ -836,11 +768,9 @@ impl eframe::App for RustReplayApp {
         }
         self.persist_config_if_changed();
         self.maybe_run_startup_auto_start(ctx);
-        self.recover_stalled_startup_auto_start(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.ui_frame_count = self.ui_frame_count.saturating_add(1);
         egui::Panel::top("top_controls")
             .exact_size(36.0)
             .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
