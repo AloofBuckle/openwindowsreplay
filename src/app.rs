@@ -2,7 +2,7 @@
 
 use crate::backend::session::{ReplayController, ReplaySaveReadiness, ReplayState};
 use crate::backend::{ProbeCaps, RateControlFeatureSupport};
-use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey};
+use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey, ReplayBufferMode};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::indicator_overlay::{IndicatorOverlayRuntime, NativeIndicatorImage};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
@@ -1105,15 +1105,36 @@ impl RustReplayApp {
                 self.config.capture_backend.short_name()
             ));
             ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                let mut disk_mode = self.config.replay_buffer_mode.is_disk();
+                if ui.checkbox(&mut disk_mode, "磁盘循环缓存").changed() {
+                    self.config.replay_buffer_mode = if disk_mode {
+                        ReplayBufferMode::Disk
+                    } else {
+                        ReplayBufferMode::Memory
+                    };
+                }
+                ui.label(format!(
+                    "当前模式：{}",
+                    self.config.replay_buffer_mode.label()
+                ));
+            });
             ui.horizontal(|ui| {
                 ui.label("循环缓存的目录 {dir：}");
-                ui.text_edit_singleline(&mut self.config.cache_dir);
-                if ui.button("选择…").clicked()
-                    && let Some(path) = pick_folder(&self.config.cache_dir)
-                {
-                    self.config.cache_dir = path;
-                }
+                ui.add_enabled_ui(self.config.replay_buffer_mode.is_disk(), |ui| {
+                    ui.text_edit_singleline(&mut self.config.cache_dir);
+                    if ui.button("选择…").clicked()
+                        && let Some(path) = pick_folder(&self.config.cache_dir)
+                    {
+                        self.config.cache_dir = path;
+                    }
+                });
             });
+            if !self.config.replay_buffer_mode.is_disk() {
+                ui.small(
+                    "内存循环不使用缓存目录；保存时直接从内存 encoded ring 写入落盘保存目录。",
+                );
+            }
             ui.horizontal(|ui| {
                 ui.label("落盘保存的目录 {dir：}");
                 ui.text_edit_singleline(&mut self.config.save_dir);

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct AppConfig {
     pub capture_backend: CaptureBackend,
+    pub replay_buffer_mode: ReplayBufferMode,
     pub chroma: Option<ChromaSampling>,
     pub rate_control: RateControlConfig,
     pub cache_dir: String,
@@ -28,6 +29,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             capture_backend: CaptureBackend::Wgc,
+            replay_buffer_mode: ReplayBufferMode::Memory,
             chroma: None,
             rate_control: RateControlConfig::default(),
             cache_dir: "cache".to_owned(),
@@ -91,6 +93,26 @@ impl AppConfig {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(format!("删除配置文件 {} 失败：{err}", path.display())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayBufferMode {
+    #[default]
+    Memory,
+    Disk,
+}
+
+impl ReplayBufferMode {
+    pub const fn is_disk(self) -> bool {
+        matches!(self, Self::Disk)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "内存循环",
+            Self::Disk => "磁盘循环",
         }
     }
 }
