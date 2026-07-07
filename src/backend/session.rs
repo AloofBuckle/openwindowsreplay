@@ -442,6 +442,9 @@ fn run_recording_worker(
         mode: buffer_mode,
         path: start_path.clone(),
     });
+    let mut disk_writer = disk_store
+        .clone()
+        .map(|store| DiskSegmentWriter::spawn(store, tx.clone()));
     let mut run_index = 0u64;
     while !stop_flag.load(Ordering::Relaxed) {
         let output_dir = cache_dir.as_ref().unwrap_or(&save_dir);
@@ -468,14 +471,15 @@ fn run_recording_worker(
                     })
                 }
                 ReplayBufferMode::Disk => {
-                    let Some(store) = disk_store.clone() else {
+                    let Some(writer_tx) = disk_writer.as_ref().and_then(DiskSegmentWriter::sender)
+                    else {
                         let _ = tx.send(ReplayEvent::Error(
-                            "磁盘循环模式缺少 segment store".to_owned(),
+                            "磁盘循环模式缺少异步 segment writer".to_owned(),
                         ));
                         return;
                     };
                     ReplayRecordSink::Disk(DiskSegmentSink::new(
-                        store,
+                        writer_tx,
                         tx.clone(),
                         run_index,
                         replay_duration,
@@ -536,11 +540,18 @@ fn run_recording_worker(
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
+                drop(sink);
+                if let Some(writer) = disk_writer.take() {
+                    writer.shutdown();
+                }
                 let _ = tx.send(ReplayEvent::Error(err.to_string()));
                 return;
             }
         }
         run_index = run_index.saturating_add(1);
+    }
+    if let Some(writer) = disk_writer.take() {
+        writer.shutdown();
     }
     let _ = tx.send(ReplayEvent::Stopped);
 }
@@ -676,6 +687,13 @@ impl DiskSegmentMeta {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DiskSegmentReservation {
+    index: u64,
+    mp4_path: PathBuf,
+    sidecar_path: PathBuf,
+}
+
 #[derive(Debug)]
 struct DiskReplayStore {
     dir: PathBuf,
@@ -702,41 +720,21 @@ impl DiskReplayStore {
             .any(|segment| segment.audio_access_units > 0)
     }
 
-    fn write_segment(
-        &mut self,
-        segment: DiskSegmentTracks,
-    ) -> Result<DiskSegmentMeta, BackendError> {
+    fn reserve_segment_paths(&mut self) -> Result<DiskSegmentReservation, BackendError> {
         fs::create_dir_all(&self.dir).map_err(|err| BackendError::Io(err.to_string()))?;
         let index = self.next_index;
         self.next_index = self.next_index.saturating_add(1);
         let stem = format!("rustreplay_segment_{}_{}", timestamp_for_filename(), index);
-        let mp4_path = self.dir.join(format!("{stem}.mp4"));
-        let sidecar_path = self.dir.join(format!("{stem}.rrseg"));
-        super::mp4_mux::write_hevc_aac_mp4(
-            &mp4_path,
-            &segment.video_track,
-            segment.audio_track.as_ref(),
-        )?;
-        write_disk_segment_sidecar(&sidecar_path, &segment)?;
-        let bytes = fs::metadata(&mp4_path).map(|meta| meta.len()).unwrap_or(0)
-            + fs::metadata(&sidecar_path)
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-        let meta = DiskSegmentMeta {
+        Ok(DiskSegmentReservation {
             index,
-            mp4_path,
-            sidecar_path,
-            duration_90k: segment.video_track.duration_90k,
-            audio_access_units: segment
-                .audio_track
-                .as_ref()
-                .map(|track| track.samples.len())
-                .unwrap_or(0),
-            bytes,
-        };
-        self.segments.push_back(meta.clone());
+            mp4_path: self.dir.join(format!("{stem}.mp4")),
+            sidecar_path: self.dir.join(format!("{stem}.rrseg")),
+        })
+    }
+
+    fn commit_segment(&mut self, meta: DiskSegmentMeta) {
+        self.segments.push_back(meta);
         self.prune_old_segments();
-        Ok(meta)
     }
 
     fn snapshot_recent_tracks(
@@ -787,8 +785,162 @@ impl DiskReplayStore {
     }
 }
 
+struct DiskSegmentWriteJob {
+    run_index: u64,
+    segment: DiskSegmentTracks,
+    enqueued_at: Instant,
+}
+
+struct DiskSegmentWriteReport {
+    meta: DiskSegmentMeta,
+    queue_wait: Duration,
+    mux_write: Duration,
+    sidecar_write: Duration,
+    commit: Duration,
+    total: Duration,
+}
+
+struct DiskSegmentWriter {
+    sender: Option<Sender<DiskSegmentWriteJob>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DiskSegmentWriter {
+    fn spawn(store: Arc<Mutex<DiskReplayStore>>, tx: Sender<ReplayEvent>) -> Self {
+        let (sender, rx) = mpsc::channel::<DiskSegmentWriteJob>();
+        let handle = thread::spawn(move || {
+            lower_current_disk_writer_priority();
+            while let Ok(job) = rx.recv() {
+                let run_index = job.run_index;
+                match write_disk_segment_job(&store, job) {
+                    Ok(report) => {
+                        let _ = tx.send(ReplayEvent::BackendStatus {
+                            index: run_index,
+                            message: format!(
+                                "磁盘循环分段已异步写入 #{}：{}，duration={:.3}s，audio_au={}，bytes={}，queue={:.1}ms mux={:.1}ms sidecar={:.1}ms commit={:.1}ms total={:.1}ms",
+                                report.meta.index,
+                                report.meta.mp4_path.display(),
+                                report.meta.duration().as_secs_f64(),
+                                report.meta.audio_access_units,
+                                report.meta.bytes,
+                                report.queue_wait.as_secs_f64() * 1000.0,
+                                report.mux_write.as_secs_f64() * 1000.0,
+                                report.sidecar_write.as_secs_f64() * 1000.0,
+                                report.commit.as_secs_f64() * 1000.0,
+                                report.total.as_secs_f64() * 1000.0,
+                            ),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(ReplayEvent::BackendStatus {
+                            index: run_index,
+                            message: format!("磁盘循环分段异步写入失败：{err}"),
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn sender(&self) -> Option<Sender<DiskSegmentWriteJob>> {
+        self.sender.as_ref().cloned()
+    }
+
+    fn shutdown(mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for DiskSegmentWriter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn write_disk_segment_job(
+    store: &Arc<Mutex<DiskReplayStore>>,
+    job: DiskSegmentWriteJob,
+) -> Result<DiskSegmentWriteReport, BackendError> {
+    let started = Instant::now();
+    let queue_wait = job.enqueued_at.elapsed();
+    let reservation = store
+        .lock()
+        .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
+        .reserve_segment_paths()?;
+
+    let mux_started = Instant::now();
+    super::mp4_mux::write_hevc_aac_mp4(
+        &reservation.mp4_path,
+        &job.segment.video_track,
+        job.segment.audio_track.as_ref(),
+    )?;
+    let mux_write = mux_started.elapsed();
+
+    let sidecar_started = Instant::now();
+    write_disk_segment_sidecar(&reservation.sidecar_path, &job.segment)?;
+    let sidecar_write = sidecar_started.elapsed();
+
+    let bytes = fs::metadata(&reservation.mp4_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+        + fs::metadata(&reservation.sidecar_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+    let meta = DiskSegmentMeta {
+        index: reservation.index,
+        mp4_path: reservation.mp4_path,
+        sidecar_path: reservation.sidecar_path,
+        duration_90k: job.segment.video_track.duration_90k,
+        audio_access_units: job
+            .segment
+            .audio_track
+            .as_ref()
+            .map(|track| track.samples.len())
+            .unwrap_or(0),
+        bytes,
+    };
+
+    let commit_started = Instant::now();
+    store
+        .lock()
+        .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
+        .commit_segment(meta.clone());
+    let commit = commit_started.elapsed();
+    Ok(DiskSegmentWriteReport {
+        meta,
+        queue_wait,
+        mux_write,
+        sidecar_write,
+        commit,
+        total: started.elapsed(),
+    })
+}
+
+#[cfg(windows)]
+fn lower_current_disk_writer_priority() {
+    unsafe {
+        let _ = windows::Win32::System::Threading::SetThreadPriority(
+            windows::Win32::System::Threading::GetCurrentThread(),
+            windows::Win32::System::Threading::THREAD_PRIORITY(-1),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_disk_writer_priority() {}
+
 struct DiskSegmentSink {
-    store: Arc<Mutex<DiskReplayStore>>,
+    writer_tx: Sender<DiskSegmentWriteJob>,
     tx: Sender<ReplayEvent>,
     run_index: u64,
     metadata: Option<EncodedReplayMetadata>,
@@ -801,7 +953,7 @@ struct DiskSegmentSink {
 
 impl DiskSegmentSink {
     fn new(
-        store: Arc<Mutex<DiskReplayStore>>,
+        writer_tx: Sender<DiskSegmentWriteJob>,
         tx: Sender<ReplayEvent>,
         run_index: u64,
         replay_duration: Duration,
@@ -810,7 +962,7 @@ impl DiskSegmentSink {
             .min((replay_duration.as_secs_f32() / 2.0).max(1.0))
             .max(1.0);
         Self {
-            store,
+            writer_tx,
             tx,
             run_index,
             metadata: None,
@@ -966,21 +1118,16 @@ impl DiskSegmentSink {
         let Some(segment) = segment.into_tracks(&self.header_units) else {
             return;
         };
-        match self
-            .store
-            .lock()
-            .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))
-            .and_then(|mut store| store.write_segment(segment))
+        if self
+            .writer_tx
+            .send(DiskSegmentWriteJob {
+                run_index: self.run_index,
+                segment,
+                enqueued_at: Instant::now(),
+            })
+            .is_err()
         {
-            Ok(meta) => self.send_status(&format!(
-                "磁盘循环分段已写入 #{}：{}，duration={:.3}s，audio_au={}，bytes={}",
-                meta.index,
-                meta.mp4_path.display(),
-                meta.duration().as_secs_f64(),
-                meta.audio_access_units,
-                meta.bytes
-            )),
-            Err(err) => self.send_status(&format!("磁盘循环分段写入失败：{err}")),
+            self.send_status("磁盘循环分段写入失败：异步 writer 已停止");
         }
     }
 
