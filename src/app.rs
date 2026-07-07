@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const INDICATOR_FLASH_DURATION: Duration = Duration::from_secs(2);
+const MAX_VISIBLE_LOG_LINES: usize = 400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndicatorColor {
     Blue,
@@ -993,7 +994,7 @@ impl RustReplayApp {
         });
 
         ui.separator();
-        let log_height = (ui.available_height() - 4.0).max(200.0);
+        let log_height = ui.available_height().max(200.0);
         ui.columns(2, |cols| {
             log_panel(
                 &mut cols[0],
@@ -1902,20 +1903,45 @@ fn pick_image_file() -> Option<String> {
 }
 
 fn log_panel(ui: &mut egui::Ui, id_salt: &'static str, title: &str, lines: &[String], height: f32) {
-    ui.heading(title);
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_min_height(height);
-        egui::ScrollArea::vertical()
-            .id_salt(id_salt)
-            .stick_to_bottom(true)
-            .min_scrolled_height(height)
-            .max_height(height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for line in lines.iter().rev().take(400).rev() {
-                    ui.monospace(line);
-                }
-            });
+    ui.push_id(id_salt, |ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_height(height);
+                ui.heading(title);
+                let body_height = ui.available_height().max(120.0);
+                let body_width = ui.available_width();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(body_width, body_height));
+                    ui.set_max_size(egui::vec2(body_width, body_height));
+                    let text = visible_log_text(lines);
+                    let mut text_view = text.as_str();
+                    egui::ScrollArea::vertical()
+                        .id_salt((id_salt, "scroll"))
+                        .stick_to_bottom(true)
+                        .min_scrolled_height(body_height)
+                        .max_height(body_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text_view)
+                                    .id_salt((id_salt, "text"))
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(1)
+                                    .min_size(egui::vec2(ui.available_width(), body_height))
+                                    .cursor_at_end(true),
+                            );
+                        });
+                });
+            },
+        );
     });
+}
+
+fn visible_log_text(lines: &[String]) -> String {
+    let start = lines.len().saturating_sub(MAX_VISIBLE_LOG_LINES);
+    lines[start..].join("\n")
 }
