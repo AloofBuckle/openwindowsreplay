@@ -12,8 +12,7 @@ use crate::error::BackendError;
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -2469,6 +2468,13 @@ fn record_d3d11_onecopy_mp4_impl(
         };
         let mut target_desc = D3D11_TEXTURE2D_DESC::default();
         first_target.GetDesc(&mut target_desc);
+        let surface_cache_enabled = std::env::var("RUSTREPLAY_SURFACE_CACHE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let mut surface_texture_cache: HashMap<usize, ID3D11Texture2D> = HashMap::new();
+        if surface_cache_enabled {
+            surface_texture_cache.insert(first_surface as usize, first_target.clone());
+        }
 
         let mut device_handle: MfxHDL = ptr::null_mut();
         let mut device_type = 0u32;
@@ -2545,6 +2551,9 @@ fn record_d3d11_onecopy_mp4_impl(
             "record backend route selected internally: {}",
             record_route.summary()
         ));
+        notes.push(format!(
+            "oneVPL surface native handle cache enabled={surface_cache_enabled}"
+        ));
         notes.push(
             "首个正式 AU 通过 mfxEncodeCtrl FrameType=I|REF|IDR 强制为关键帧；编码预热 AU 仅用于驱动/表面预热和参数集提取，不写入正式时间线"
                 .to_owned(),
@@ -2567,7 +2576,7 @@ fn record_d3d11_onecopy_mp4_impl(
                     .to_owned(),
             ),
             RecordCaptureSource::Wgc => notes.push(
-                "固定 WGC 路线：按自动 route 使用 BGRA8/FP16 输入，捕获端 GPU shader 写目标 FourCC shared snapshot、WGC 负责录制光标，编码线程仅 CopyResource 到 oneVPL surface"
+                "固定 WGC 路线：使用 oneVPL native D3D11 device 创建 WGC capture，捕获端 GPU shader 写目标 FourCC ordinary ring texture、WGC 负责录制光标，编码线程仅 CopyResource 到 oneVPL surface"
                     .to_owned(),
             ),
         }
@@ -2626,7 +2635,7 @@ fn record_d3d11_onecopy_mp4_impl(
             let capture_pool_size = 32usize;
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
-            let (free_tx, free_rx) = std::sync::mpsc::channel::<SnapshotSlot>();
+            let (free_tx, free_rx) = std::sync::mpsc::channel::<CaptureFrameSlot>();
             let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop = capture_stop.clone();
             let capture_thread_started = Instant::now();
@@ -2689,7 +2698,7 @@ fn record_d3d11_onecopy_mp4_impl(
             let mut capture_stats: Option<CaptureStats> = None;
             let mut capture_error: Option<String> = None;
             let mut active_source_desc: Option<D3D11_TEXTURE2D_DESC> = None;
-            let mut pending_free_slots: Vec<SnapshotSlot> = Vec::new();
+            let mut pending_free_slots: Vec<CaptureFrameSlot> = Vec::new();
 
             loop {
                 if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2864,79 +2873,93 @@ fn record_d3d11_onecopy_mp4_impl(
                             };
 
                             let frame_interface = (*surface).FrameInterface;
-                            let mut native: MfxHDL = ptr::null_mut();
-                            let mut native_type = 0u32;
-                            let status = ((*frame_interface).GetNativeHandle)(
-                                surface,
-                                &mut native,
-                                &mut native_type,
-                            );
-                            if status != MFX_ERR_NONE || native_type != MFX_RESOURCE_DX11_TEXTURE {
-                                let _ = ((*frame_interface).Release)(surface);
-                                return Err(BackendError::VplStatus {
-                                    func: "mfxFrameSurfaceInterface::GetNativeHandle",
-                                    status,
-                                });
-                            }
-                            let Some(target) =
-                                <ID3D11Texture2D as Interface>::from_raw_borrowed(&native)
-                            else {
-                                let _ = ((*frame_interface).Release)(surface);
+                            if frame_interface.is_null() {
                                 return Err(BackendError::unsupported(
                                     "oneVPL record",
-                                    "native texture",
-                                    "GetNativeHandle 返回值不是 ID3D11Texture2D",
-                                ));
-                            };
-                            perf.surface.add(surface_started.elapsed());
-
-                            slot.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
-                                BackendError::WindowsApi {
-                                    func: "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
-                                    message: err.to_string(),
-                                }
-                            })?;
-                            let conversion_source = slot.encoder_texture.clone();
-                            if direct_route_snapshot {
-                                let copy_started = Instant::now();
-                                copy_texture_resource(&immediate, &conversion_source, target)?;
-                                perf.copy.add(copy_started.elapsed());
-                                full_convert_frames += 1;
-                            } else if same_route_format {
-                                let copy_started = Instant::now();
-                                copy_texture_subresource_region(
-                                    &immediate,
-                                    &conversion_source,
-                                    target,
-                                    source_desc.Width.min(target_desc.Width),
-                                    source_desc.Height.min(target_desc.Height),
-                                )?;
-                                perf.copy.add(copy_started.elapsed());
-                                full_convert_frames += 1;
-                            } else if let Some(converter) = &route_converter {
-                                let convert_started = Instant::now();
-                                converter.convert(&conversion_source)?;
-                                perf.convert.add(convert_started.elapsed());
-                                full_convert_frames += 1;
-                            } else {
-                                let _ = ((*frame_interface).Release)(surface);
-                                return Err(BackendError::unsupported(
-                                    "GPU shader -> route YUV plane",
-                                    format!("DXGI_FORMAT({}) 输入", source_desc.Format.0),
-                                    "固定路线未初始化目标 YUV 转换器",
+                                    "FrameInterface",
+                                    "oneVPL surface 没有 FrameInterface",
                                 ));
                             }
+                            let (target, surface_cache_hit) = match cached_vpl_surface_texture(
+                                surface,
+                                &mut surface_texture_cache,
+                                surface_cache_enabled,
+                            ) {
+                                Ok(texture) => texture,
+                                Err(err) => {
+                                    let _ = ((*frame_interface).Release)(surface);
+                                    return Err(err);
+                                }
+                            };
+                            if surface_cache_hit {
+                                perf.surface_cache_hits = perf.surface_cache_hits.saturating_add(1);
+                            } else {
+                                perf.surface_cache_misses =
+                                    perf.surface_cache_misses.saturating_add(1);
+                            }
+                            perf.surface.add(surface_started.elapsed());
+
+                            let conversion_source = match &slot {
+                                CaptureFrameSlot::Shared(shared) => {
+                                    shared.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
+                                        BackendError::WindowsApi {
+                                            func: "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
+                                            message: err.to_string(),
+                                        }
+                                    })?;
+                                    shared.encoder_texture.clone()
+                                }
+                                CaptureFrameSlot::WgcLocal(local) => local.texture.clone(),
+                            };
+                            let conversion_result = (|| -> Result<(), BackendError> {
+                                if direct_route_snapshot {
+                                    let copy_started = Instant::now();
+                                    copy_texture_resource(&immediate, &conversion_source, &target)?;
+                                    perf.copy.add(copy_started.elapsed());
+                                    full_convert_frames += 1;
+                                } else if same_route_format {
+                                    let copy_started = Instant::now();
+                                    copy_texture_subresource_region(
+                                        &immediate,
+                                        &conversion_source,
+                                        &target,
+                                        source_desc.Width.min(target_desc.Width),
+                                        source_desc.Height.min(target_desc.Height),
+                                    )?;
+                                    perf.copy.add(copy_started.elapsed());
+                                    full_convert_frames += 1;
+                                } else if let Some(converter) = &route_converter {
+                                    let convert_started = Instant::now();
+                                    converter.convert(&conversion_source)?;
+                                    perf.convert.add(convert_started.elapsed());
+                                    full_convert_frames += 1;
+                                } else {
+                                    return Err(BackendError::unsupported(
+                                        "GPU shader -> route YUV plane",
+                                        format!("DXGI_FORMAT({}) 输入", source_desc.Format.0),
+                                        "固定路线未初始化目标 YUV 转换器",
+                                    ));
+                                }
+                                Ok(())
+                            })();
 
                             let fence_started = Instant::now();
-                            slot.encoder_fence.mark(&immediate);
-                            perf.source_fence.add(fence_started.elapsed());
-
-                            slot.encoder_mutex.ReleaseSync(0).map_err(|err| {
-                                BackendError::WindowsApi {
-                                    func: "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
-                                    message: err.to_string(),
+                            match &slot {
+                                CaptureFrameSlot::Shared(shared) => {
+                                    shared.encoder_fence.mark(&immediate);
+                                    shared.encoder_mutex.ReleaseSync(0).map_err(|err| {
+                                        BackendError::WindowsApi {
+                                            func: "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
+                                            message: err.to_string(),
+                                        }
+                                    })?;
                                 }
-                            })?;
+                                CaptureFrameSlot::WgcLocal(local) => {
+                                    local.fence.mark(&immediate);
+                                }
+                            }
+                            perf.source_fence.add(fence_started.elapsed());
+                            conversion_result?;
                             // The free slot is returned after encoder-side conversion/copy commands
                             // have been submitted, the keyed mutex has been released, and a D3D11
                             // event query later confirms the GPU has consumed the snapshot.
@@ -2944,7 +2967,7 @@ fn record_d3d11_onecopy_mp4_impl(
 
                             if !same_route_format {
                                 let copy_started = Instant::now();
-                                copy_texture_resource(&immediate, &route_intermediate, target)?;
+                                copy_texture_resource(&immediate, &route_intermediate, &target)?;
                                 perf.copy.add(copy_started.elapsed());
                             }
 
@@ -3222,6 +3245,7 @@ fn record_d3d11_onecopy_mp4_impl(
             if let Some(capture) = audio_capture.as_mut() {
                 capture.stop_without_reencode(&mut notes);
             }
+            surface_texture_cache.clear();
             let close_status = (api.mfx_video_encode_close)(session);
             let mfx_close_status = (api.mfx_close)(session);
             (api.mfx_unload)(loader);
@@ -3267,6 +3291,7 @@ fn record_d3d11_onecopy_mp4_impl(
             requested_duration_90k,
             !capture_source.is_wgc(),
         );
+        surface_texture_cache.clear();
         let close_status = (api.mfx_video_encode_close)(session);
         let mfx_close_status = (api.mfx_close)(session);
         (api.mfx_unload)(loader);
@@ -3574,6 +3599,8 @@ struct RecordPerf {
     sync: StageTiming,
     release_frame: StageTiming,
     frame: StageTiming,
+    surface_cache_hits: u64,
+    surface_cache_misses: u64,
     dda_accumulated_frames_total: u64,
     dda_accumulated_frames_max: u32,
 }
@@ -3597,7 +3624,7 @@ impl RecordPerf {
                 "convert={:.3}/{:.3}, copy={:.3}/{:.3}, ",
                 "encode_submit={:.3}/{:.3}, encode_sync={:.3}/{:.3}, ",
                 "release_frame={:.3}/{:.3}, frame_body={:.3}/{:.3}; ",
-                "dda_accumulated avg/max={:.2}/{}, captured={}"
+                "surface_cache hit/miss={}/{}, dda_accumulated avg/max={:.2}/{}, captured={}"
             ),
             self.acquire.avg_ms(),
             self.acquire.max_ms(),
@@ -3621,6 +3648,8 @@ impl RecordPerf {
             self.release_frame.max_ms(),
             self.frame.avg_ms(),
             self.frame.max_ms(),
+            self.surface_cache_hits,
+            self.surface_cache_misses,
             avg_accumulated,
             self.dda_accumulated_frames_max,
             captured_frames
@@ -3641,6 +3670,50 @@ struct AsyncEncode {
 enum TrySyncResult {
     Ready(Option<crate::backend::mp4_mux::HevcAccessUnit>),
     NotReady,
+}
+
+#[cfg(windows)]
+unsafe fn cached_vpl_surface_texture(
+    surface: *mut MfxFrameSurface1,
+    cache: &mut HashMap<usize, windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+    cache_enabled: bool,
+) -> Result<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, bool), BackendError> {
+    use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+    use windows::core::Interface;
+
+    let key = surface as usize;
+    if cache_enabled && let Some(texture) = cache.get(&key) {
+        return Ok((texture.clone(), true));
+    }
+    let frame_interface = (*surface).FrameInterface;
+    if frame_interface.is_null() {
+        return Err(BackendError::unsupported(
+            "oneVPL record",
+            "FrameInterface",
+            "oneVPL surface 没有 FrameInterface",
+        ));
+    }
+    let mut native: MfxHDL = ptr::null_mut();
+    let mut native_type = 0u32;
+    let status = ((*frame_interface).GetNativeHandle)(surface, &mut native, &mut native_type);
+    if status != MFX_ERR_NONE || native_type != MFX_RESOURCE_DX11_TEXTURE {
+        return Err(BackendError::VplStatus {
+            func: "mfxFrameSurfaceInterface::GetNativeHandle",
+            status,
+        });
+    }
+    let Some(target) = <ID3D11Texture2D as Interface>::from_raw_borrowed(&native) else {
+        return Err(BackendError::unsupported(
+            "oneVPL record",
+            "native texture",
+            "GetNativeHandle 返回值不是 ID3D11Texture2D",
+        ));
+    };
+    let texture = target.clone();
+    if cache_enabled {
+        cache.insert(key, texture.clone());
+    }
+    Ok((texture, false))
 }
 
 fn sink_status(encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>, message: impl AsRef<str>) {
@@ -4337,7 +4410,7 @@ impl Drop for SnapshotSlotInner {
 
 #[cfg(windows)]
 struct CapturedSnapshot {
-    slot: SnapshotSlot,
+    slot: CaptureFrameSlot,
     source_desc: windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
     move_rect_bytes: u32,
     dirty_rects: Vec<windows::Win32::Foundation::RECT>,
@@ -4349,7 +4422,6 @@ struct CapturedSnapshot {
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
 struct WgcLocalSlot {
     id: usize,
     texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
@@ -4362,13 +4434,9 @@ unsafe impl Send for WgcLocalSlot {}
 unsafe impl Sync for WgcLocalSlot {}
 
 #[cfg(windows)]
-#[allow(dead_code)]
-struct WgcCopiedFrame {
-    slot: WgcLocalSlot,
-    source_desc: windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
-    timestamp_100ns: i64,
-    callback_duration: std::time::Duration,
-    copy_duration: std::time::Duration,
+enum CaptureFrameSlot {
+    Shared(SnapshotSlot),
+    WgcLocal(WgcLocalSlot),
 }
 
 #[cfg(windows)]
@@ -4548,7 +4616,20 @@ fn snapshot_slot_matches(
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
+fn wgc_local_slot_matches(
+    slot: &WgcLocalSlot,
+    desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+) -> bool {
+    let mut slot_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        slot.texture.GetDesc(&mut slot_desc);
+    }
+    slot_desc.Width == desc.Width
+        && slot_desc.Height == desc.Height
+        && slot_desc.Format.0 == desc.Format.0
+}
+
+#[cfg(windows)]
 unsafe fn create_wgc_local_slot(
     id: usize,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -4611,7 +4692,7 @@ fn spawn_dda_capture_thread(
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
-    free_rx: std::sync::mpsc::Receiver<SnapshotSlot>,
+    free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = unsafe {
@@ -4663,7 +4744,7 @@ unsafe fn run_dda_capture_thread(
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: &std::sync::mpsc::Sender<CaptureMsg>,
-    free_rx: std::sync::mpsc::Receiver<SnapshotSlot>,
+    free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> Result<CaptureStats, String> {
     use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
@@ -4708,6 +4789,9 @@ unsafe fn run_dda_capture_thread(
                 last_timestamp_90k = None;
                 last_accepted_present_qpc = None;
             }
+            let CaptureFrameSlot::Shared(slot) = slot else {
+                continue;
+            };
             if snapshot_desc0
                 .as_ref()
                 .is_none_or(|desc| snapshot_slot_matches(&slot, desc))
@@ -4859,7 +4943,7 @@ unsafe fn run_dda_capture_thread(
             }
             if !encoder_warmup_done {
                 let captured = CapturedSnapshot {
-                    slot,
+                    slot: CaptureFrameSlot::Shared(slot),
                     source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
@@ -4888,7 +4972,7 @@ unsafe fn run_dda_capture_thread(
                 timestamp_origin_qpc = None;
                 last_timestamp_90k = None;
                 let captured = CapturedSnapshot {
-                    slot,
+                    slot: CaptureFrameSlot::Shared(slot),
                     source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
@@ -4924,7 +5008,7 @@ unsafe fn run_dda_capture_thread(
             }
             reached_source_end = timestamp_90k >= source_stop_90k;
             let captured = CapturedSnapshot {
-                slot,
+                slot: CaptureFrameSlot::Shared(slot),
                 source_desc: snapshot_desc,
                 move_rect_bytes: frame_metadata.move_rect_bytes,
                 dirty_rects: frame_metadata.dirty_rects,
@@ -4968,7 +5052,7 @@ fn spawn_wgc_capture_thread(
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
-    free_rx: std::sync::mpsc::Receiver<SnapshotSlot>,
+    free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = unsafe {
@@ -5013,7 +5097,7 @@ unsafe fn run_wgc_capture_thread(
     pool_size: usize,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
-    free_rx: std::sync::mpsc::Receiver<SnapshotSlot>,
+    free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> Result<CaptureStats, String> {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5024,16 +5108,12 @@ unsafe fn run_wgc_capture_thread(
         GraphicsCaptureSession,
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-    use windows::Win32::Foundation::{HMODULE, RPC_E_CHANGED_MODE};
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-    };
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
-        D3D11_TEXTURE2D_DESC, D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D,
+        D3D11_TEXTURE2D_DESC, ID3D11Multithread, ID3D11Texture2D,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-    use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::Win32::System::WinRT::Direct3D11::{
         CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     };
@@ -5054,7 +5134,7 @@ unsafe fn run_wgc_capture_thread(
 
     struct WgcCaptureState {
         stats: CaptureStats,
-        free_slots: VecDeque<SnapshotSlot>,
+        free_slots: VecDeque<WgcLocalSlot>,
         source_desc: Option<D3D11_TEXTURE2D_DESC>,
         capture_index: u64,
         timestamp_origin_100ns: Option<i64>,
@@ -5135,28 +5215,13 @@ unsafe fn run_wgc_capture_thread(
         return Err("GraphicsCaptureSession::IsSupported 返回 false".to_owned());
     }
 
-    let adapter: IDXGIAdapter = adapter1
-        .cast()
-        .map_err(|err| win_err("IDXGIAdapter1::cast(WGC record)", err))?;
-    let mut device: Option<ID3D11Device> = None;
-    let mut feature_level = D3D_FEATURE_LEVEL(0);
-    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-    D3D11CreateDevice(
-        Some(&adapter),
-        D3D_DRIVER_TYPE_UNKNOWN,
-        HMODULE::default(),
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        Some(&levels),
-        D3D11_SDK_VERSION,
-        Some(&mut device),
-        Some(&mut feature_level),
-        None,
-    )
-    .map_err(|err| win_err("D3D11CreateDevice(WGC record)", err))?;
-    let device = device.ok_or_else(|| "D3D11CreateDevice(WGC record) 返回空 device".to_owned())?;
-    let context = device
-        .GetImmediateContext()
-        .map_err(|err| win_err("ID3D11Device::GetImmediateContext(WGC record)", err))?;
+    let device = encoder_device.clone();
+    let context = device.GetImmediateContext().map_err(|err| {
+        win_err(
+            "oneVPL native ID3D11Device::GetImmediateContext(WGC record)",
+            err,
+        )
+    })?;
     let wgc_multithread: Option<ID3D11Multithread> = context.cast().ok();
     if let Some(mt) = &wgc_multithread {
         let _ = mt.SetMultithreadProtected(true);
@@ -5265,7 +5330,7 @@ unsafe fn run_wgc_capture_thread(
     initial_state.source_desc = Some(initial_snapshot_desc);
     for id in 0..pool_size {
         initial_state.free_slots.push_back(
-            create_shared_snapshot_slot(id, &device, &encoder_device, &initial_snapshot_desc)
+            create_wgc_local_slot(id, &device, &initial_snapshot_desc)
                 .map_err(|err| err.to_string())?,
         );
     }
@@ -5441,14 +5506,11 @@ unsafe fn run_wgc_capture_thread(
         };
         let _guard = D3d11MultithreadGuard::enter(&wgc_multithread);
         let copy_started = std::time::Instant::now();
-        slot.capture_mutex
-            .AcquireSync(0, 1_000)
-            .map_err(|err| format!("IDXGIKeyedMutex::AcquireSync(WGC capture thread): {err}"))?;
         let (route_intermediate, route_converter) = &capture_route_path;
         route_converter
             .convert(&source)
             .and_then(|()| {
-                copy_texture_resource(&context, route_intermediate, &slot.capture_texture)
+                copy_texture_resource(&context, route_intermediate, &slot.texture)
             })
             .map_err(|err| {
                 format!(
@@ -5459,11 +5521,6 @@ unsafe fn run_wgc_capture_thread(
                     initial_snapshot_desc.Height
                 )
             })?;
-        let release_result = slot
-            .capture_mutex
-            .ReleaseSync(1)
-            .map_err(|err| format!("IDXGIKeyedMutex::ReleaseSync(WGC capture thread): {err}"));
-        release_result?;
         let copy_duration = copy_started.elapsed();
         state.stats.copied += 1;
         let callback_frame_duration = callback_frame_started.elapsed();
@@ -5490,7 +5547,7 @@ unsafe fn run_wgc_capture_thread(
                 }
             }
             let captured = CapturedSnapshot {
-                slot,
+                slot: CaptureFrameSlot::WgcLocal(slot),
                 source_desc: snapshot_desc,
                 move_rect_bytes: 0,
                 dirty_rects: Vec::new(),
@@ -5529,7 +5586,7 @@ unsafe fn run_wgc_capture_thread(
                 .observe_source_interval(capture_index, timestamp_90k.saturating_sub(previous));
         }
         let captured = CapturedSnapshot {
-            slot,
+            slot: CaptureFrameSlot::WgcLocal(slot),
             source_desc: snapshot_desc,
             move_rect_bytes: 0,
             dirty_rects: Vec::new(),
@@ -5548,7 +5605,10 @@ unsafe fn run_wgc_capture_thread(
         }
         Ok(())
     };
-    let return_slot = |slot: SnapshotSlot| -> Result<(), String> {
+    let return_slot = |slot: CaptureFrameSlot| -> Result<(), String> {
+        let CaptureFrameSlot::WgcLocal(slot) = slot else {
+            return Ok(());
+        };
         let mut state = callback_state
             .lock()
             .map_err(|_| "WGC callback state mutex poisoned while returning slot".to_owned())?;
@@ -5568,7 +5628,7 @@ unsafe fn run_wgc_capture_thread(
         if state
             .source_desc
             .as_ref()
-            .is_none_or(|desc| snapshot_slot_matches(&slot, desc))
+            .is_none_or(|desc| wgc_local_slot_matches(&slot, desc))
         {
             state.free_slots.push_back(slot);
         }
@@ -6072,18 +6132,30 @@ impl GpuCompletionFence {
 
 #[cfg(windows)]
 unsafe fn return_ready_snapshot_slots(
-    pending: &mut Vec<SnapshotSlot>,
+    pending: &mut Vec<CaptureFrameSlot>,
     context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    free_tx: &std::sync::mpsc::Sender<SnapshotSlot>,
+    free_tx: &std::sync::mpsc::Sender<CaptureFrameSlot>,
     wait_all: bool,
 ) -> Result<(), BackendError> {
     let mut index = 0usize;
     while index < pending.len() {
-        let ready = if wait_all {
-            pending[index].encoder_fence.wait_ready(context)?;
-            true
-        } else {
-            pending[index].encoder_fence.is_ready(context)?
+        let ready = match &pending[index] {
+            CaptureFrameSlot::Shared(slot) => {
+                if wait_all {
+                    slot.encoder_fence.wait_ready(context)?;
+                    true
+                } else {
+                    slot.encoder_fence.is_ready(context)?
+                }
+            }
+            CaptureFrameSlot::WgcLocal(slot) => {
+                if wait_all {
+                    slot.fence.wait_ready(context)?;
+                    true
+                } else {
+                    slot.fence.is_ready(context)?
+                }
+            }
         };
         if ready {
             let slot = pending.swap_remove(index);
