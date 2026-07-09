@@ -11,6 +11,7 @@ mod hotkey;
 mod indicator_overlay;
 mod rate_control;
 mod ring;
+mod single_instance;
 mod tray;
 
 use config::AppConfig;
@@ -25,6 +26,11 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     set_process_dpi_awareness();
+    let Some(single_instance) = single_instance::SingleInstance::acquire()
+        .map_err(|err| anyhow::anyhow!(err))?
+    else {
+        return Ok(());
+    };
 
     let start_to_tray = AppConfig::load_from_disk()
         .ok()
@@ -45,7 +51,7 @@ fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "RustReplay 即时回放",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::RustReplayApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::RustReplayApp::new(cc, single_instance)))),
     )
     .map_err(|err| anyhow::anyhow!(err.to_string()))
 }

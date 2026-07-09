@@ -6,6 +6,7 @@ use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey, ReplayBu
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::indicator_overlay::{IndicatorOverlayRuntime, NativeIndicatorImage};
 use crate::rate_control::{RateControlConfig, RateControlMethod};
+use crate::single_instance::SingleInstance;
 use crate::tray::{TrayEvent, TrayRuntime};
 use eframe::egui;
 use std::path::Path;
@@ -98,10 +99,11 @@ pub struct RustReplayApp {
     startup_auto_start_pending: bool,
     startup_hidden_to_tray: bool,
     allow_exit: bool,
+    single_instance: SingleInstance,
 }
 
 impl RustReplayApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, single_instance: SingleInstance) -> Self {
         let font_status = install_chinese_font(&cc.egui_ctx);
         let config_path = AppConfig::config_path();
         let (config, config_status) = match AppConfig::load_from_disk() {
@@ -153,6 +155,7 @@ impl RustReplayApp {
             startup_auto_start_pending,
             startup_hidden_to_tray,
             allow_exit: false,
+            single_instance,
         };
         if let Some(status) = indicator_status {
             this.loop_log.push(status);
@@ -348,6 +351,9 @@ impl RustReplayApp {
     }
 
     fn persist_config_if_changed(&mut self) {
+        if self.config_read_only() {
+            return;
+        }
         let current = self.config.stable_json();
         if current == self.last_saved_config_json {
             return;
@@ -436,6 +442,11 @@ impl RustReplayApp {
         if self.is_initializing() {
             self.loop_log
                 .push("等待初始化完成，暂不能停止回放。".to_owned());
+            return;
+        }
+        if !self.can_stop_replay() {
+            self.loop_log
+                .push("当前没有正在运行的后台录制，不能停止回放。".to_owned());
             return;
         }
         match self.controller.stop() {
@@ -548,6 +559,12 @@ impl RustReplayApp {
                 }
                 TrayEvent::Status(line) => self.loop_log.push(line),
             }
+        }
+    }
+
+    fn handle_single_instance_activation(&mut self, ctx: &egui::Context) {
+        if self.single_instance.take_activate_request() {
+            self.open_main_window(ctx);
         }
     }
 
@@ -716,6 +733,21 @@ impl RustReplayApp {
         !self.is_initializing() && self.controller.save_readiness().can_save()
     }
 
+    fn can_stop_replay(&self) -> bool {
+        !self.is_initializing()
+            && matches!(
+                self.controller.state(),
+                ReplayState::Running { .. } | ReplayState::Stopping { .. }
+            )
+    }
+
+    fn config_read_only(&self) -> bool {
+        matches!(
+            self.controller.state(),
+            ReplayState::Running { .. } | ReplayState::Stopping { .. }
+        )
+    }
+
     fn config_is_persisted(&self) -> bool {
         self.config.stable_json() == self.last_saved_config_json
     }
@@ -767,6 +799,7 @@ impl eframe::App for RustReplayApp {
         self.handle_save_hotkey_binding_input(ctx);
         self.handle_hotkey_events();
         self.handle_tray_events(ctx);
+        self.handle_single_instance_activation(ctx);
         self.update_indicator_runtime(ctx);
         if self.last_status_refresh.elapsed() > Duration::from_millis(500) {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -788,7 +821,11 @@ impl eframe::App for RustReplayApp {
             .exact_size(34.0)
             .show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("重置所有配置").clicked() {
+                    if ui
+                        .add_enabled(!self.config_read_only(), egui::Button::new("重置所有配置"))
+                        .on_disabled_hover_text("录制运行中，配置只读")
+                        .clicked()
+                    {
                         self.reset_all_config();
                     }
                 });
@@ -844,8 +881,8 @@ impl RustReplayApp {
                 self.click_save();
             }
             if ui
-                .add_enabled(!initializing, egui::Button::new(stop_label))
-                .on_disabled_hover_text("等待初始化")
+                .add_enabled(self.can_stop_replay(), egui::Button::new(stop_label))
+                .on_disabled_hover_text("当前没有正在运行的后台录制")
                 .clicked()
             {
                 self.click_stop();
@@ -858,8 +895,11 @@ impl RustReplayApp {
             {
                 self.start_probe();
             }
-            ui.checkbox(&mut self.config.start_recording_on_launch, "随启动开始");
-            ui.checkbox(&mut self.config.start_minimized_to_tray, "启动自动折叠");
+            let config_enabled = !self.config_read_only();
+            ui.add_enabled_ui(config_enabled, |ui| {
+                ui.checkbox(&mut self.config.start_recording_on_launch, "随启动开始");
+                ui.checkbox(&mut self.config.start_minimized_to_tray, "启动自动折叠");
+            });
             ui.separator();
             ui.label(self.status_text());
 
@@ -987,13 +1027,17 @@ impl RustReplayApp {
                     .id_salt("encoder_params_scroll")
                     .max_height(params_height)
                     .show(&mut cols[0], |ui| {
-                        self.left_encoder_panel(ui);
+                        ui.add_enabled_ui(!self.config_read_only(), |ui| {
+                            self.left_encoder_panel(ui);
+                        });
                     });
                 egui::ScrollArea::vertical()
                     .id_salt("loop_params_scroll")
                     .max_height(params_height)
                     .show(&mut cols[1], |ui| {
-                        self.right_loop_panel(ui);
+                        ui.add_enabled_ui(!self.config_read_only(), |ui| {
+                            self.right_loop_panel(ui);
+                        });
                     });
             });
         });
