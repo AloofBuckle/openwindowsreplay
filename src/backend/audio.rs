@@ -233,6 +233,68 @@ pub fn mix_to_stereo_48k(frames: &[PcmFrame]) -> Result<Option<StereoPcmFrame>, 
     }))
 }
 
+pub fn mix_window_samples_to_stereo_48k(
+    frames: &[PcmFrame],
+    window_start_100ns: i64,
+    output_samples: usize,
+) -> Result<StereoPcmFrame, BackendError> {
+    let mut mixed = vec![[0.0f32, 0.0f32]; output_samples];
+    if output_samples == 0 {
+        return Ok(StereoPcmFrame {
+            start_time_100ns: window_start_100ns,
+            samples: mixed,
+        });
+    }
+
+    let window_start_tick = time_100ns_to_sample_ticks(window_start_100ns);
+    let window_end_tick = window_start_tick.saturating_add(output_samples as u64);
+    for frame in frames {
+        frame.validate()?;
+        let converted = normalize_to_stereo_48k(frame)?;
+        if converted.samples.is_empty() {
+            continue;
+        }
+        let frame_start_tick = time_100ns_to_sample_ticks(converted.start_time_100ns);
+        let frame_end_tick = frame_start_tick.saturating_add(converted.samples.len() as u64);
+        let overlap_start_tick = frame_start_tick.max(window_start_tick);
+        let overlap_end_tick = frame_end_tick.min(window_end_tick);
+        if overlap_start_tick >= overlap_end_tick {
+            continue;
+        }
+        let src_offset = overlap_start_tick.saturating_sub(frame_start_tick) as usize;
+        let dst_offset = overlap_start_tick.saturating_sub(window_start_tick) as usize;
+        let copy_samples = overlap_end_tick.saturating_sub(overlap_start_tick) as usize;
+        for index in 0..copy_samples {
+            if let (Some(src), Some(dst)) = (
+                converted.samples.get(src_offset + index),
+                mixed.get_mut(dst_offset + index),
+            ) {
+                dst[0] += src[0];
+                dst[1] += src[1];
+            }
+        }
+    }
+
+    for [l, r] in &mut mixed {
+        *l = l.clamp(-1.0, 1.0);
+        *r = r.clamp(-1.0, 1.0);
+    }
+
+    Ok(StereoPcmFrame {
+        start_time_100ns: window_start_100ns,
+        samples: mixed,
+    })
+}
+
+pub fn mix_window_to_stereo_48k(
+    frames: &[PcmFrame],
+    window_start_100ns: i64,
+    window_duration_100ns: i64,
+) -> Result<StereoPcmFrame, BackendError> {
+    let output_samples = duration_100ns_to_samples_ceil(window_duration_100ns, TARGET_SAMPLE_RATE);
+    mix_window_samples_to_stereo_48k(frames, window_start_100ns, output_samples)
+}
+
 pub fn clip_and_rebase_to_window(
     frames: &[PcmFrame],
     window_start_100ns: i64,
@@ -441,5 +503,29 @@ mod tests {
         assert_eq!(clipped.start_time_100ns, 0);
         assert_eq!(clipped.frame_count(), 3);
         assert_eq!(clipped.samples, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn window_mixer_outputs_fixed_silence_without_pcm_padding_frame() {
+        let mixed = mix_window_samples_to_stereo_48k(&[], 2_000_000, 4).unwrap();
+        assert_eq!(mixed.start_time_100ns, 2_000_000);
+        assert_eq!(mixed.samples, vec![[0.0, 0.0]; 4]);
+    }
+
+    #[test]
+    fn window_mixer_clips_and_aligns_absolute_samples() {
+        let one_sample_100ns = samples_to_100ns(1, TARGET_SAMPLE_RATE);
+        let frame = PcmFrame {
+            source: AudioSourceKind::Loopback,
+            start_time_100ns: 1_000_000,
+            format: PcmFormat::target(),
+            samples: vec![0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4],
+        };
+        let mixed =
+            mix_window_samples_to_stereo_48k(&[frame], 1_000_000 + one_sample_100ns, 4).unwrap();
+        assert_eq!(mixed.samples[0], [0.2, 0.2]);
+        assert_eq!(mixed.samples[1], [0.3, 0.3]);
+        assert_eq!(mixed.samples[2], [0.4, 0.4]);
+        assert_eq!(mixed.samples[3], [0.0, 0.0]);
     }
 }

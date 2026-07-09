@@ -45,6 +45,9 @@ const MFX_FRAMETYPE_IDR: u16 = 0x0080;
 const MFX_EXTBUFF_CODING_OPTION2: u32 = make_fourcc(b'C', b'D', b'O', b'2');
 const MFX_EXTBUFF_CODING_OPTION3: u32 = make_fourcc(b'C', b'D', b'O', b'3');
 const MFX_EXTBUFF_VIDEO_SIGNAL_INFO: u32 = make_fourcc(b'V', b'S', b'I', b'N');
+const VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N: u32 = 60;
+const VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D: u32 = 1;
+const ENCODER_WARMUP_TIMESTAMP_STEP_90K: u64 = 1;
 
 const MFX_CODEC_HEVC: u32 = make_fourcc(b'H', b'E', b'V', b'C');
 const MFX_FOURCC_NV12: u32 = make_fourcc(b'N', b'V', b'1', b'2');
@@ -1551,15 +1554,15 @@ struct RecordAudioCapture {
     rx: std::sync::mpsc::Receiver<crate::backend::audio::PcmFrame>,
     frames: Vec<crate::backend::audio::PcmFrame>,
     live_encoder: Option<crate::backend::aac_mf::MfAacLcEncoder>,
+    live_blocker: crate::backend::audio::AacBlocker,
     live_submitted_until_ticks: u64,
     live_pushed_until_ticks: u64,
     live_failed: bool,
-    last_live_poll: std::time::Instant,
+    audio_end_abs_100ns: Option<i64>,
 }
 
 #[cfg(windows)]
 impl RecordAudioCapture {
-    const LIVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     const LIVE_SAFETY_100NS: i64 = 1_000_000; // 100ms，避免麦克风/loopback 较晚 packet 改写已推送 AAC。
 
     fn start(duration: std::time::Duration, notes: &mut Vec<String>) -> Option<Self> {
@@ -1600,15 +1603,22 @@ impl RecordAudioCapture {
             rx,
             frames: Vec::new(),
             live_encoder: None,
+            live_blocker: crate::backend::audio::AacBlocker::default(),
             live_submitted_until_ticks: 0,
             live_pushed_until_ticks: 0,
             live_failed: false,
-            last_live_poll: std::time::Instant::now(),
+            audio_end_abs_100ns: None,
         })
     }
 
     fn drain_incoming(&mut self) {
         while let Ok(frame) = self.rx.try_recv() {
+            let end = frame.end_time_100ns();
+            self.audio_end_abs_100ns = Some(
+                self.audio_end_abs_100ns
+                    .map(|current| current.max(end))
+                    .unwrap_or(end),
+            );
             self.frames.push(frame);
         }
     }
@@ -1624,10 +1634,6 @@ impl RecordAudioCapture {
         if encoded_sink.is_none() || self.live_failed {
             return;
         }
-        if self.last_live_poll.elapsed() < Self::LIVE_POLL_INTERVAL {
-            return;
-        }
-        self.last_live_poll = std::time::Instant::now();
         if let Err(err) = self.poll_live_aac_inner(
             first_video_timestamp_100ns,
             current_video_timestamp_90k,
@@ -1646,9 +1652,7 @@ impl RecordAudioCapture {
         current_video_timestamp_90k: Option<u64>,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     ) -> Result<(), BackendError> {
-        use crate::backend::audio::{
-            TARGET_CHANNELS, aac_blocks_from_stereo, clip_and_rebase_to_window, mix_to_stereo_48k,
-        };
+        use crate::backend::audio::{AAC_LC_FRAME_SAMPLES, mix_window_samples_to_stereo_48k};
 
         let Some(video_start_100ns) = first_video_timestamp_100ns else {
             return Ok(());
@@ -1656,12 +1660,7 @@ impl RecordAudioCapture {
         let Some(video_timestamp_90k) = current_video_timestamp_90k else {
             return Ok(());
         };
-        let Some(audio_end_abs_100ns) = self
-            .frames
-            .iter()
-            .map(crate::backend::audio::PcmFrame::end_time_100ns)
-            .max()
-        else {
+        let Some(audio_end_abs_100ns) = self.audio_end_abs_100ns else {
             return Ok(());
         };
         let audio_ready_100ns = audio_end_abs_100ns
@@ -1671,8 +1670,8 @@ impl RecordAudioCapture {
         let video_ready_100ns = video_90k_to_100ns(video_timestamp_90k).max(0);
         let ready_100ns = audio_ready_100ns.min(video_ready_100ns);
         let ready_ticks = audio_100ns_to_ticks(ready_100ns);
-        let encode_until_ticks = (ready_ticks / crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64)
-            * crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64;
+        let encode_until_ticks =
+            (ready_ticks / AAC_LC_FRAME_SAMPLES as u64) * AAC_LC_FRAME_SAMPLES as u64;
         if encode_until_ticks <= self.live_submitted_until_ticks {
             return Ok(());
         }
@@ -1684,31 +1683,13 @@ impl RecordAudioCapture {
         }
         let window_start_offset_100ns = audio_ticks_to_100ns(from_ticks);
         let window_start_abs_100ns = video_start_100ns.saturating_add(window_start_offset_100ns);
-        let mut clipped = clip_and_rebase_to_window(
+        let mut mixed = mix_window_samples_to_stereo_48k(
             &self.frames,
             window_start_abs_100ns,
-            audio_ticks_to_100ns(window_ticks),
+            window_ticks as usize,
         )?;
-        for frame in &mut clipped {
-            frame.start_time_100ns = frame
-                .start_time_100ns
-                .saturating_add(window_start_offset_100ns);
-        }
-        // 保证 mixer 的输出窗口覆盖到 encode_until_ticks；没有声音的区间仍应实时写静音 AAC，
-        // 这样 running save 不会因为系统声/麦克风短暂停顿而丢失音频时间线。
-        clipped.push(crate::backend::audio::PcmFrame {
-            source: crate::backend::audio::AudioSourceKind::Loopback,
-            start_time_100ns: window_start_offset_100ns,
-            format: crate::backend::audio::PcmFormat::target(),
-            samples: vec![0.0; window_ticks as usize * usize::from(TARGET_CHANNELS)],
-        });
-        let mixed = mix_to_stereo_48k(&clipped)?.unwrap_or_else(|| {
-            let mut silence =
-                crate::backend::audio::silence_stereo_48k(audio_ticks_to_100ns(window_ticks));
-            silence.start_time_100ns = window_start_offset_100ns;
-            silence
-        });
-        let blocks = aac_blocks_from_stereo(&mixed);
+        mixed.start_time_100ns = window_start_offset_100ns;
+        let blocks = self.live_blocker.push(&mixed);
         if self.live_encoder.is_none() {
             self.live_encoder = Some(crate::backend::aac_mf::MfAacLcEncoder::new()?);
         }
@@ -1732,7 +1713,7 @@ impl RecordAudioCapture {
             }
             submitted_until_ticks = block
                 .timestamp_ticks
-                .saturating_add(crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64);
+                .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
         }
         self.live_submitted_until_ticks = submitted_until_ticks;
         self.prune_live_pcm_frames(video_start_100ns);
@@ -1754,6 +1735,25 @@ impl RecordAudioCapture {
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
         notes: &mut Vec<String>,
     ) {
+        if let Some(encoder) = self.live_encoder.as_mut()
+            && let Some(block) = self.live_blocker.flush_padded()
+        {
+            match encoder.encode_block(&block) {
+                Ok(samples) => {
+                    for sample in samples {
+                        if let Some(sink) = encoded_sink.as_deref_mut() {
+                            sink.aac_access_unit(&sample);
+                        }
+                        self.live_pushed_until_ticks = self.live_pushed_until_ticks.max(
+                            sample
+                                .timestamp_ticks
+                                .saturating_add(u64::from(sample.duration_ticks)),
+                        );
+                    }
+                }
+                Err(err) => notes.push(format!("实时 AAC ring 尾块编码失败：{err}")),
+            }
+        }
         if let Some(encoder) = self.live_encoder.take() {
             match encoder.finish() {
                 Ok(samples) => {
@@ -1851,8 +1851,7 @@ fn build_record_aac_track(
     sink_push_from_ticks: u64,
 ) -> Result<Option<crate::backend::mp4_mux::AacLcMp4Track>, BackendError> {
     use crate::backend::audio::{
-        TARGET_CHANNELS, TARGET_SAMPLE_RATE, aac_blocks_from_stereo, clip_and_rebase_to_window,
-        mix_to_stereo_48k,
+        AacBlocker, TARGET_CHANNELS, TARGET_SAMPLE_RATE, mix_window_samples_to_stereo_48k,
     };
     use crate::backend::mp4_mux::AacLcMp4Track;
 
@@ -1862,26 +1861,49 @@ fn build_record_aac_track(
     };
     let audio_duration_ticks = video_90k_to_audio_ticks(video_duration_90k).max(1);
     let audio_duration_100ns = video_90k_to_100ns(video_duration_90k).max(1);
-    let mut clipped =
-        clip_and_rebase_to_window(&audio_frames, video_start_100ns, audio_duration_100ns)?;
-    let clipped_packets = clipped.len();
-    let clipped_pcm_frames = clipped
+    let audio_end_100ns = video_start_100ns.saturating_add(audio_duration_100ns);
+    let clipped_packets = audio_frames
         .iter()
+        .filter(|frame| {
+            frame.end_time_100ns() > video_start_100ns && frame.start_time_100ns < audio_end_100ns
+        })
+        .count();
+    let clipped_pcm_frames = audio_frames
+        .iter()
+        .filter(|frame| {
+            frame.end_time_100ns() > video_start_100ns && frame.start_time_100ns < audio_end_100ns
+        })
         .map(|frame| frame.frame_count())
         .sum::<usize>();
-    clipped.push(crate::backend::audio::PcmFrame {
-        source: crate::backend::audio::AudioSourceKind::Loopback,
-        start_time_100ns: 0,
-        format: crate::backend::audio::PcmFormat::target(),
-        samples: vec![0.0; audio_duration_ticks as usize * usize::from(TARGET_CHANNELS)],
-    });
-    let mixed = mix_to_stereo_48k(&clipped)?
-        .unwrap_or_else(|| crate::backend::audio::silence_stereo_48k(audio_duration_100ns));
-    let blocks = aac_blocks_from_stereo(&mixed);
     let mut encoder = crate::backend::aac_mf::MfAacLcEncoder::new()?;
+    let mut blocker = AacBlocker::default();
     let mut samples = Vec::new();
-    for block in &blocks {
-        for sample in encoder.encode_block(block)? {
+    let mut mixed_48k_frames = 0u64;
+    let mut aac_blocks = 0usize;
+    let mut cursor_ticks = 0u64;
+    const AAC_MIX_CHUNK_TICKS: u64 = TARGET_SAMPLE_RATE as u64;
+    while cursor_ticks < audio_duration_ticks {
+        let chunk_ticks = (audio_duration_ticks - cursor_ticks).min(AAC_MIX_CHUNK_TICKS);
+        let window_start_abs_100ns =
+            video_start_100ns.saturating_add(audio_ticks_to_100ns(cursor_ticks));
+        let mut mixed = mix_window_samples_to_stereo_48k(
+            &audio_frames,
+            window_start_abs_100ns,
+            chunk_ticks as usize,
+        )?;
+        mixed.start_time_100ns = audio_ticks_to_100ns(cursor_ticks);
+        mixed_48k_frames = mixed_48k_frames.saturating_add(mixed.samples.len() as u64);
+        for block in blocker.push(&mixed) {
+            aac_blocks += 1;
+            for sample in encoder.encode_block(&block)? {
+                push_record_aac_sample(&mut samples, sample, encoded_sink, sink_push_from_ticks);
+            }
+        }
+        cursor_ticks = cursor_ticks.saturating_add(chunk_ticks);
+    }
+    if let Some(block) = blocker.flush_padded() {
+        aac_blocks += 1;
+        for sample in encoder.encode_block(&block)? {
             push_record_aac_sample(&mut samples, sample, encoded_sink, sink_push_from_ticks);
         }
     }
@@ -1907,8 +1929,8 @@ fn build_record_aac_track(
         aac_padding_ticks,
         clipped_packets,
         clipped_pcm_frames,
-        mixed.samples.len(),
-        blocks.len()
+        mixed_48k_frames,
+        aac_blocks
     ));
     if sink_push_from_ticks > 0 {
         notes.push(format!(
@@ -1936,6 +1958,39 @@ fn push_record_aac_sample(
         sink.aac_access_unit(&sample);
     }
     samples.push(sample);
+}
+
+#[cfg(windows)]
+fn encoder_frame_rate_hint_from_output(
+    output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+) -> (u32, u32, String) {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    use windows::core::PCWSTR;
+
+    let mut devmode = DEVMODEW::default();
+    devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(output_desc.DeviceName.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut devmode,
+        )
+        .as_bool()
+    };
+    if ok && devmode.dmDisplayFrequency > 0 {
+        let hz = devmode.dmDisplayFrequency as u32;
+        (
+            hz,
+            1,
+            format!("EnumDisplaySettingsW current dmDisplayFrequency={}Hz", hz),
+        )
+    } else {
+        (
+            VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N,
+            VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D,
+            "EnumDisplaySettingsW 未返回有效刷新率，使用 oneVPL 码控提示 fallback 60/1".to_owned(),
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -2045,6 +2100,12 @@ fn record_d3d11_onecopy_mp4_impl(
             .max(1) as u16;
         let aligned_width = align16(capture_width);
         let aligned_height = align16(capture_height);
+        let (encoder_frame_rate_n, encoder_frame_rate_d, encoder_frame_rate_note) =
+            encoder_frame_rate_hint_from_output(&output_desc);
+        notes.push(format!(
+            "oneVPL FrameRateExt 仅作为编码器码控/HRD 提示：{}/{}；来源={}；正式 MP4 时间戳保持 DDA/WGC 源 VFR 节奏",
+            encoder_frame_rate_n, encoder_frame_rate_d, encoder_frame_rate_note
+        ));
         // 自动同步路线集中在录制后端内部：前端只表达目标色度采样；
         // 能力探测阶段已经把当前显示器状态解析为 RoutePlan。启动时只做
         // 轻量一致性校验，避免重复完整 route 现场探测。
@@ -2192,8 +2253,8 @@ fn record_d3d11_onecopy_mp4_impl(
             query_param.mfx.FrameInfo.Height = aligned_height;
             query_param.mfx.FrameInfo.CropW = capture_width;
             query_param.mfx.FrameInfo.CropH = capture_height;
-            query_param.mfx.FrameInfo.FrameRateExtN = 144;
-            query_param.mfx.FrameInfo.FrameRateExtD = 1;
+            query_param.mfx.FrameInfo.FrameRateExtN = encoder_frame_rate_n;
+            query_param.mfx.FrameInfo.FrameRateExtD = encoder_frame_rate_d;
             query_param.mfx.GopPicSize = record_gop_pic_size;
             query_param.mfx.GopRefDist = record_gop_ref_dist;
             query_param.mfx.IdrInterval = record_idr_interval;
@@ -2296,8 +2357,8 @@ fn record_d3d11_onecopy_mp4_impl(
         let mut ext_buffers = VplEncodeExtBuffers::for_route(record_route, rate_control);
         ext_buffers.attach(&mut param);
         param.AsyncDepth = record_async_depth;
-        param.mfx.FrameInfo.FrameRateExtN = 144;
-        param.mfx.FrameInfo.FrameRateExtD = 1;
+        param.mfx.FrameInfo.FrameRateExtN = encoder_frame_rate_n;
+        param.mfx.FrameInfo.FrameRateExtD = encoder_frame_rate_d;
         param.mfx.FrameInfo.Width = aligned_width;
         param.mfx.FrameInfo.Height = aligned_height;
         param.mfx.FrameInfo.CropW = capture_width;
@@ -2541,19 +2602,10 @@ fn record_d3d11_onecopy_mp4_impl(
         let capture_duration = Duration::from_secs_f32(duration_seconds.max(0.1));
         let requested_duration_90k =
             (duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64;
-        let nominal_frame_duration_90k = VIDEO_CLOCK_HZ / 144;
-        let source_stop_90k = match capture_source {
-            // DDA only exposes accumulated frame counts and QPC present time, and
-            // the muxer extends the final sample to the requested duration. Keep
-            // the existing "last source frame before end" stop rule for DDA.
-            RecordCaptureSource::Dda => {
-                requested_duration_90k.saturating_sub(nominal_frame_duration_90k)
-            }
-            // WGC is intentionally VFR: stop based on the WGC source timeline
-            // itself, not on an external 144 Hz/CFR tick that would hide or
-            // synthesize source-timestamp gaps.
-            RecordCaptureSource::Wgc => requested_duration_90k,
-        };
+        // DDA/WGC are intentionally VFR: stop from the accepted source
+        // timeline itself, without subtracting or synthesizing a nominal FPS
+        // frame duration.
+        let source_stop_90k = requested_duration_90k;
         let start = Instant::now();
         let end_at = start + capture_duration;
         let qpc_frequency = query_performance_frequency().unwrap_or(0);
@@ -2898,7 +2950,7 @@ fn record_d3d11_onecopy_mp4_impl(
 
                             if warmup {
                                 let warmup_ts90 = u64::from(warmup_encoded_frames)
-                                    .saturating_mul(nominal_frame_duration_90k);
+                                    .saturating_mul(ENCODER_WARMUP_TIMESTAMP_STEP_90K);
                                 warmup_encoded_frames = warmup_encoded_frames.saturating_add(1);
                                 (*surface).Data.TimeStamp = warmup_ts90;
                                 (*surface).Data.FrameOrder = warmup_encoded_frames;
@@ -3321,7 +3373,7 @@ fn record_d3d11_onecopy_mp4_impl(
         }
         if capture_source.is_wgc() {
             notes.push(
-                "WGC timestamp policy: MP4 sample timestamps are WGC SystemRelativeTime relative to the first accepted source frame; source-to-source gaps are preserved as VFR sample-duration gaps, and no external 144Hz/CFR clock is used to synthesize missing timestamps"
+                "WGC timestamp policy: MP4 sample timestamps are WGC SystemRelativeTime relative to the first accepted source frame; source-to-source gaps are preserved as VFR sample-duration gaps, and no external CFR clock is used to synthesize missing timestamps"
                     .to_owned(),
             );
         }
@@ -4638,14 +4690,12 @@ unsafe fn run_dda_capture_thread(
     let mut encoder_warmup_pending = false;
     let mut encoder_warmup_done = false;
     let dda_pipeline_warmup_frames = 4u32;
-    // DDA can report a burst of accumulated frames immediately after the
-    // encoder/copy workload starts. Require about 0.2s of stable 144Hz source
-    // intervals before anchoring the official timeline so short recordings do
-    // not begin on a startup burst.
-    let dda_pipeline_warmup_stable_intervals_required = 30u32;
+    // Keep only a short frame-count warmup after encoder warmup. The official
+    // timeline starts from DDA LastPresentTime and does not require a fixed
+    // refresh-rate interval to become "stable".
+    let dda_pipeline_warmup_stable_intervals_required = 0u32;
     let mut dda_pipeline_warmup_remaining = 0u32;
-    let mut dda_pipeline_warmup_stable_intervals = 0u32;
-    let mut dda_pipeline_warmup_last_present_qpc: Option<i64> = None;
+    let dda_pipeline_warmup_stable_intervals = 0u32;
     let max_end_at = end_at + std::time::Duration::from_secs(3);
 
     while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < max_end_at {
@@ -4654,8 +4704,6 @@ unsafe fn run_dda_capture_thread(
                 encoder_warmup_pending = false;
                 encoder_warmup_done = true;
                 dda_pipeline_warmup_remaining = dda_pipeline_warmup_frames;
-                dda_pipeline_warmup_stable_intervals = 0;
-                dda_pipeline_warmup_last_present_qpc = None;
                 timestamp_origin_qpc = None;
                 last_timestamp_90k = None;
                 last_accepted_present_qpc = None;
@@ -4835,28 +4883,6 @@ unsafe fn run_dda_capture_thread(
                 || dda_pipeline_warmup_stable_intervals
                     < dda_pipeline_warmup_stable_intervals_required;
             if pipeline_warmup_frame {
-                if let Some(previous) = dda_pipeline_warmup_last_present_qpc
-                    && frame_info.LastPresentTime > 0
-                    && qpc_frequency > 0
-                {
-                    let delta_90k = qpc_delta_to_90k(
-                        frame_info.LastPresentTime.saturating_sub(previous),
-                        qpc_frequency,
-                    );
-                    let above_threshold = (7.5f64 * VIDEO_CLOCK_HZ as f64 / 1000.0).round() as u64;
-                    let below_threshold = (6.5f64 * VIDEO_CLOCK_HZ as f64 / 1000.0).round() as u64;
-                    if (below_threshold..=above_threshold).contains(&delta_90k) {
-                        dda_pipeline_warmup_stable_intervals =
-                            dda_pipeline_warmup_stable_intervals.saturating_add(1);
-                    } else {
-                        dda_pipeline_warmup_stable_intervals = 0;
-                    }
-                }
-                dda_pipeline_warmup_last_present_qpc = if frame_info.LastPresentTime > 0 {
-                    Some(frame_info.LastPresentTime)
-                } else {
-                    None
-                };
                 dda_pipeline_warmup_remaining = dda_pipeline_warmup_remaining.saturating_sub(1);
                 stats.dropped_warmup += 1;
                 timestamp_origin_qpc = None;
@@ -4889,24 +4915,8 @@ unsafe fn run_dda_capture_thread(
                 &mut last_timestamp_90k,
             );
             if let Some(previous) = previous_timestamp_90k {
-                let accumulated_step_90k = u64::from(frame_info.AccumulatedFrames.max(1))
-                    .saturating_mul(VIDEO_CLOCK_HZ / 144);
-                let minimum_timestamp_90k = previous.saturating_add(accumulated_step_90k);
-                let single_frame_jitter_ceiling_90k =
-                    (8.5f64 * VIDEO_CLOCK_HZ as f64 / 1000.0).round() as u64;
-                let source_delta_90k = timestamp_90k.saturating_sub(previous);
-                if frame_info.AccumulatedFrames <= 1
-                    && source_delta_90k <= single_frame_jitter_ceiling_90k
-                {
-                    // DDA LastPresentTime has sub-refresh jitter even when
-                    // AccumulatedFrames says this is a single desktop update.
-                    // Snap those single-frame updates to the source-reported
-                    // accumulated cadence; keep multi-frame accumulated jumps
-                    // visible as longer intervals.
-                    timestamp_90k = minimum_timestamp_90k;
-                    last_timestamp_90k = Some(timestamp_90k);
-                } else if timestamp_90k < minimum_timestamp_90k {
-                    timestamp_90k = minimum_timestamp_90k;
+                if timestamp_90k <= previous {
+                    timestamp_90k = previous.saturating_add(1);
                     last_timestamp_90k = Some(timestamp_90k);
                 }
                 stats
@@ -5111,9 +5121,7 @@ unsafe fn run_wgc_capture_thread(
         format!("{label}: {err}")
     }
 
-    const WGC_WARMUP_MIN_DELTA_100NS: i64 = 60_000;
-    const WGC_WARMUP_MAX_DELTA_100NS: i64 = 80_000;
-    const WGC_WARMUP_STABLE_INTERVALS: u32 = 72;
+    const WGC_WARMUP_STABLE_INTERVALS: u32 = 0;
 
     let capture_duration = end_at.saturating_duration_since(start);
     let ro_guard = match RoInitialize(RO_INIT_MULTITHREADED) {
@@ -5367,13 +5375,8 @@ unsafe fn run_wgc_capture_thread(
             }
         }
         if !drop_warmup_frame && !encoder_warmup_frame && !state.warmup_done {
-            if let Some(previous) = state.warmup_last_timestamp_100ns {
-                let delta = timestamp_100ns.saturating_sub(previous);
-                if (WGC_WARMUP_MIN_DELTA_100NS..=WGC_WARMUP_MAX_DELTA_100NS).contains(&delta) {
-                    state.warmup_stable_intervals = state.warmup_stable_intervals.saturating_add(1);
-                } else {
-                    state.warmup_stable_intervals = 0;
-                }
+            if state.warmup_last_timestamp_100ns.is_some() {
+                state.warmup_stable_intervals = state.warmup_stable_intervals.saturating_add(1);
             }
             state.warmup_last_timestamp_100ns = Some(timestamp_100ns);
             state.stats.dropped_warmup += 1;
@@ -5470,14 +5473,9 @@ unsafe fn run_wgc_capture_thread(
 
         if encoder_warmup_frame || pipeline_warmup_frame {
             if pipeline_warmup_frame {
-                if let Some(previous) = state.last_timestamp_100ns {
-                    let delta = timestamp_100ns.saturating_sub(previous);
-                    if (WGC_WARMUP_MIN_DELTA_100NS..=WGC_WARMUP_MAX_DELTA_100NS).contains(&delta) {
-                        state.pipeline_warmup_stable_intervals =
-                            state.pipeline_warmup_stable_intervals.saturating_add(1);
-                    } else {
-                        state.pipeline_warmup_stable_intervals = 0;
-                    }
+                if state.last_timestamp_100ns.is_some() {
+                    state.pipeline_warmup_stable_intervals =
+                        state.pipeline_warmup_stable_intervals.saturating_add(1);
                 }
                 state.pipeline_warmup_remaining = state.pipeline_warmup_remaining.saturating_sub(1);
                 state.last_timestamp_100ns = Some(timestamp_100ns);
@@ -8993,7 +8991,8 @@ impl RecordThreadPriorityGuard {
         match SetThreadPriority(handle, THREAD_PRIORITY_HIGHEST) {
             Ok(()) => {
                 notes.push(
-                    "录制线程临时提升到 THREAD_PRIORITY_HIGHEST 以降低 144Hz DDA 抖动".to_owned(),
+                    "录制线程临时提升到 THREAD_PRIORITY_HIGHEST 以降低 DDA 高刷新采集抖动"
+                        .to_owned(),
                 );
                 Some(Self { handle, previous })
             }
@@ -9069,11 +9068,7 @@ fn dda_relative_timestamp_90k(
         let origin = *origin_qpc.get_or_insert(last_present_time_qpc);
         qpc_delta_to_90k(last_present_time_qpc.saturating_sub(origin), qpc_frequency)
     } else {
-        last_timestamp_90k
-            .map(|last| last.saturating_add(VIDEO_CLOCK_HZ / 144))
-            .unwrap_or_else(|| {
-                duration_to_90k(std::time::Instant::now().saturating_duration_since(fallback_start))
-            })
+        duration_to_90k(std::time::Instant::now().saturating_duration_since(fallback_start))
     };
     if let Some(last) = *last_timestamp_90k
         && timestamp <= last
@@ -9139,7 +9134,7 @@ fn wgc_relative_timestamp_90k(
     // WGC is intentionally VFR.  This conversion is the only timestamp
     // transform for accepted WGC frames: SystemRelativeTime is made relative to
     // the first accepted WGC source frame and scaled to the 90 kHz MP4/video
-    // timebase.  Do not add an external 144 Hz/CFR clock here; source gaps must
+    // timebase.  Do not add an external CFR clock here; source gaps must
     // remain visible as longer sample durations.
     let origin = *origin_100ns.get_or_insert(timestamp_100ns);
     let delta_100ns = timestamp_100ns.saturating_sub(origin).max(0) as i128;
@@ -9349,14 +9344,14 @@ unsafe fn smoke_rate_control_surface_available(
         route.bit_depth,
         route.profile,
     );
-    // 用生产目标的 4K/144 + WGC async_depth=2 参数做 Query/Init smoke，避免某个
+    // 用生产目标的 4K 桌面尺寸 + WGC async_depth=2 参数做 Query/Init smoke，避免某个
     // 码控字段在默认低分辨率 Query/Init 通过、实际桌面录制却拿不到 surface。
     param.mfx.FrameInfo.Width = 3840;
     param.mfx.FrameInfo.Height = 2160;
     param.mfx.FrameInfo.CropW = 3840;
     param.mfx.FrameInfo.CropH = 2160;
-    param.mfx.FrameInfo.FrameRateExtN = 144;
-    param.mfx.FrameInfo.FrameRateExtD = 1;
+    param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
+    param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
     param.mfx.GopRefDist = 1;
     param.mfx.LowPower = MFX_CODINGOPTION_ON;
     param.mfx.TargetUsage = 7;
@@ -9382,8 +9377,8 @@ unsafe fn smoke_rate_control_surface_available(
     param.mfx.FrameInfo.Height = 2160;
     param.mfx.FrameInfo.CropW = 3840;
     param.mfx.FrameInfo.CropH = 2160;
-    param.mfx.FrameInfo.FrameRateExtN = 144;
-    param.mfx.FrameInfo.FrameRateExtD = 1;
+    param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
+    param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
     param.mfx.GopPicSize = 60;
     param.mfx.GopRefDist = 1;
     param.mfx.IdrInterval = 1;
@@ -9859,8 +9854,8 @@ fn make_query_param(
     param.mfx.FrameInfo.Height = 1088;
     param.mfx.FrameInfo.CropW = 1920;
     param.mfx.FrameInfo.CropH = 1080;
-    param.mfx.FrameInfo.FrameRateExtN = 60;
-    param.mfx.FrameInfo.FrameRateExtD = 1;
+    param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
+    param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
     param.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
     param.mfx.FrameInfo.ChromaFormat = chroma;
     param.mfx.FrameInfo.BitDepthLuma = bit_depth;
