@@ -214,7 +214,7 @@ impl ReplayController {
         let buffer_mode = config.replay_buffer_mode;
         let cache_dir = if buffer_mode.is_disk() {
             let cache_dir = PathBuf::from(&config.cache_dir);
-            fs::create_dir_all(&cache_dir).map_err(|err| BackendError::Io(err.to_string()))?;
+            DiskReplayStore::prepare_directory(&cache_dir)?;
             Some(cache_dir)
         } else {
             None
@@ -313,11 +313,13 @@ impl ReplayController {
                 // and NVENC can continue pushing access units while a replay is being saved.
                 let snapshot = packet_snapshot.into_tracks();
                 if snapshot.audio_track.is_some() {
-                    super::mp4_mux::write_hevc_aac_mp4(
-                        &dst,
-                        &snapshot.video_track,
-                        snapshot.audio_track.as_ref(),
-                    )?;
+                    write_replay_output_atomically(&dst, |path| {
+                        super::mp4_mux::write_hevc_aac_mp4(
+                            path,
+                            &snapshot.video_track,
+                            snapshot.audio_track.as_ref(),
+                        )
+                    })?;
                     self.memory_save_after_ns = Some(save_after_ns);
                     return Ok(());
                 }
@@ -342,11 +344,13 @@ impl ReplayController {
                 .snapshot_recent_tracks_after(replay_duration, self.disk_save_after_segment)?;
             if let Some((snapshot, last_segment)) = snapshot_with_cursor {
                 if snapshot.audio_track.is_some() {
-                    super::mp4_mux::write_prepared_hevc_aac_mp4(
-                        &dst,
-                        &snapshot.video_track,
-                        snapshot.audio_track.as_ref(),
-                    )?;
+                    write_replay_output_atomically(&dst, |path| {
+                        super::mp4_mux::write_prepared_hevc_aac_mp4(
+                            path,
+                            &snapshot.video_track,
+                            snapshot.audio_track.as_ref(),
+                        )
+                    })?;
                     self.disk_save_after_segment = Some(last_segment);
                     return Ok(());
                 }
@@ -379,9 +383,25 @@ impl ReplayController {
                 "后台录制尚未产生可保存的已编码 HEVC/AAC access unit",
             ));
         };
-        super::mp4_mux::write_hevc_aac_mp4(&dst, &clip.video_track, clip.audio_track.as_ref())?;
+        write_replay_output_atomically(&dst, |path| {
+            super::mp4_mux::write_hevc_aac_mp4(path, &clip.video_track, clip.audio_track.as_ref())
+        })?;
         Ok(())
     }
+}
+
+fn write_replay_output_atomically(
+    dst: &Path,
+    write: impl FnOnce(&Path) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    let part = dst.with_extension("mp4.part");
+    let _ = fs::remove_file(&part);
+    let result = write(&part)
+        .and_then(|()| fs::rename(&part, dst).map_err(|err| BackendError::Io(err.to_string())));
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result
 }
 
 pub(super) fn validate_config(

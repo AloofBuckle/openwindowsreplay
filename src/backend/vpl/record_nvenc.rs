@@ -172,8 +172,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             RecordCaptureSource::Dda => RecordThreadPriorityGuard::raise(&mut notes),
             RecordCaptureSource::Wgc => {
                 notes.push(
-                    "WGC/NVENC 录制主线程/FrameArrived 回调/捕获线程固定保持普通 CPU 优先级"
-                        .to_owned(),
+                    "WGC/NVENC 录制主线程/持久 MTA 捕获服务固定保持普通 CPU 优先级".to_owned(),
                 );
                 None
             }
@@ -358,6 +357,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         }
 
         let mut samples = Vec::new();
+        let mut encoded_stats = RecordHevcStats::default();
         let retain_output_samples = write_output_mp4 || encoded_sink.is_none();
         let mut captured_frames = 0u32;
         let mut warmup_encoded_frames = 0u32;
@@ -440,6 +440,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                     free_rx,
                 ),
             };
+            let mut capture_thread = CaptureThreadGuard::new(stop.clone(), capture_handle);
             sink_status(
                 &mut encoded_sink,
                 format!(
@@ -546,14 +547,16 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             full_convert_frames = full_convert_frames.saturating_add(1);
 
                             let fence_started = Instant::now();
+                            let mut keyed_mutex_guard = None;
                             let direct_input = match &slot {
                                 CaptureFrameSlot::Shared(shared) => {
-                                    shared.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
-                                        BackendError::WindowsApi {
-                                            func: "IDXGIKeyedMutex::AcquireSync(NVENC DDA snapshot)",
-                                            message: err.to_string(),
-                                        }
-                                    })?;
+                                    keyed_mutex_guard = Some(KeyedMutexGuard::acquire(
+                                        &shared.encoder_mutex,
+                                        1,
+                                        0,
+                                        1_000,
+                                        "IDXGIKeyedMutex::AcquireSync(NVENC DDA snapshot)",
+                                    )?);
                                     let target = dda_target_texture.as_ref().ok_or_else(|| {
                                         BackendError::unsupported(
                                             "NVENC DDA compatibility copy",
@@ -568,10 +571,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                         target,
                                     );
                                     perf.copy.add(copy_started.elapsed());
-                                    if let Err(err) = copy_result {
-                                        let _ = shared.encoder_mutex.ReleaseSync(0);
-                                        return Err(err);
-                                    }
+                                    copy_result?;
                                     target.clone()
                                 }
                                 CaptureFrameSlot::WgcLocal(local) => {
@@ -615,16 +615,14 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             perf.submit.add(submit_started.elapsed());
 
                             let release_result = match &slot {
-                                CaptureFrameSlot::Shared(shared) => shared
-                                    .encoder_mutex
-                                    .ReleaseSync(0)
-                                    .map_err(|err| BackendError::WindowsApi {
-                                        func: "IDXGIKeyedMutex::ReleaseSync(NVENC DDA snapshot)",
-                                        message: err.to_string(),
-                                    }),
+                                CaptureFrameSlot::Shared(_) => keyed_mutex_guard
+                                    .take()
+                                    .expect("shared snapshot owns keyed mutex guard")
+                                    .release("IDXGIKeyedMutex::ReleaseSync(NVENC DDA snapshot)"),
                                 CaptureFrameSlot::WgcLocal(_) => Ok(()),
                             };
                             release_result?;
+                            drop(keyed_mutex_guard);
                             let sample = encode_result?;
                             let _ = free_tx.send(slot);
 
@@ -633,6 +631,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                 sample,
                                 &mut encoded_sink,
                                 retain_output_samples,
+                                &mut encoded_stats,
                             );
                             if warmup {
                                 perf.frame.add(frame_started.elapsed());
@@ -653,7 +652,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                         })();
                         if let Err(err) = frame_result {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = capture_handle.join();
+                            capture_thread.stop_and_join();
                             return Err(err);
                         }
                     }
@@ -669,7 +668,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             }
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = capture_handle.join();
+            capture_thread.stop_and_join();
             if let Some(message) = capture_error {
                 return Err(BackendError::unsupported(
                     format!("{} capture thread", capture_source.label()),
@@ -714,23 +713,13 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
 
         let duration_90k = encoded_timeline_duration_90k(
             &samples,
+            encoded_stats.last_timestamp_90k,
             requested_duration_90k,
             !capture_source.is_wgc(),
         );
-        let encoded_samples = samples
-            .iter()
-            .filter(|sample| !sample.discard_from_track)
-            .count()
-            .min(u32::MAX as usize) as u32;
-        let encoded_bytes = samples
-            .iter()
-            .filter(|sample| !sample.discard_from_track)
-            .map(|s| s.data.len() as u64)
-            .sum();
-        let discarded_header_units = samples
-            .iter()
-            .filter(|sample| sample.discard_from_track)
-            .count();
+        let encoded_samples = encoded_stats.encoded_samples;
+        let encoded_bytes = encoded_stats.encoded_bytes;
+        let discarded_header_units = encoded_stats.discarded_header_units;
         if encoded_samples == 0 {
             return Err(BackendError::unsupported(
                 "NVENC encode",

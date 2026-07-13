@@ -188,6 +188,13 @@ pub(super) unsafe fn run_dda_capture_thread(
             });
             if source_changed {
                 let first_source = source_desc0.is_none();
+                if !route.accepts_unconverted_capture_format(source_desc.Format) {
+                    return Err(format!(
+                        "DDA DuplicateOutput1 returned DXGI_FORMAT({}) for {}; the route requires FP16 source data and refuses an 8-bit HDR downgrade",
+                        source_desc.Format.0,
+                        route.summary()
+                    ));
+                }
                 source_desc0 = Some(source_desc);
                 let snapshot_desc = D3D11_TEXTURE2D_DESC {
                     Width: target_width.max(1),
@@ -253,9 +260,14 @@ pub(super) unsafe fn run_dda_capture_thread(
                 let _guard = D3d11MultithreadGuard::enter(&d3d_multithread);
                 match &slot {
                     CaptureFrameSlot::Shared(shared) => {
-                        shared.capture_mutex.AcquireSync(0, 1_000).map_err(|err| {
-                            format!("IDXGIKeyedMutex::AcquireSync(capture): {err}")
-                        })?;
+                        let mutex_guard = KeyedMutexGuard::acquire(
+                            &shared.capture_mutex,
+                            0,
+                            1,
+                            1_000,
+                            "IDXGIKeyedMutex::AcquireSync(capture)",
+                        )
+                        .map_err(|err| err.to_string())?;
                         let convert_result = (|| -> Result<(), BackendError> {
                             let intermediate = route_intermediate.as_ref().ok_or_else(|| {
                                 BackendError::unsupported(
@@ -274,11 +286,9 @@ pub(super) unsafe fn run_dda_capture_thread(
                             converter.convert(&source)?;
                             copy_texture_resource(&context, intermediate, &shared.capture_texture)
                         })();
-                        let release_result = shared
-                            .capture_mutex
-                            .ReleaseSync(1)
-                            .map_err(|err| format!("IDXGIKeyedMutex::ReleaseSync(capture): {err}"));
-                        release_result?;
+                        mutex_guard
+                            .release("IDXGIKeyedMutex::ReleaseSync(capture)")
+                            .map_err(|err| err.to_string())?;
                         convert_result.map_err(|err| err.to_string())?;
                     }
                     CaptureFrameSlot::WgcLocal(_) => {

@@ -1,9 +1,11 @@
 use super::*;
 
 pub(super) struct DiskSegmentSink {
-    pub(super) writer_tx: Sender<DiskSegmentWriteJob>,
+    pub(super) writer_tx: SyncSender<DiskSegmentWriteJob>,
     pub(super) tx: Sender<ReplayEvent>,
     pub(super) run_index: u64,
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) failed: bool,
     pub(super) metadata: Option<EncodedReplayMetadata>,
     pub(super) header_units: Vec<HevcAccessUnit>,
     pub(super) current: Option<DiskSegmentBuilder>,
@@ -14,10 +16,11 @@ pub(super) struct DiskSegmentSink {
 
 impl DiskSegmentSink {
     pub(super) fn new(
-        writer_tx: Sender<DiskSegmentWriteJob>,
+        writer_tx: SyncSender<DiskSegmentWriteJob>,
         tx: Sender<ReplayEvent>,
         run_index: u64,
         replay_duration: Duration,
+        stop: Arc<AtomicBool>,
     ) -> Self {
         let target_seconds = DISK_SEGMENT_TARGET_SECONDS
             .min((replay_duration.as_secs_f32() / 2.0).max(1.0))
@@ -26,6 +29,8 @@ impl DiskSegmentSink {
             writer_tx,
             tx,
             run_index,
+            stop,
+            failed: false,
             metadata: None,
             header_units: Vec::new(),
             current: None,
@@ -36,6 +41,9 @@ impl DiskSegmentSink {
     }
 
     pub(super) fn finish_success(&mut self, recorded: &super::vpl::VplOneCopyRecordOutput) {
+        if self.failed {
+            return;
+        }
         if let Some(mut current) = self.current.take() {
             current.end_90k = Some(recorded.video_track.duration_90k);
             self.pending.push_back(current);
@@ -69,6 +77,9 @@ impl DiskSegmentSink {
     }
 
     pub(super) fn hevc_access_unit(&mut self, sample: &HevcAccessUnit) {
+        if self.failed {
+            return;
+        }
         self.remember_parameter_sets(sample);
         if sample.discard_from_track {
             return;
@@ -77,6 +88,9 @@ impl DiskSegmentSink {
             return;
         };
         if self.current.is_none() {
+            if !sample.is_sync {
+                return;
+            }
             self.current = Some(DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
@@ -98,6 +112,13 @@ impl DiskSegmentSink {
                 current.end_90k = Some(sample.timestamp_90k);
                 self.pending.push_back(current);
             }
+            if self.pending.len() > DISK_PENDING_SEGMENT_LIMIT {
+                self.fail(format!(
+                    "磁盘循环音频未能推进，待完成分段超过上限 {}",
+                    DISK_PENDING_SEGMENT_LIMIT
+                ));
+                return;
+            }
             self.current = Some(DiskSegmentBuilder::new(
                 metadata,
                 sample.timestamp_90k,
@@ -115,6 +136,9 @@ impl DiskSegmentSink {
     }
 
     pub(super) fn aac_access_unit(&mut self, sample: &AacAccessUnit) {
+        if self.failed {
+            return;
+        }
         self.latest_audio_ticks = self.latest_audio_ticks.max(
             sample
                 .timestamp_ticks
@@ -179,17 +203,30 @@ impl DiskSegmentSink {
         let Some(segment) = segment.into_tracks(&self.header_units) else {
             return;
         };
-        if self
-            .writer_tx
-            .send(DiskSegmentWriteJob {
-                run_index: self.run_index,
-                segment,
-                enqueued_at: Instant::now(),
-            })
-            .is_err()
-        {
-            self.send_status("磁盘循环分段写入失败：异步 writer 已停止");
+        let job = DiskSegmentWriteJob {
+            run_index: self.run_index,
+            segment,
+            enqueued_at: Instant::now(),
+        };
+        match self.writer_tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.fail(format!(
+                "磁盘循环写入队列已满（容量 {}），磁盘速度低于编码分段产生速度",
+                DISK_WRITER_QUEUE_CAPACITY
+            )),
+            Err(TrySendError::Disconnected(_)) => {
+                self.fail("磁盘循环异步 writer 已停止".to_owned())
+            }
         }
+    }
+
+    pub(super) fn fail(&mut self, message: String) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.tx.send(ReplayEvent::Error(message));
     }
 
     pub(super) fn send_status(&mut self, message: &str) {
@@ -265,6 +302,13 @@ impl DiskSegmentBuilder {
         if !self.has_video() {
             return None;
         }
+        if !self
+            .video_samples
+            .first()
+            .is_some_and(|sample| sample.is_sync)
+        {
+            return None;
+        }
         let mut samples = header_units
             .iter()
             .map(|sample| {
@@ -322,30 +366,42 @@ pub(super) struct DiskSegmentTracks {
 pub(super) struct DiskSegmentIndexedTracks {
     pub(super) mp4_path: PathBuf,
     pub(super) index: HevcAacMp4Index,
+    pub(super) lease: Arc<()>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct DiskPreparedReplaySnapshot {
     pub(super) video_track: HevcPreparedMp4Track,
     pub(super) audio_track: Option<AacPreparedMp4Track>,
+    pub(super) _leases: Vec<Arc<()>>,
 }
 
 pub(super) fn concat_disk_indexed_segments(
     segments: &[DiskSegmentIndexedTracks],
-) -> Option<DiskPreparedReplaySnapshot> {
-    let first = segments.first()?;
+) -> Result<Option<DiskPreparedReplaySnapshot>, BackendError> {
+    let Some(first) = segments.first() else {
+        return Ok(None);
+    };
+    validate_disk_segment_compatibility(first, first)?;
     let mut video_samples = Vec::new();
     let mut audio_samples = Vec::new();
-    let mut parameter_sets = first.index.video_track.parameter_sets.clone();
+    let parameter_sets = first.index.video_track.parameter_sets.clone();
     let mut video_base_90k = 0u64;
     let mut audio_base_ticks = 0u64;
-    let mut audio_sample_rate = 48_000;
-    let mut audio_channel_count = 2;
+    let audio_sample_rate = first
+        .index
+        .audio_track
+        .as_ref()
+        .map(|audio| audio.sample_rate)
+        .unwrap_or(48_000);
+    let audio_channel_count = first
+        .index
+        .audio_track
+        .as_ref()
+        .map(|audio| audio.channel_count)
+        .unwrap_or(2);
     for segment in segments {
-        merge_hevc_parameter_sets(
-            &mut parameter_sets,
-            &segment.index.video_track.parameter_sets,
-        );
+        validate_disk_segment_compatibility(first, segment)?;
         video_samples.extend(segment.index.video_track.samples.iter().map(|sample| {
             HevcPreparedSample {
                 duration_90k: sample.duration_90k,
@@ -359,8 +415,6 @@ pub(super) fn concat_disk_indexed_segments(
         }));
         video_base_90k = video_base_90k.saturating_add(segment.index.video_track.duration_90k);
         if let Some(audio) = &segment.index.audio_track {
-            audio_sample_rate = audio.sample_rate;
-            audio_channel_count = audio.channel_count;
             audio_samples.extend(audio.samples.iter().map(|sample| AacPreparedSample {
                 duration_ticks: sample.duration_ticks,
                 data: Mp4SampleFileRange {
@@ -378,7 +432,7 @@ pub(super) fn concat_disk_indexed_segments(
         }
     }
     if video_samples.is_empty() {
-        return None;
+        return Ok(None);
     }
     let audio_track = if audio_samples.is_empty() {
         None
@@ -390,7 +444,7 @@ pub(super) fn concat_disk_indexed_segments(
             samples: audio_samples,
         })
     };
-    Some(DiskPreparedReplaySnapshot {
+    Ok(Some(DiskPreparedReplaySnapshot {
         video_track: HevcPreparedMp4Track {
             width: first.index.video_track.width,
             height: first.index.video_track.height,
@@ -401,19 +455,54 @@ pub(super) fn concat_disk_indexed_segments(
             samples: video_samples,
         },
         audio_track,
-    })
+        _leases: segments
+            .iter()
+            .map(|segment| segment.lease.clone())
+            .collect(),
+    }))
 }
 
-pub(super) fn merge_hevc_parameter_sets(dst: &mut HevcParameterSets, src: &HevcParameterSets) {
-    append_unique_bytes(&mut dst.vps, &src.vps);
-    append_unique_bytes(&mut dst.sps, &src.sps);
-    append_unique_bytes(&mut dst.pps, &src.pps);
-}
-
-pub(super) fn append_unique_bytes(dst: &mut Vec<Vec<u8>>, src: &[Vec<u8>]) {
-    for item in src {
-        if !dst.iter().any(|seen| seen == item) {
-            dst.push(item.clone());
+fn validate_disk_segment_compatibility(
+    expected: &DiskSegmentIndexedTracks,
+    actual: &DiskSegmentIndexedTracks,
+) -> Result<(), BackendError> {
+    let expected_video = &expected.index.video_track;
+    let actual_video = &actual.index.video_track;
+    let incompatible_video = expected_video.width != actual_video.width
+        || expected_video.height != actual_video.height
+        || expected_video.color != actual_video.color
+        || expected_video.codec != actual_video.codec
+        || expected_video.parameter_sets != actual_video.parameter_sets;
+    if incompatible_video {
+        return Err(BackendError::unsupported(
+            "磁盘循环缓存拼接",
+            actual.mp4_path.display().to_string(),
+            "分段的分辨率、色彩、HEVC profile/位深或 VPS/SPS/PPS 与当前保存 epoch 不一致",
+        ));
+    }
+    if !actual_video
+        .samples
+        .first()
+        .is_some_and(|sample| sample.is_sync)
+    {
+        return Err(BackendError::unsupported(
+            "磁盘循环缓存拼接",
+            actual.mp4_path.display().to_string(),
+            "分段首个视频 sample 不是关键帧",
+        ));
+    }
+    match (&expected.index.audio_track, &actual.index.audio_track) {
+        (Some(expected), Some(actual))
+            if expected.sample_rate == actual.sample_rate
+                && expected.channel_count == actual.channel_count => {}
+        (None, None) => {}
+        _ => {
+            return Err(BackendError::unsupported(
+                "磁盘循环缓存拼接",
+                actual.mp4_path.display().to_string(),
+                "分段 AAC 轨道是否存在、采样率或声道数与当前保存 epoch 不一致",
+            ));
         }
     }
+    Ok(())
 }

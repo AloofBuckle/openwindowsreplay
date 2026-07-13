@@ -8,6 +8,7 @@ pub(super) struct DiskSegmentMeta {
     pub(super) duration_90k: u64,
     pub(super) audio_access_units: usize,
     pub(super) bytes: u64,
+    pub(super) lease: Arc<()>,
 }
 
 impl DiskSegmentMeta {
@@ -21,6 +22,52 @@ pub(super) struct DiskSegmentReservation {
     pub(super) index: u64,
     pub(super) mp4_path: PathBuf,
     pub(super) sidecar_path: PathBuf,
+    pub(super) mp4_part_path: PathBuf,
+    pub(super) sidecar_part_path: PathBuf,
+}
+
+struct DiskSegmentWriteTransaction {
+    reservation: DiskSegmentReservation,
+    committed: bool,
+}
+
+impl DiskSegmentWriteTransaction {
+    fn new(reservation: DiskSegmentReservation) -> Self {
+        Self {
+            reservation,
+            committed: false,
+        }
+    }
+
+    fn publish(&self) -> Result<(), BackendError> {
+        fs::rename(&self.reservation.mp4_part_path, &self.reservation.mp4_path)
+            .map_err(|err| BackendError::Io(err.to_string()))?;
+        fs::rename(
+            &self.reservation.sidecar_part_path,
+            &self.reservation.sidecar_path,
+        )
+        .map_err(|err| BackendError::Io(err.to_string()))
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DiskSegmentWriteTransaction {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in [
+            &self.reservation.mp4_part_path,
+            &self.reservation.sidecar_part_path,
+            &self.reservation.mp4_path,
+            &self.reservation.sidecar_path,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -33,6 +80,26 @@ pub(super) struct DiskReplayStore {
 }
 
 impl DiskReplayStore {
+    pub(super) fn prepare_directory(dir: &Path) -> Result<(), BackendError> {
+        fs::create_dir_all(dir).map_err(|err| BackendError::Io(err.to_string()))?;
+        for entry in fs::read_dir(dir).map_err(|err| BackendError::Io(err.to_string()))? {
+            let entry = entry.map_err(|err| BackendError::Io(err.to_string()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("rustreplay_segment_")
+                && (name.ends_with(".mp4") || name.ends_with(".rrseg") || name.ends_with(".part"))
+            {
+                fs::remove_file(entry.path()).map_err(|err| {
+                    BackendError::Io(format!(
+                        "清理残留磁盘循环文件 {} 失败：{err}",
+                        entry.path().display()
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn new(dir: PathBuf, retention: Duration, segment_slop: Duration) -> Self {
         Self {
             dir,
@@ -58,6 +125,8 @@ impl DiskReplayStore {
             index,
             mp4_path: self.dir.join(format!("{stem}.mp4")),
             sidecar_path: self.dir.join(format!("{stem}.rrseg")),
+            mp4_part_path: self.dir.join(format!("{stem}.mp4.part")),
+            sidecar_part_path: self.dir.join(format!("{stem}.rrseg.part")),
         })
     }
 
@@ -89,9 +158,10 @@ impl DiskReplayStore {
             segments.push(DiskSegmentIndexedTracks {
                 mp4_path: meta.mp4_path.clone(),
                 index: read_disk_segment_sidecar(&meta.sidecar_path)?,
+                lease: meta.lease.clone(),
             });
         }
-        Ok(concat_disk_indexed_segments(&segments).map(|tracks| (tracks, last_segment)))
+        Ok(concat_disk_indexed_segments(&segments)?.map(|tracks| (tracks, last_segment)))
     }
 
     pub(super) fn select_recent_segments(&self, duration: Duration) -> Vec<DiskSegmentMeta> {
@@ -133,10 +203,35 @@ impl DiskReplayStore {
                 break;
             }
         }
-        for segment in self.segments.drain(..keep_from) {
-            let _ = fs::remove_file(&segment.mp4_path);
-            let _ = fs::remove_file(&segment.sidecar_path);
+        let mut retained = VecDeque::with_capacity(self.segments.len());
+        for (index, segment) in self.segments.drain(..).enumerate() {
+            if index < keep_from && Arc::strong_count(&segment.lease) == 1 {
+                let _ = fs::remove_file(&segment.mp4_path);
+                let _ = fs::remove_file(&segment.sidecar_path);
+            } else {
+                retained.push_back(segment);
+            }
         }
+        self.segments = retained;
+    }
+
+    pub(super) fn clear_segments(&mut self) -> Result<(), BackendError> {
+        let segments = self.segments.drain(..).collect::<Vec<_>>();
+        for segment in segments {
+            for path in [&segment.mp4_path, &segment.sidecar_path] {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(BackendError::Io(format!(
+                            "删除磁盘循环缓存 {} 失败：{err}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -156,13 +251,17 @@ pub(super) struct DiskSegmentWriteReport {
 }
 
 pub(super) struct DiskSegmentWriter {
-    pub(super) sender: Option<Sender<DiskSegmentWriteJob>>,
+    pub(super) sender: Option<SyncSender<DiskSegmentWriteJob>>,
     pub(super) handle: Option<JoinHandle<()>>,
 }
 
 impl DiskSegmentWriter {
-    pub(super) fn spawn(store: Arc<Mutex<DiskReplayStore>>, tx: Sender<ReplayEvent>) -> Self {
-        let (sender, rx) = mpsc::channel::<DiskSegmentWriteJob>();
+    pub(super) fn spawn(
+        store: Arc<Mutex<DiskReplayStore>>,
+        tx: Sender<ReplayEvent>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        let (sender, rx) = mpsc::sync_channel::<DiskSegmentWriteJob>(DISK_WRITER_QUEUE_CAPACITY);
         let handle = thread::spawn(move || {
             lower_current_disk_writer_priority();
             while let Ok(job) = rx.recv() {
@@ -187,10 +286,11 @@ impl DiskSegmentWriter {
                         });
                     }
                     Err(err) => {
-                        let _ = tx.send(ReplayEvent::BackendStatus {
-                            index: run_index,
-                            message: format!("磁盘循环分段异步写入失败：{err}"),
-                        });
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = tx.send(ReplayEvent::Error(format!(
+                            "磁盘循环分段异步写入失败（片段 #{run_index}）：{err}"
+                        )));
+                        break;
                     }
                 }
             }
@@ -201,7 +301,7 @@ impl DiskSegmentWriter {
         }
     }
 
-    pub(super) fn sender(&self) -> Option<Sender<DiskSegmentWriteJob>> {
+    pub(super) fn sender(&self) -> Option<SyncSender<DiskSegmentWriteJob>> {
         self.sender.as_ref().cloned()
     }
 
@@ -232,29 +332,31 @@ pub(super) fn write_disk_segment_job(
         .lock()
         .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
         .reserve_segment_paths()?;
+    let mut transaction = DiskSegmentWriteTransaction::new(reservation);
 
     let mux_started = Instant::now();
     let index = super::mp4_mux::write_hevc_aac_mp4_with_index(
-        &reservation.mp4_path,
+        &transaction.reservation.mp4_part_path,
         &job.segment.video_track,
         job.segment.audio_track.as_ref(),
     )?;
     let mux_write = mux_started.elapsed();
 
     let sidecar_started = Instant::now();
-    write_disk_segment_sidecar(&reservation.sidecar_path, &index)?;
+    write_disk_segment_sidecar(&transaction.reservation.sidecar_part_path, &index)?;
     let sidecar_write = sidecar_started.elapsed();
+    transaction.publish()?;
 
-    let bytes = fs::metadata(&reservation.mp4_path)
+    let bytes = fs::metadata(&transaction.reservation.mp4_path)
         .map(|meta| meta.len())
         .unwrap_or(0)
-        + fs::metadata(&reservation.sidecar_path)
+        + fs::metadata(&transaction.reservation.sidecar_path)
             .map(|meta| meta.len())
             .unwrap_or(0);
     let meta = DiskSegmentMeta {
-        index: reservation.index,
-        mp4_path: reservation.mp4_path,
-        sidecar_path: reservation.sidecar_path,
+        index: transaction.reservation.index,
+        mp4_path: transaction.reservation.mp4_path.clone(),
+        sidecar_path: transaction.reservation.sidecar_path.clone(),
         duration_90k: index.video_track.duration_90k,
         audio_access_units: index
             .audio_track
@@ -262,6 +364,7 @@ pub(super) fn write_disk_segment_job(
             .map(|track| track.samples.len())
             .unwrap_or(0),
         bytes,
+        lease: Arc::new(()),
     };
 
     let commit_started = Instant::now();
@@ -269,6 +372,7 @@ pub(super) fn write_disk_segment_job(
         .lock()
         .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
         .commit_segment(meta.clone());
+    transaction.commit();
     let commit = commit_started.elapsed();
     Ok(DiskSegmentWriteReport {
         meta,

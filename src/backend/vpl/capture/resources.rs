@@ -1,6 +1,106 @@
 use super::*;
 
 #[cfg(windows)]
+struct OwnedSharedHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl OwnedSharedHandle {
+    fn get(&self) -> windows::Win32::Foundation::HANDLE {
+        self.0
+    }
+
+    fn into_raw(self) -> windows::Win32::Foundation::HANDLE {
+        let raw = self.0;
+        std::mem::forget(self);
+        raw
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedSharedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ThreadDesktopGuard {
+    previous: windows::Win32::System::StationsAndDesktops::HDESK,
+    input: windows::Win32::System::StationsAndDesktops::HDESK,
+}
+
+#[cfg(windows)]
+impl ThreadDesktopGuard {
+    unsafe fn bind_to_input() -> Result<Self, BackendError> {
+        use windows::Win32::System::StationsAndDesktops::{
+            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
+            GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
+        };
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+
+        let previous =
+            GetThreadDesktop(GetCurrentThreadId()).map_err(|err| BackendError::WindowsApi {
+                func: "GetThreadDesktop(DDA capture)",
+                message: err.to_string(),
+            })?;
+        let input = OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
+        )
+        .map_err(|err| BackendError::WindowsApi {
+            func: "OpenInputDesktop(DDA capture)",
+            message: err.to_string(),
+        })?;
+        if let Err(err) = SetThreadDesktop(input) {
+            let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(input);
+            return Err(BackendError::WindowsApi {
+                func: "SetThreadDesktop(DDA capture)",
+                message: err.to_string(),
+            });
+        }
+        Ok(Self { previous, input })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ThreadDesktopGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::StationsAndDesktops::SetThreadDesktop(self.previous);
+            let _ = windows::Win32::System::StationsAndDesktops::CloseDesktop(self.input);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn duplicate_output1_with_retry(
+    output: &windows::Win32::Graphics::Dxgi::IDXGIOutput5,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    supported_formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+) -> windows::core::Result<windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let _desktop = ThreadDesktopGuard::bind_to_input().map_err(|err| {
+            windows::core::Error::new(
+                windows::core::HRESULT(0x80004005u32 as i32),
+                err.to_string(),
+            )
+        })?;
+        match output.DuplicateOutput1(device, 0, supported_formats) {
+            Ok(duplication) => return Ok(duplication),
+            Err(err) => last_error = Some(err),
+        }
+        if attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    Err(last_error.expect("DuplicateOutput1 retry loop always records an error"))
+}
+
+#[cfg(windows)]
 pub(in super::super) unsafe fn create_duplication_on_device(
     adapter1: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -25,10 +125,19 @@ pub(in super::super) unsafe fn create_duplication_on_device(
     })?;
     if let Ok(output5) = output.cast::<IDXGIOutput5>() {
         if route.requires_fp16_capture() {
-            // 10-bit/HDR 路线不能退到 BGRA8：那会在 capture 阶段丢失源位深，
-            // 与“源是什么位深，输出就是什么位深”的后端契约冲突。
-            let supported_formats = [DXGI_FORMAT_R16G16B16A16_FLOAT];
-            match output5.DuplicateOutput1(device, 0, &supported_formats) {
+            // DuplicateOutput1 expects the caller's complete acceptable scan-out
+            // format list. Keep FP16 first, but include the mandatory 8-bit formats
+            // so drivers that validate the list as a whole can still create the
+            // duplication. The capture loop verifies the actual returned format and
+            // rejects 8-bit output for this route, so this cannot silently downgrade
+            // HDR/10-bit capture.
+            let supported_formats = [
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_B8G8R8X8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+            ];
+            match duplicate_output1_with_retry(&output5, device, &supported_formats) {
                 Ok(duplication) => return Ok(duplication),
                 Err(err) => {
                     return Err(BackendError::unsupported(
@@ -48,7 +157,7 @@ pub(in super::super) unsafe fn create_duplication_on_device(
                 DXGI_FORMAT_R8G8B8A8_UNORM,
                 DXGI_FORMAT_R16G16B16A16_FLOAT,
             ];
-            match output5.DuplicateOutput1(device, 0, &supported_formats) {
+            match duplicate_output1_with_retry(&output5, device, &supported_formats) {
                 Ok(duplication) => return Ok(duplication),
                 Err(err) => {
                     // 某些 WDDM/驱动组合能枚举 IDXGIOutput5，但 DuplicateOutput1
@@ -264,12 +373,14 @@ pub(in super::super) unsafe fn create_shared_snapshot_slot(
                 func: "ID3D11Texture2D::cast<IDXGIResource1>(shared DDA snapshot)",
                 message: err.to_string(),
             })?;
-    let shared_handle = resource1
-        .CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0, PCWSTR::null())
-        .map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIResource1::CreateSharedHandle(shared DDA snapshot)",
-            message: err.to_string(),
-        })?;
+    let shared_handle = OwnedSharedHandle(
+        resource1
+            .CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0, PCWSTR::null())
+            .map_err(|err| BackendError::WindowsApi {
+                func: "IDXGIResource1::CreateSharedHandle(shared DDA snapshot)",
+                message: err.to_string(),
+            })?,
+    );
     let encoder_device1: ID3D11Device1 =
         encoder_device
             .cast()
@@ -278,7 +389,7 @@ pub(in super::super) unsafe fn create_shared_snapshot_slot(
                 message: err.to_string(),
             })?;
     let encoder_texture: ID3D11Texture2D = encoder_device1
-        .OpenSharedResource1(shared_handle)
+        .OpenSharedResource1(shared_handle.get())
         .map_err(|err| BackendError::WindowsApi {
             func: "ID3D11Device1::OpenSharedResource1(shared DDA snapshot)",
             message: err.to_string(),
@@ -298,7 +409,7 @@ pub(in super::super) unsafe fn create_shared_snapshot_slot(
             capture_mutex,
             encoder_mutex,
             encoder_fence: GpuCompletionFence::new(encoder_device)?,
-            shared_handle,
+            shared_handle: shared_handle.into_raw(),
         }),
     })
 }

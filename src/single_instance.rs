@@ -80,9 +80,7 @@ fn signal_existing_instance() {
     let name = wide_with_nul(ACTIVATE_EVENT_NAME);
     let event = unsafe {
         OpenEventW(
-            SYNCHRONIZATION_ACCESS_RIGHTS(
-                windows::Win32::System::Threading::EVENT_MODIFY_STATE.0,
-            ),
+            SYNCHRONIZATION_ACCESS_RIGHTS(windows::Win32::System::Threading::EVENT_MODIFY_STATE.0),
             false,
             windows::core::PCWSTR(name.as_ptr()),
         )

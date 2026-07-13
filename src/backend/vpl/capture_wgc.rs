@@ -1,6 +1,77 @@
 use super::*;
 
 #[cfg(windows)]
+struct WgcCaptureJob {
+    adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    start: std::time::Instant,
+    end_at: std::time::Instant,
+    source_stop_90k: u64,
+    route: VplRecordRoute,
+    target_width: u32,
+    target_height: u32,
+    pool_size: usize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
+    free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
+    result_tx: std::sync::mpsc::Sender<Result<CaptureStats, String>>,
+}
+
+#[cfg(windows)]
+std::thread_local! {
+    static WGC_WINRT_DEVICE_CACHE: std::cell::RefCell<std::collections::HashMap<usize, windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(windows)]
+fn wgc_capture_service() -> &'static std::sync::mpsc::Sender<WgcCaptureJob> {
+    static SERVICE: std::sync::OnceLock<std::sync::mpsc::Sender<WgcCaptureJob>> =
+        std::sync::OnceLock::new();
+    SERVICE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WgcCaptureJob>();
+        std::thread::Builder::new()
+            .name("rustreplay-wgc-mta".to_owned())
+            .spawn(move || unsafe {
+                use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+                use windows::Win32::System::WinRT::{
+                    RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
+                };
+
+                let initialized = match RoInitialize(RO_INIT_MULTITHREADED) {
+                    Ok(()) => Ok(true),
+                    Err(err) if err.code() == RPC_E_CHANGED_MODE => Ok(false),
+                    Err(err) => Err(format!("RoInitialize(WGC service): {err}")),
+                };
+                while let Ok(job) = rx.recv() {
+                    let result = match &initialized {
+                        Ok(_) => run_wgc_capture_thread(
+                            job.adapter1,
+                            job.encoder_device,
+                            job.start,
+                            job.end_at,
+                            job.source_stop_90k,
+                            job.route,
+                            job.target_width,
+                            job.target_height,
+                            job.pool_size,
+                            job.stop,
+                            job.frame_tx,
+                            job.free_rx,
+                        ),
+                        Err(message) => Err(message.clone()),
+                    };
+                    let _ = job.result_tx.send(result);
+                }
+                if matches!(initialized, Ok(true)) {
+                    RoUninitialize();
+                }
+            })
+            .expect("failed to spawn persistent WGC MTA service thread");
+        tx
+    })
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_wgc_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
@@ -16,22 +87,30 @@ pub(super) fn spawn_wgc_capture_thread(
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
     free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
+    let service = wgc_capture_service().clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let job = WgcCaptureJob {
+        adapter1,
+        encoder_device,
+        start,
+        end_at,
+        source_stop_90k,
+        route,
+        target_width,
+        target_height,
+        pool_size,
+        stop,
+        frame_tx: frame_tx.clone(),
+        free_rx,
+        result_tx,
+    };
     std::thread::spawn(move || {
-        let result = unsafe {
-            run_wgc_capture_thread(
-                adapter1,
-                encoder_device,
-                start,
-                end_at,
-                source_stop_90k,
-                route,
-                target_width,
-                target_height,
-                pool_size,
-                stop,
-                frame_tx.clone(),
-                free_rx,
-            )
+        let result = if service.send(job).is_err() {
+            Err("persistent WGC capture service is unavailable".to_owned())
+        } else {
+            result_rx
+                .recv()
+                .unwrap_or_else(|_| Err("persistent WGC capture service disconnected".to_owned()))
         };
         match result {
             Ok(stats) => {
@@ -43,30 +122,6 @@ pub(super) fn spawn_wgc_capture_thread(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     })
-}
-
-#[cfg(windows)]
-pub(super) fn atomic_queue_depth_increment(counter: &std::sync::atomic::AtomicUsize) -> usize {
-    use std::sync::atomic::Ordering;
-
-    let previous = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_add(1))
-        })
-        .unwrap_or_else(|value| value);
-    previous.saturating_add(1)
-}
-
-#[cfg(windows)]
-pub(super) fn atomic_queue_depth_decrement(counter: &std::sync::atomic::AtomicUsize) -> usize {
-    use std::sync::atomic::Ordering;
-
-    let previous = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_sub(1))
-        })
-        .unwrap_or_else(|value| value);
-    previous.saturating_sub(1)
 }
 
 #[cfg(windows)]
@@ -86,15 +141,14 @@ pub(super) unsafe fn run_wgc_capture_thread(
     free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> Result<CaptureStats, String> {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use windows::Foundation::{TimeSpan, TypedEventHandler};
+    use windows::Foundation::TimeSpan;
     use windows::Graphics::Capture::{
         Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
         GraphicsCaptureSession,
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_TEXTURE2D_DESC, ID3D11Multithread, ID3D11Texture2D,
     };
@@ -104,19 +158,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     };
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
-    use windows::core::{IInspectable, Interface};
-
-    struct RoGuard(bool);
-    impl Drop for RoGuard {
-        fn drop(&mut self) {
-            if self.0 {
-                unsafe {
-                    RoUninitialize();
-                }
-            }
-        }
-    }
+    use windows::core::Interface;
 
     struct WgcCaptureState {
         stats: CaptureStats,
@@ -175,17 +217,6 @@ pub(super) unsafe fn run_wgc_capture_thread(
         coalesce_started_at: std::time::Instant,
     }
 
-    fn update_atomic_max(target: &AtomicUsize, value: usize) {
-        let mut current = target.load(Ordering::Relaxed);
-        while value > current {
-            match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
-    }
-
     fn win_err(label: &str, err: windows::core::Error) -> String {
         format!("{label}: {err}")
     }
@@ -193,11 +224,6 @@ pub(super) unsafe fn run_wgc_capture_thread(
     const WGC_WARMUP_STABLE_INTERVALS: u32 = 0;
 
     let capture_duration = end_at.saturating_duration_since(start);
-    let ro_guard = match RoInitialize(RO_INIT_MULTITHREADED) {
-        Ok(()) => RoGuard(true),
-        Err(err) if err.code() == RPC_E_CHANGED_MODE => RoGuard(false),
-        Err(err) => return Err(win_err("RoInitialize(WGC record)", err)),
-    };
     if !GraphicsCaptureSession::IsSupported()
         .map_err(|err| win_err("GraphicsCaptureSession::IsSupported(WGC record)", err))?
     {
@@ -231,11 +257,20 @@ pub(super) unsafe fn run_wgc_capture_thread(
     let dxgi_device: IDXGIDevice = device
         .cast()
         .map_err(|err| win_err("ID3D11Device::cast<IDXGIDevice>(WGC record)", err))?;
-    let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
-        .map_err(|err| win_err("CreateDirect3D11DeviceFromDXGIDevice(WGC record)", err))?;
-    let winrt_device: IDirect3DDevice = inspectable
-        .cast()
-        .map_err(|err| win_err("IInspectable::cast<IDirect3DDevice>(WGC record)", err))?;
+    let device_key = device.as_raw() as usize;
+    let winrt_device = WGC_WINRT_DEVICE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(device) = cache.get(&device_key) {
+            return Ok(device.clone());
+        }
+        let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
+            .map_err(|err| win_err("CreateDirect3D11DeviceFromDXGIDevice(WGC record)", err))?;
+        let device: IDirect3DDevice = inspectable
+            .cast()
+            .map_err(|err| win_err("IInspectable::cast<IDirect3DDevice>(WGC record)", err))?;
+        cache.insert(device_key, device.clone());
+        Ok::<_, String>(device)
+    })?;
     let item_interop: IGraphicsCaptureItemInterop =
         windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(
             |err| {
@@ -274,7 +309,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-    let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+    let frame_pool = Direct3D11CaptureFramePool::Create(
         &winrt_device,
         pixel_format,
         wgc_frame_pool_size,
@@ -341,79 +376,6 @@ pub(super) unsafe fn run_wgc_capture_thread(
         );
     }
     let callback_state = Arc::new(Mutex::new(initial_state));
-    let (wgc_frame_tx, wgc_frame_rx) = std::sync::mpsc::channel::<WgcQueuedFrame>();
-    let wgc_frame_queue_depth = Arc::new(AtomicUsize::new(0));
-    let wgc_frame_queue_depth_max = Arc::new(AtomicUsize::new(0));
-    let handler_stop = Arc::clone(&stop);
-    let handler_state = Arc::clone(&callback_state);
-    let handler_wgc_frame_tx = wgc_frame_tx.clone();
-    let handler_wgc_frame_queue_depth = Arc::clone(&wgc_frame_queue_depth);
-    let handler_wgc_frame_queue_depth_max = Arc::clone(&wgc_frame_queue_depth_max);
-    let handler =
-        TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |sender, _| {
-            if handler_stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            if let Some(pool) = sender.as_ref() {
-                loop {
-                    let frame = match pool.TryGetNextFrame() {
-                        Ok(frame) => frame,
-                        Err(err) if err.code().0 == 0 => break,
-                        Err(err) => {
-                            if let Ok(mut state) = handler_state.lock() {
-                                state.error = Some(win_err("TryGetNextFrame(WGC callback)", err));
-                            }
-                            handler_stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    };
-
-                    let timestamp_100ns = match frame.SystemRelativeTime() {
-                        Ok(timestamp) => timestamp.Duration,
-                        Err(err) => {
-                            if let Ok(mut state) = handler_state.lock() {
-                                state.error = Some(win_err(
-                                    "Direct3D11CaptureFrame::SystemRelativeTime(WGC callback)",
-                                    err,
-                                ));
-                            }
-                            handler_stop.store(true, Ordering::Relaxed);
-                            let _ = frame.Close();
-                            break;
-                        }
-                    };
-                    let enqueued_at = std::time::Instant::now();
-                    let queued = WgcQueuedFrame {
-                        frame,
-                        timestamp_100ns,
-                        enqueued_at,
-                        coalesce_origin_100ns: timestamp_100ns,
-                        coalesce_started_at: enqueued_at,
-                    };
-                    // Publish the queue-depth increment before the channel send. The receiver can
-                    // run immediately after `send`; incrementing afterwards lets it decrement 0
-                    // to usize::MAX and the next WinRT callback would panic across the ABI boundary.
-                    let depth = atomic_queue_depth_increment(&handler_wgc_frame_queue_depth);
-                    if handler_wgc_frame_tx.send(queued).is_err() {
-                        atomic_queue_depth_decrement(&handler_wgc_frame_queue_depth);
-                        handler_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    update_atomic_max(&handler_wgc_frame_queue_depth_max, depth);
-                    if handler_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-            } else if let Ok(mut state) = handler_state.lock() {
-                state.error = Some("FrameArrived(WGC callback) sender 为空".to_owned());
-                handler_stop.store(true, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-
-    let token = frame_pool
-        .FrameArrived(&handler)
-        .map_err(|err| win_err("Direct3D11CaptureFramePool::FrameArrived(WGC record)", err))?;
     session
         .StartCapture()
         .map_err(|err| win_err("GraphicsCaptureSession::StartCapture(WGC record)", err))?;
@@ -691,15 +653,43 @@ pub(super) unsafe fn run_wgc_capture_thread(
             Some(current)
         }
     };
+    let poll_next_wgc_frame = || -> Result<Option<WgcQueuedFrame>, String> {
+        let frame = match frame_pool.TryGetNextFrame() {
+            Ok(frame) => frame,
+            Err(err) if err.code().0 == 0 => return Ok(None),
+            Err(err) => return Err(win_err("TryGetNextFrame(WGC polling)", err)),
+        };
+        let timestamp_100ns = frame
+            .SystemRelativeTime()
+            .map_err(|err| {
+                win_err(
+                    "Direct3D11CaptureFrame::SystemRelativeTime(WGC polling)",
+                    err,
+                )
+            })?
+            .Duration;
+        let enqueued_at = std::time::Instant::now();
+        Ok(Some(WgcQueuedFrame {
+            frame,
+            timestamp_100ns,
+            enqueued_at,
+            coalesce_origin_100ns: timestamp_100ns,
+            coalesce_started_at: enqueued_at,
+        }))
+    };
     while !stop.load(Ordering::Relaxed) {
         while let Ok(slot) = free_rx.try_recv() {
             return_slot(slot)?;
         }
-        while let Ok(frame) = wgc_frame_rx.try_recv() {
+        let mut polled_frame = false;
+        loop {
+            let Some(frame) = poll_next_wgc_frame()? else {
+                break;
+            };
+            polled_frame = true;
             while let Ok(slot) = free_rx.try_recv() {
                 return_slot(slot)?;
             }
-            atomic_queue_depth_decrement(&wgc_frame_queue_depth);
             if let Some(frame) = enqueue_wgc_frame(&mut pending_wgc_frame, frame) {
                 let frame_result = process_wgc_frame(frame);
                 if let Err(message) = frame_result {
@@ -740,39 +730,8 @@ pub(super) unsafe fn run_wgc_capture_thread(
         if deadline_reached {
             break;
         }
-        match wgc_frame_rx.recv_timeout(std::time::Duration::from_millis(1)) {
-            Ok(frame) => {
-                while let Ok(slot) = free_rx.try_recv() {
-                    return_slot(slot)?;
-                }
-                atomic_queue_depth_decrement(&wgc_frame_queue_depth);
-                if let Some(frame) = enqueue_wgc_frame(&mut pending_wgc_frame, frame) {
-                    let frame_result = process_wgc_frame(frame);
-                    if let Err(message) = frame_result {
-                        if let Ok(mut state) = callback_state.lock() {
-                            state.error = Some(message);
-                        }
-                        stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if pending_wgc_frame
-                    .as_ref()
-                    .is_some_and(|frame| frame.coalesce_started_at.elapsed() >= wgc_coalesce_window)
-                {
-                    let frame = pending_wgc_frame.take().expect("pending WGC frame");
-                    if let Err(message) = process_wgc_frame(frame) {
-                        if let Ok(mut state) = callback_state.lock() {
-                            state.error = Some(message);
-                        }
-                        stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        if !polled_frame {
+            std::thread::sleep(std::time::Duration::from_micros(500));
         }
         while let Ok(slot) = free_rx.try_recv() {
             return_slot(slot)?;
@@ -810,11 +769,8 @@ pub(super) unsafe fn run_wgc_capture_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let _ = frame_pool.RemoveFrameArrived(token);
     let _ = session.Close();
     let _ = frame_pool.Close();
-    drop(handler);
-    std::mem::forget(ro_guard);
 
     let (error, mut stats) = {
         let state = callback_state
@@ -822,17 +778,13 @@ pub(super) unsafe fn run_wgc_capture_thread(
             .map_err(|_| "WGC callback state mutex poisoned while finalizing".to_owned())?;
         (state.error.clone(), state.stats.clone())
     };
-    stats.wgc_input_queue_max = wgc_frame_queue_depth_max.load(Ordering::Relaxed) as u64;
+    stats.wgc_input_queue_max = 0;
     stats.wgc_coalesced_frames = wgc_coalesced_frames;
-    // Some WGC/WinRT wrappers have shown access violations when released
-    // immediately on the capture thread after a high-rate recording. Keep only
-    // the WinRT capture graph alive; snapshot slots and shared handles still drop.
-    std::mem::forget(session);
-    std::mem::forget(frame_pool);
-    std::mem::forget(item);
-    std::mem::forget(item_interop);
-    std::mem::forget(winrt_device);
-    std::mem::forget(inspectable);
+    drop(session);
+    drop(frame_pool);
+    drop(item);
+    drop(item_interop);
+    drop(winrt_device);
     if let Some(error) = error {
         return Err(error);
     }

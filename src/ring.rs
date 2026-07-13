@@ -46,7 +46,8 @@ impl EncodedPacket {
 #[derive(Debug, Clone)]
 pub struct EncodedRingBuffer {
     retention_ns: u64,
-    packets: VecDeque<EncodedPacket>,
+    video_packets: VecDeque<EncodedPacket>,
+    audio_packets: VecDeque<EncodedPacket>,
     bytes: usize,
     newest_pts_ns: u64,
     newest_end_ns: u64,
@@ -56,7 +57,8 @@ impl EncodedRingBuffer {
     pub fn new(retention: Duration) -> Self {
         Self {
             retention_ns: retention.as_nanos().min(u128::from(u64::MAX)) as u64,
-            packets: VecDeque::new(),
+            video_packets: VecDeque::new(),
+            audio_packets: VecDeque::new(),
             bytes: 0,
             newest_pts_ns: 0,
             newest_end_ns: 0,
@@ -69,21 +71,21 @@ impl EncodedRingBuffer {
         self.newest_end_ns = self
             .newest_end_ns
             .max(packet.pts_ns.saturating_add(packet.duration_ns));
-        self.packets.push_back(packet);
+        let queue = match packet.stream {
+            EncodedStreamKind::Video => &mut self.video_packets,
+            EncodedStreamKind::Audio => &mut self.audio_packets,
+        };
+        insert_packet_ordered(queue, packet);
         self.prune_before(self.newest_pts_ns.saturating_sub(self.retention_ns));
     }
 
     pub fn snapshot_recent(&self, duration: Duration) -> Vec<EncodedPacket> {
-        if self.packets.is_empty() {
+        if self.is_empty() {
             return Vec::new();
         }
         let duration_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
         let min_pts = self.newest_pts_ns.saturating_sub(duration_ns);
-        self.packets
-            .iter()
-            .filter(|packet| packet.pts_ns >= min_pts)
-            .cloned()
-            .collect()
+        self.snapshot_from_pts(min_pts)
     }
 
     pub fn snapshot_recent_with_leading_video_key(&self, duration: Duration) -> Vec<EncodedPacket> {
@@ -95,38 +97,40 @@ impl EncodedRingBuffer {
         duration: Duration,
         not_before_pts_ns: Option<u64>,
     ) -> Vec<EncodedPacket> {
-        if self.packets.is_empty() {
+        if self.video_packets.is_empty() {
             return Vec::new();
         }
         let duration_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
         let min_pts = self.newest_pts_ns.saturating_sub(duration_ns);
         let start_pts = if let Some(not_before) = not_before_pts_ns {
             let window_start = min_pts.max(not_before);
-            let Some(key) = self.packets.iter().find(|packet| {
-                packet.stream == EncodedStreamKind::Video
-                    && packet.is_key
-                    && packet.pts_ns >= window_start
-            }) else {
+            let Some(key) = self
+                .video_packets
+                .iter()
+                .find(|packet| packet.is_key && packet.pts_ns >= window_start)
+            else {
                 return Vec::new();
             };
             key.pts_ns
         } else {
-            self.packets
+            self.video_packets
                 .iter()
                 .rev()
-                .find(|packet| {
-                    packet.stream == EncodedStreamKind::Video
-                        && packet.is_key
-                        && packet.pts_ns <= min_pts
-                })
+                .find(|packet| packet.is_key && packet.pts_ns <= min_pts)
                 .map(|packet| packet.pts_ns)
-                .unwrap_or(min_pts)
+                .or_else(|| {
+                    self.video_packets
+                        .iter()
+                        .find(|packet| packet.is_key && packet.pts_ns >= min_pts)
+                        .map(|packet| packet.pts_ns)
+                })
+                .unwrap_or(u64::MAX)
         };
-        self.packets
-            .iter()
-            .filter(|packet| packet.pts_ns >= start_pts)
-            .cloned()
-            .collect()
+        if start_pts == u64::MAX {
+            Vec::new()
+        } else {
+            self.snapshot_from_pts(start_pts)
+        }
     }
 
     pub fn newest_end_ns(&self) -> u64 {
@@ -145,11 +149,11 @@ impl EncodedRingBuffer {
     }
 
     pub fn len(&self) -> usize {
-        self.packets.len()
+        self.video_packets.len() + self.audio_packets.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
+        self.video_packets.is_empty() && self.audio_packets.is_empty()
     }
 
     pub fn bytes(&self) -> usize {
@@ -157,19 +161,74 @@ impl EncodedRingBuffer {
     }
 
     fn prune_before(&mut self, min_pts: u64) {
-        while self
-            .packets
-            .front()
-            .is_some_and(|packet| packet.pts_ns < min_pts)
-        {
-            if let Some(packet) = self.packets.pop_front() {
-                self.bytes = self.bytes.saturating_sub(packet.data.len());
-            }
+        prune_queue_before(&mut self.video_packets, min_pts, &mut self.bytes);
+        prune_queue_before(&mut self.audio_packets, min_pts, &mut self.bytes);
+    }
+
+    fn snapshot_from_pts(&self, min_pts: u64) -> Vec<EncodedPacket> {
+        let mut video = self
+            .video_packets
+            .iter()
+            .filter(|packet| packet.pts_ns >= min_pts)
+            .peekable();
+        let mut audio = self
+            .audio_packets
+            .iter()
+            .filter(|packet| packet.pts_ns >= min_pts)
+            .peekable();
+        let mut packets = Vec::with_capacity(video.size_hint().0 + audio.size_hint().0);
+        loop {
+            let take_video = match (video.peek(), audio.peek()) {
+                (Some(video), Some(audio)) => {
+                    (video.pts_ns, video.stream_sort_key())
+                        <= (audio.pts_ns, audio.stream_sort_key())
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            packets.push(if take_video {
+                video.next().expect("peeked video packet").clone()
+            } else {
+                audio.next().expect("peeked audio packet").clone()
+            });
+        }
+        packets
+    }
+
+    fn clear(&mut self) {
+        self.video_packets.clear();
+        self.audio_packets.clear();
+        self.bytes = 0;
+        self.newest_pts_ns = 0;
+        self.newest_end_ns = 0;
+    }
+}
+
+fn insert_packet_ordered(queue: &mut VecDeque<EncodedPacket>, packet: EncodedPacket) {
+    if queue
+        .back()
+        .is_none_or(|last| (last.pts_ns, last.dts_ns) <= (packet.pts_ns, packet.dts_ns))
+    {
+        queue.push_back(packet);
+        return;
+    }
+    let insert_at = queue
+        .iter()
+        .position(|current| (current.pts_ns, current.dts_ns) > (packet.pts_ns, packet.dts_ns))
+        .unwrap_or(queue.len());
+    queue.insert(insert_at, packet);
+}
+
+fn prune_queue_before(queue: &mut VecDeque<EncodedPacket>, min_pts: u64, bytes: &mut usize) {
+    while queue.front().is_some_and(|packet| packet.pts_ns < min_pts) {
+        if let Some(packet) = queue.pop_front() {
+            *bytes = bytes.saturating_sub(packet.data.len());
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedReplayMetadata {
     pub width: u16,
     pub height: u16,
@@ -335,15 +394,19 @@ impl EncodedReplayRing {
     }
 
     pub fn start_segment(&mut self, metadata: EncodedReplayMetadata) {
-        self.flush_pending_video_with_duration_ns(1);
-        self.metadata = Some(EncodedReplayMetadata {
-            width: metadata.width,
-            height: metadata.height,
-            color: metadata.color,
-            codec: metadata.codec,
-            audio_sample_rate: metadata.audio_sample_rate,
-            audio_channel_count: metadata.audio_channel_count,
-        });
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|current| current != &metadata)
+        {
+            self.ring.clear();
+            self.next_segment_base_ns = 0;
+            self.active_segment_base_ns = 0;
+            self.pending_video = None;
+        } else {
+            self.flush_pending_video_with_duration_ns(1);
+        }
+        self.metadata = Some(metadata);
         self.active_segment_base_ns = self.next_segment_base_ns;
         self.pending_video = None;
     }
@@ -466,12 +529,7 @@ impl EncodedReplayRing {
         let first_video_pts = packets
             .iter()
             .filter(|packet| packet.stream == EncodedStreamKind::Video)
-            .find(|packet| packet.is_key)
-            .or_else(|| {
-                packets
-                    .iter()
-                    .find(|packet| packet.stream == EncodedStreamKind::Video)
-            })?
+            .find(|packet| packet.is_key)?
             .pts_ns;
         let video_end_pts_ns = packets
             .iter()
@@ -480,12 +538,20 @@ impl EncodedReplayRing {
             })
             .map(|packet| packet.pts_ns.saturating_add(packet.duration_ns))
             .max()?;
-        let save_cursor_pts_ns = self
+        let pending_video_end = self
             .pending_video
             .as_ref()
             .map(|packet| packet.pts_ns.saturating_add(packet.duration_ns))
-            .unwrap_or(video_end_pts_ns)
-            .max(video_end_pts_ns);
+            .unwrap_or(video_end_pts_ns);
+        let completed_video_end = video_end_pts_ns.max(pending_video_end);
+        let audio_end_pts_ns = packets
+            .iter()
+            .filter(|packet| packet.stream == EncodedStreamKind::Audio)
+            .map(|packet| packet.pts_ns.saturating_add(packet.duration_ns))
+            .max();
+        let save_cursor_pts_ns = audio_end_pts_ns
+            .map(|audio_end| completed_video_end.min(audio_end))
+            .unwrap_or(completed_video_end);
         Some(EncodedReplayPacketSnapshot {
             metadata,
             packets,
@@ -498,18 +564,8 @@ impl EncodedReplayRing {
     pub fn availability(&self) -> EncodedReplayAvailability {
         EncodedReplayAvailability {
             metadata_ready: self.metadata.is_some(),
-            video_packets: self
-                .ring
-                .packets
-                .iter()
-                .filter(|packet| packet.stream == EncodedStreamKind::Video)
-                .count(),
-            audio_packets: self
-                .ring
-                .packets
-                .iter()
-                .filter(|packet| packet.stream == EncodedStreamKind::Audio)
-                .count(),
+            video_packets: self.ring.video_packets.len(),
+            audio_packets: self.ring.audio_packets.len(),
             pending_video_packet: self.pending_video.is_some(),
             bytes: self.ring.bytes(),
         }
@@ -557,7 +613,20 @@ mod tests {
         ring.push(pkt(1_000_000_000));
         ring.push(pkt(3_000_000_000));
         assert_eq!(ring.len(), 2);
-        assert_eq!(ring.packets.front().unwrap().pts_ns, 1_000_000_000);
+        assert_eq!(ring.video_packets.front().unwrap().pts_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn ring_prunes_late_out_of_order_audio_independently() {
+        let mut ring = EncodedRingBuffer::new(Duration::from_secs(2));
+        ring.push(pkt(3_000_000_000));
+        let mut late_audio = pkt(0);
+        late_audio.stream = EncodedStreamKind::Audio;
+        ring.push(late_audio);
+
+        assert_eq!(ring.len(), 1);
+        assert!(ring.audio_packets.is_empty());
+        assert_eq!(ring.bytes(), 3);
     }
 
     #[test]
@@ -692,9 +761,9 @@ mod tests {
         replay.push_tracks(&video, None);
         let stored = replay
             .ring
-            .packets
+            .video_packets
             .iter()
-            .find(|packet| packet.stream == EncodedStreamKind::Video)
+            .next()
             .unwrap()
             .data
             .clone();
@@ -709,6 +778,37 @@ mod tests {
             .unwrap();
 
         assert!(Arc::ptr_eq(&stored, &snapped.data));
+    }
+
+    #[test]
+    fn replay_snapshot_requires_a_real_video_keyframe() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc(0, false));
+        replay.push_video_au_90k(&hevc(90_000, false));
+        replay.finish_segment_with_audio_duration(180_000, None);
+
+        assert!(
+            replay
+                .snapshot_recent_packets_after(Duration::from_secs(10), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_change_discards_previous_codec_epoch() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc(0, true));
+        replay.push_video_au_90k(&hevc(90_000, false));
+        replay.finish_segment_with_audio_duration(180_000, None);
+        assert!(!replay.ring.is_empty());
+
+        replay.start_segment(metadata(32, 16));
+
+        assert!(replay.ring.is_empty());
+        assert_eq!(replay.metadata.as_ref().unwrap().width, 32);
+        assert_eq!(replay.active_segment_base_ns, 0);
     }
 
     #[test]
@@ -774,6 +874,17 @@ mod tests {
             timestamp_ticks,
             duration_ticks: 1024,
             data: vec![0x21, 0x10].into(),
+        }
+    }
+
+    fn metadata(width: u16, height: u16) -> EncodedReplayMetadata {
+        EncodedReplayMetadata {
+            width,
+            height,
+            color: NclxColorMetadata::bt709_full(),
+            codec: HevcCodecMetadata::main_420_8(),
+            audio_sample_rate: 48_000,
+            audio_channel_count: 2,
         }
     }
 }

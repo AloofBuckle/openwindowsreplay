@@ -19,13 +19,15 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIVE_RECORD_SECONDS: f32 = 24.0 * 60.0 * 60.0;
 const DISK_SEGMENT_TARGET_SECONDS: f32 = 10.0;
+const DISK_WRITER_QUEUE_CAPACITY: usize = 3;
+const DISK_PENDING_SEGMENT_LIMIT: usize = 3;
 const DISK_SEGMENT_SIDECAR_MAGIC: &[u8; 8] = b"RRSEG002";
 const VIDEO_CLOCK_HZ: u64 = 90_000;
 

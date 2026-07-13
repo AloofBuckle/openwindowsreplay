@@ -1,6 +1,89 @@
 use super::*;
 
 #[cfg(windows)]
+pub(in super::super) struct KeyedMutexGuard<'a> {
+    mutex: &'a windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex,
+    release_key: u64,
+    held: bool,
+}
+
+#[cfg(windows)]
+impl<'a> KeyedMutexGuard<'a> {
+    pub(in super::super) fn acquire(
+        mutex: &'a windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex,
+        acquire_key: u64,
+        release_key: u64,
+        timeout_ms: u32,
+        func: &'static str,
+    ) -> Result<Self, BackendError> {
+        use windows::core::Interface;
+
+        let status = unsafe {
+            (Interface::vtable(mutex).AcquireSync)(
+                Interface::as_raw(mutex),
+                acquire_key,
+                timeout_ms,
+            )
+        };
+        match status.0 as u32 {
+            0 => Ok(Self {
+                mutex,
+                release_key,
+                held: true,
+            }),
+            0x0000_0102 => Err(BackendError::WindowsApi {
+                func,
+                message: format!(
+                    "keyed mutex wait timed out after {timeout_ms}ms; resource ownership was not acquired"
+                ),
+            }),
+            0x0000_0080 => Err(BackendError::WindowsApi {
+                func,
+                message: "keyed mutex was abandoned; shared resource state is invalid".to_owned(),
+            }),
+            _ => Err(BackendError::WindowsApi {
+                func,
+                message: windows::core::Error::from_hresult(status).to_string(),
+            }),
+        }
+    }
+
+    pub(in super::super) fn release(mut self, func: &'static str) -> Result<(), BackendError> {
+        let status = self.release_raw();
+        if status.0 == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::WindowsApi {
+                func,
+                message: windows::core::Error::from_hresult(status).to_string(),
+            })
+        }
+    }
+
+    fn release_raw(&mut self) -> windows::core::HRESULT {
+        use windows::core::Interface;
+
+        if !self.held {
+            return windows::core::HRESULT(0);
+        }
+        self.held = false;
+        unsafe {
+            (Interface::vtable(self.mutex).ReleaseSync)(
+                Interface::as_raw(self.mutex),
+                self.release_key,
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KeyedMutexGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.release_raw();
+    }
+}
+
+#[cfg(windows)]
 pub(in super::super) struct D3d11MultithreadGuard<'a> {
     pub(in super::super) mt: Option<&'a windows::Win32::Graphics::Direct3D11::ID3D11Multithread>,
 }
@@ -451,12 +534,40 @@ impl GpuCompletionFence {
         &self,
         context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     ) -> Result<(), BackendError> {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
         let mut polls = 0u32;
         while !self.is_ready(context)? {
             polls = polls.wrapping_add(1);
-            if polls.is_multiple_of(64) {
-            } else {
+            if polls.is_multiple_of(256) {
+                let device = context
+                    .GetDevice()
+                    .map_err(|err| BackendError::WindowsApi {
+                        func: "ID3D11DeviceContext::GetDevice(GPU fence wait)",
+                        message: err.to_string(),
+                    })?;
+                device
+                    .GetDeviceRemovedReason()
+                    .map_err(|err| BackendError::WindowsApi {
+                        func: "ID3D11Device::GetDeviceRemovedReason(GPU fence wait)",
+                        message: err.to_string(),
+                    })?;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BackendError::WindowsApi {
+                    func: "ID3D11DeviceContext::GetData(GPU fence wait)",
+                    message: format!(
+                        "GPU event query did not complete within {:.1}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                });
+            }
+            if polls < 64 {
                 std::hint::spin_loop();
+            } else if polls < 512 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
         }
         Ok(())

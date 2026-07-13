@@ -1559,34 +1559,57 @@ unsafe fn open_d3d11_session_for_adapter(
         func: "IDXGIAdapter1::cast<IDXGIAdapter>(NVENC)",
         message: err.to_string(),
     })?;
-
-    let mut device: Option<ID3D11Device> = None;
-    let mut context: Option<ID3D11DeviceContext> = None;
-    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-    let mut feature_level = D3D_FEATURE_LEVEL(0);
-    D3D11CreateDevice(
-        Some(&adapter),
-        D3D_DRIVER_TYPE_UNKNOWN,
-        HMODULE::default(),
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        Some(&levels),
-        D3D11_SDK_VERSION,
-        Some(&mut device),
-        Some(&mut feature_level),
-        Some(&mut context),
-    )
-    .map_err(|err| BackendError::WindowsApi {
-        func: "D3D11CreateDevice(NVENC)",
-        message: err.to_string(),
-    })?;
-    let device = device.ok_or_else(|| BackendError::WindowsApi {
-        func: "D3D11CreateDevice(NVENC)",
-        message: "返回空 ID3D11Device".to_owned(),
-    })?;
-    let context = context.ok_or_else(|| BackendError::WindowsApi {
-        func: "D3D11CreateDevice(NVENC)",
-        message: "返回空 ID3D11DeviceContext".to_owned(),
-    })?;
+    let adapter_desc = adapter1
+        .GetDesc1()
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIAdapter1::GetDesc1(NVENC device cache)",
+            message: err.to_string(),
+        })?;
+    let adapter_key = ((adapter_desc.AdapterLuid.HighPart as u32 as u64) << 32)
+        | u64::from(adapter_desc.AdapterLuid.LowPart);
+    static DEVICE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<u64, (ID3D11Device, ID3D11DeviceContext)>>,
+    > = std::sync::OnceLock::new();
+    let (device, context) = {
+        let cache = DEVICE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut cache = cache.lock().map_err(|_| BackendError::WindowsApi {
+            func: "NVENC D3D11 device cache",
+            message: "device cache mutex poisoned".to_owned(),
+        })?;
+        if let Some((device, context)) = cache.get(&adapter_key) {
+            (device.clone(), context.clone())
+        } else {
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+            let mut feature_level = D3D_FEATURE_LEVEL(0);
+            D3D11CreateDevice(
+                Some(&adapter),
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                Some(&levels),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                Some(&mut feature_level),
+                Some(&mut context),
+            )
+            .map_err(|err| BackendError::WindowsApi {
+                func: "D3D11CreateDevice(NVENC)",
+                message: err.to_string(),
+            })?;
+            let device = device.ok_or_else(|| BackendError::WindowsApi {
+                func: "D3D11CreateDevice(NVENC)",
+                message: "返回空 ID3D11Device".to_owned(),
+            })?;
+            let context = context.ok_or_else(|| BackendError::WindowsApi {
+                func: "D3D11CreateDevice(NVENC)",
+                message: "返回空 ID3D11DeviceContext".to_owned(),
+            })?;
+            cache.insert(adapter_key, (device.clone(), context.clone()));
+            (device, context)
+        }
+    };
 
     let open = api
         .functions

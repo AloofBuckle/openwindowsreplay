@@ -32,7 +32,9 @@ fn disk_segment_concat_rebases_timestamps() {
     let first = write_indexed_segment(&dir, "first", &segment(0, 90_000, 0, 48_000));
     let second = write_indexed_segment(&dir, "second", &segment(0, 45_000, 0, 24_000));
 
-    let snapshot = concat_disk_indexed_segments(&[first, second]).unwrap();
+    let snapshot = concat_disk_indexed_segments(&[first, second])
+        .unwrap()
+        .unwrap();
 
     assert_eq!(snapshot.video_track.duration_90k, 135_000);
     assert_eq!(snapshot.video_track.samples[0].duration_90k, 90_000);
@@ -44,6 +46,34 @@ fn disk_segment_concat_rebases_timestamps() {
     crate::backend::mp4_mux::write_prepared_hevc_aac_mp4(&out, &snapshot.video_track, Some(&audio))
         .unwrap();
     assert!(fs::metadata(&out).unwrap().len() > 0);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn disk_segment_concat_rejects_incompatible_video_epoch() {
+    let dir = unique_temp_dir("concat_incompatible_video");
+    fs::create_dir_all(&dir).unwrap();
+    let first = write_indexed_segment(&dir, "first", &segment(0, 90_000, 0, 48_000));
+    let mut second = write_indexed_segment(&dir, "second", &segment(0, 90_000, 0, 48_000));
+    second.index.video_track.width = 32;
+
+    let err = concat_disk_indexed_segments(&[first, second]).unwrap_err();
+
+    assert!(err.to_string().contains("保存 epoch 不一致"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn disk_segment_concat_rejects_non_key_segment_start() {
+    let dir = unique_temp_dir("concat_non_key");
+    fs::create_dir_all(&dir).unwrap();
+    let first = write_indexed_segment(&dir, "first", &segment(0, 90_000, 0, 48_000));
+    let mut second = write_indexed_segment(&dir, "second", &segment(0, 90_000, 0, 48_000));
+    second.index.video_track.samples[0].is_sync = false;
+
+    let err = concat_disk_indexed_segments(&[first, second]).unwrap_err();
+
+    assert!(err.to_string().contains("首个视频 sample 不是关键帧"));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -62,6 +92,7 @@ fn disk_store_selects_whole_recent_segments() {
             duration_90k: 10 * VIDEO_CLOCK_HZ,
             audio_access_units: 1,
             bytes: 1,
+            lease: Arc::new(()),
         });
     }
 
@@ -114,6 +145,56 @@ fn disk_segment_builder_keeps_audio_duration_aligned_to_video_segment() {
     assert_eq!(segment.audio_track.unwrap().duration_ticks, 48_000);
 }
 
+#[test]
+fn disk_segment_sink_fails_instead_of_blocking_when_writer_queue_is_full() {
+    let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+    writer_tx
+        .try_send(DiskSegmentWriteJob {
+            run_index: 0,
+            segment: segment(0, 90_000, 0, 48_000),
+            enqueued_at: Instant::now(),
+        })
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(60),
+        stop.clone(),
+    );
+    let mut builder = DiskSegmentBuilder::new(metadata(), 0, 0);
+    builder.end_90k = Some(90_000);
+    builder.push_video(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+
+    sink.write_completed_segment(builder);
+
+    assert!(stop.load(Ordering::Relaxed));
+    assert!(matches!(event_rx.recv().unwrap(), ReplayEvent::Error(_)));
+}
+
+#[test]
+fn disk_store_prepare_directory_removes_only_replay_artifacts() {
+    let dir = unique_temp_dir("cleanup_stale");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("rustreplay_segment_old.mp4"), b"x").unwrap();
+    fs::write(dir.join("rustreplay_segment_old.rrseg.part"), b"x").unwrap();
+    fs::write(dir.join("keep.txt"), b"x").unwrap();
+
+    DiskReplayStore::prepare_directory(&dir).unwrap();
+
+    assert!(!dir.join("rustreplay_segment_old.mp4").exists());
+    assert!(!dir.join("rustreplay_segment_old.rrseg.part").exists());
+    assert!(dir.join("keep.txt").exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
 fn segment(
     video_start_90k: u64,
     duration_90k: u64,
@@ -162,6 +243,17 @@ fn segment(
     }
 }
 
+fn metadata() -> EncodedReplayMetadata {
+    EncodedReplayMetadata {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+        audio_sample_rate: 48_000,
+        audio_channel_count: 2,
+    }
+}
+
 fn write_indexed_segment(
     dir: &Path,
     name: &str,
@@ -179,6 +271,7 @@ fn write_indexed_segment(
     DiskSegmentIndexedTracks {
         mp4_path,
         index: read_disk_segment_sidecar(&sidecar_path).unwrap(),
+        lease: Arc::new(()),
     }
 }
 

@@ -1,6 +1,109 @@
 use super::*;
 
 #[cfg(windows)]
+struct VplRecordRuntime<'a> {
+    api: &'a VplApi,
+    loader: MfxLoader,
+    session: MfxSession,
+    encoder_open: bool,
+}
+
+#[cfg(windows)]
+impl<'a> VplRecordRuntime<'a> {
+    unsafe fn new(api: &'a VplApi, loader: MfxLoader) -> Self {
+        Self {
+            api,
+            loader,
+            session: ptr::null_mut(),
+            encoder_open: false,
+        }
+    }
+
+    fn set_session(&mut self, session: MfxSession) {
+        self.session = session;
+    }
+
+    fn mark_encoder_open(&mut self) {
+        self.encoder_open = true;
+    }
+
+    unsafe fn shutdown(&mut self) -> (i32, i32) {
+        let encoder_status = if self.encoder_open && !self.session.is_null() {
+            self.encoder_open = false;
+            (self.api.mfx_video_encode_close)(self.session)
+        } else {
+            MFX_ERR_NONE
+        };
+        let session_status = if !self.session.is_null() {
+            let session = std::mem::replace(&mut self.session, ptr::null_mut());
+            (self.api.mfx_close)(session)
+        } else {
+            MFX_ERR_NONE
+        };
+        if !self.loader.is_null() {
+            let loader = std::mem::replace(&mut self.loader, ptr::null_mut());
+            (self.api.mfx_unload)(loader);
+        }
+        (encoder_status, session_status)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VplRecordRuntime<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+#[cfg(windows)]
+struct MfxSurfaceGuard {
+    surface: *mut MfxFrameSurface1,
+    interface: *mut MfxFrameSurfaceInterface,
+}
+
+#[cfg(windows)]
+impl MfxSurfaceGuard {
+    unsafe fn new(
+        surface: *mut MfxFrameSurface1,
+        interface: *mut MfxFrameSurfaceInterface,
+    ) -> Self {
+        Self { surface, interface }
+    }
+
+    unsafe fn release(mut self, func: &'static str) -> Result<(), BackendError> {
+        let status = self.release_raw();
+        if status == MFX_ERR_NONE {
+            Ok(())
+        } else {
+            Err(BackendError::VplStatus { func, status })
+        }
+    }
+
+    fn into_raw(mut self) -> *mut MfxFrameSurface1 {
+        std::mem::replace(&mut self.surface, ptr::null_mut())
+    }
+
+    unsafe fn release_raw(&mut self) -> i32 {
+        if self.surface.is_null() || self.interface.is_null() {
+            return MFX_ERR_NONE;
+        }
+        let surface = std::mem::replace(&mut self.surface, ptr::null_mut());
+        ((*self.interface).Release)(surface)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MfxSurfaceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.release_raw();
+        }
+    }
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_d3d11_onecopy_mp4_impl(
     adapter_index: u32,
@@ -61,9 +164,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let _thread_priority = match capture_source {
             RecordCaptureSource::Dda => RecordThreadPriorityGuard::raise(&mut notes),
             RecordCaptureSource::Wgc => {
-                notes.push(
-                    "WGC 录制主线程/FrameArrived 回调/捕获线程固定保持普通 CPU 优先级".to_owned(),
-                );
+                notes.push("WGC 录制主线程/持久 MTA 捕获服务固定保持普通 CPU 优先级".to_owned());
                 None
             }
         };
@@ -174,8 +275,8 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 "返回空 loader",
             ));
         }
+        let mut runtime = VplRecordRuntime::new(&api, loader);
         if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "录制后端初始化",
                 "用户停止请求",
@@ -185,8 +286,8 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let session_started = Instant::now();
         let mut session: MfxSession = ptr::null_mut();
         let create_status = (api.mfx_create_session)(loader, 0, &mut session);
+        runtime.set_session(session);
         if create_status != MFX_ERR_NONE || session.is_null() {
-            (api.mfx_unload)(loader);
             return Err(BackendError::VplStatus {
                 func: "MFXCreateSession",
                 status: create_status,
@@ -335,8 +436,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             break;
         }
         let Some((record_route, queried, query_status)) = selected_route else {
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "oneVPL record route Query",
                 requested_chroma.doc_label(),
@@ -376,8 +475,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         param.mfx.LowPower = MFX_CODINGOPTION_ON;
         param.mfx.TargetUsage = 7;
         if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "录制后端初始化",
                 "用户停止请求",
@@ -387,8 +484,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let init_started = Instant::now();
         let init_status = (api.mfx_video_encode_init)(session, &mut param);
         if init_status < MFX_ERR_NONE {
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::VplStatus {
                 func: "MFXVideoENCODE_Init",
                 status: init_status,
@@ -403,6 +498,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 init_started.elapsed().as_secs_f64() * 1000.0
             ),
         );
+        runtime.mark_encoder_open();
         if let Some(sink) = encoded_sink.as_deref_mut() {
             sink.video_track_started(VplOutputTrackInfo {
                 width: capture_width,
@@ -416,9 +512,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let first_get_surface_status =
             (api.mfx_memory_get_surface_for_encode)(session, &mut first_surface);
         if first_get_surface_status != MFX_ERR_NONE || first_surface.is_null() {
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "oneVPL D3D11 surface import",
                 format!(
@@ -435,15 +528,13 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
 
         let first_interface = (*first_surface).FrameInterface;
         if first_interface.is_null() {
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "oneVPL record",
                 "FrameInterface",
                 "oneVPL surface 没有 FrameInterface",
             ));
         }
+        let first_surface_guard = MfxSurfaceGuard::new(first_surface, first_interface);
         let mut first_native: MfxHDL = ptr::null_mut();
         let mut first_native_type = 0u32;
         let surface_started = Instant::now();
@@ -453,10 +544,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             &mut first_native_type,
         );
         if native_status != MFX_ERR_NONE || first_native_type != MFX_RESOURCE_DX11_TEXTURE {
-            let _ = ((*first_interface).Release)(first_surface);
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::VplStatus {
                 func: "mfxFrameSurfaceInterface::GetNativeHandle",
                 status: native_status,
@@ -464,10 +551,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         }
         let Some(first_target) = <ID3D11Texture2D as Interface>::from_raw_borrowed(&first_native)
         else {
-            let _ = ((*first_interface).Release)(first_surface);
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "oneVPL record",
                 "native texture",
@@ -492,10 +575,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             &mut device_type,
         );
         if device_status != MFX_ERR_NONE || device_type != MFX_HANDLE_D3D11_DEVICE {
-            let _ = ((*first_interface).Release)(first_surface);
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::VplStatus {
                 func: "mfxFrameSurfaceInterface::GetDeviceHandle",
                 status: device_status,
@@ -503,10 +582,6 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         }
         let Some(vpl_device) = <ID3D11Device as Interface>::from_raw_borrowed(&device_handle)
         else {
-            let _ = ((*first_interface).Release)(first_surface);
-            let _ = (api.mfx_video_encode_close)(session);
-            let _ = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
             return Err(BackendError::unsupported(
                 "oneVPL record",
                 "device handle",
@@ -590,6 +665,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         }
 
         let mut samples = Vec::new();
+        let mut encoded_stats = RecordHevcStats::default();
         let retain_output_samples = write_output_mp4 || encoded_sink.is_none();
         let mut captured_frames = 0u32;
         let mut warmup_encoded_frames = 0u32;
@@ -599,7 +675,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let mut conversion_ready = false;
         let format_flags_in = 0u32;
         let format_flags_out = 0u32;
-        let mut pending_surface = Some(first_surface);
+        let mut pending_surface = Some(first_surface_guard.into_raw());
         let mut in_flight: VecDeque<Box<AsyncEncode>> =
             VecDeque::with_capacity(record_async_depth as usize);
         let mut bitstream_pool: Vec<Vec<u8>> = Vec::with_capacity(record_async_depth as usize);
@@ -685,6 +761,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     free_rx,
                 ),
             };
+            let mut capture_thread = CaptureThreadGuard::new(stop.clone(), capture_handle);
             sink_status(
                 &mut encoded_sink,
                 format!(
@@ -740,6 +817,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     sample,
                                     &mut encoded_sink,
                                     retain_output_samples,
+                                    &mut encoded_stats,
                                 ),
                                 TrySyncResult::Ready(None) => break,
                                 TrySyncResult::NotReady => break,
@@ -891,17 +969,12 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     "oneVPL surface 没有 FrameInterface",
                                 ));
                             }
-                            let (target, surface_cache_hit) = match cached_vpl_surface_texture(
+                            let surface_guard = MfxSurfaceGuard::new(surface, frame_interface);
+                            let (target, surface_cache_hit) = cached_vpl_surface_texture(
                                 surface,
                                 &mut surface_texture_cache,
                                 surface_cache_enabled,
-                            ) {
-                                Ok(texture) => texture,
-                                Err(err) => {
-                                    let _ = ((*frame_interface).Release)(surface);
-                                    return Err(err);
-                                }
-                            };
+                            )?;
                             if surface_cache_hit {
                                 perf.surface_cache_hits = perf.surface_cache_hits.saturating_add(1);
                             } else {
@@ -910,14 +983,16 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                             }
                             perf.surface.add(surface_started.elapsed());
 
+                            let mut keyed_mutex_guard = None;
                             let conversion_source = match &slot {
                                 CaptureFrameSlot::Shared(shared) => {
-                                    shared.encoder_mutex.AcquireSync(1, 1_000).map_err(|err| {
-                                        BackendError::WindowsApi {
-                                            func: "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
-                                            message: err.to_string(),
-                                        }
-                                    })?;
+                                    keyed_mutex_guard = Some(KeyedMutexGuard::acquire(
+                                        &shared.encoder_mutex,
+                                        1,
+                                        0,
+                                        1_000,
+                                        "IDXGIKeyedMutex::AcquireSync(encoder snapshot)",
+                                    )?);
                                     shared.encoder_texture.clone()
                                 }
                                 CaptureFrameSlot::WgcLocal(local) => local.texture.clone(),
@@ -960,16 +1035,17 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                             match &slot {
                                 CaptureFrameSlot::Shared(shared) => {
                                     shared.encoder_fence.mark(&immediate);
-                                    shared.encoder_mutex.ReleaseSync(0).map_err(|err| {
-                                        BackendError::WindowsApi {
-                                            func: "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
-                                            message: err.to_string(),
-                                        }
-                                    })?;
+                                    keyed_mutex_guard
+                                        .take()
+                                        .expect("shared snapshot owns keyed mutex guard")
+                                        .release(
+                                            "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
+                                        )?;
                                 }
                                 CaptureFrameSlot::WgcLocal(_) => {}
                             }
                             perf.source_fence.add(fence_started.elapsed());
+                            drop(keyed_mutex_guard);
                             conversion_result?;
                             if return_wgc_slot_immediately {
                                 // WGC producer and encoder consumer share this immediate context.
@@ -1006,6 +1082,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                                 sample,
                                                 &mut encoded_sink,
                                                 retain_output_samples,
+                                                &mut encoded_stats,
                                             );
                                         }
                                     }
@@ -1026,13 +1103,8 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     true,
                                 )?;
                                 perf.submit.add(warmup_submit_started.elapsed());
-                                let release_status = ((*frame_interface).Release)(surface);
-                                if release_status != MFX_ERR_NONE {
-                                    return Err(BackendError::VplStatus {
-                                        func: "mfxFrameSurfaceInterface::Release(warmup)",
-                                        status: release_status,
-                                    });
-                                }
+                                surface_guard
+                                    .release("mfxFrameSurfaceInterface::Release(warmup)")?;
                                 if let Some(submitted) = submitted {
                                     in_flight.push_back(submitted);
                                 }
@@ -1050,6 +1122,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                                 sample,
                                                 &mut encoded_sink,
                                                 retain_output_samples,
+                                                &mut encoded_stats,
                                             );
                                         }
                                     }
@@ -1068,6 +1141,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                                     sample,
                                                     &mut encoded_sink,
                                                     retain_output_samples,
+                                                    &mut encoded_stats,
                                                 )
                                             }
                                             TrySyncResult::Ready(None) => break,
@@ -1110,6 +1184,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                             sample,
                                             &mut encoded_sink,
                                             retain_output_samples,
+                                            &mut encoded_stats,
                                         );
                                     }
                                 }
@@ -1130,13 +1205,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 false,
                             )?;
                             perf.submit.add(submit_started.elapsed());
-                            let release_status = ((*frame_interface).Release)(surface);
-                            if release_status != MFX_ERR_NONE {
-                                return Err(BackendError::VplStatus {
-                                    func: "mfxFrameSurfaceInterface::Release",
-                                    status: release_status,
-                                });
-                            }
+                            surface_guard.release("mfxFrameSurfaceInterface::Release")?;
                             if let Some(submitted) = submitted {
                                 in_flight.push_back(submitted);
                             }
@@ -1154,6 +1223,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                         sample,
                                         &mut encoded_sink,
                                         retain_output_samples,
+                                        &mut encoded_stats,
                                     ),
                                     TrySyncResult::Ready(None) => break,
                                     TrySyncResult::NotReady => break,
@@ -1171,6 +1241,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                         sample,
                                         &mut encoded_sink,
                                         retain_output_samples,
+                                        &mut encoded_stats,
                                     );
                                 }
                             }
@@ -1190,7 +1261,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                         })();
                         if let Err(err) = frame_result {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = capture_handle.join();
+                            capture_thread.stop_and_join();
                             return Err(err);
                         }
                     }
@@ -1207,7 +1278,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             return_ready_snapshot_slots(&mut pending_free_slots, &immediate, &free_tx, true)?;
-            let _ = capture_handle.join();
+            capture_thread.stop_and_join();
             if let Some(message) = capture_error {
                 return Err(BackendError::unsupported(
                     "DDA capture thread",
@@ -1252,6 +1323,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                         sample,
                         &mut encoded_sink,
                         retain_output_samples,
+                        &mut encoded_stats,
                     ),
                     TrySyncResult::Ready(None) => break,
                     TrySyncResult::NotReady => std::thread::sleep(Duration::from_millis(1)),
@@ -1261,9 +1333,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 capture.stop_without_reencode(&mut notes);
             }
             surface_texture_cache.clear();
-            let close_status = (api.mfx_video_encode_close)(session);
-            let mfx_close_status = (api.mfx_close)(session);
-            (api.mfx_unload)(loader);
+            let (close_status, mfx_close_status) = runtime.shutdown();
             sink_status(
                 &mut encoded_sink,
                 format!(
@@ -1282,6 +1352,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             ));
         }
 
+        if let Some(surface) = pending_surface.take() {
+            let frame_interface = (*surface).FrameInterface;
+            if !frame_interface.is_null() {
+                MfxSurfaceGuard::new(surface, frame_interface)
+                    .release("mfxFrameSurfaceInterface::Release(unused pending surface)")?;
+            }
+        }
+
         while !in_flight.is_empty() {
             if let Some(sample) =
                 sync_one_async_encode(&api, session, &mut in_flight, &mut bitstream_pool)?
@@ -1291,6 +1369,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     sample,
                     &mut encoded_sink,
                     retain_output_samples,
+                    &mut encoded_stats,
                 );
             }
         }
@@ -1300,16 +1379,16 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             &mut samples,
             &mut encoded_sink,
             retain_output_samples,
+            &mut encoded_stats,
         )?;
         let duration_90k = encoded_timeline_duration_90k(
             &samples,
+            encoded_stats.last_timestamp_90k,
             requested_duration_90k,
             !capture_source.is_wgc(),
         );
         surface_texture_cache.clear();
-        let close_status = (api.mfx_video_encode_close)(session);
-        let mfx_close_status = (api.mfx_close)(session);
-        (api.mfx_unload)(loader);
+        let (close_status, mfx_close_status) = runtime.shutdown();
         if mfx_close_status != MFX_ERR_NONE {
             return Err(BackendError::VplStatus {
                 func: "MFXClose",
@@ -1317,20 +1396,9 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             });
         }
 
-        let encoded_samples = samples
-            .iter()
-            .filter(|sample| !sample.discard_from_track)
-            .count()
-            .min(u32::MAX as usize) as u32;
-        let encoded_bytes = samples
-            .iter()
-            .filter(|sample| !sample.discard_from_track)
-            .map(|s| s.data.len() as u64)
-            .sum();
-        let discarded_header_units = samples
-            .iter()
-            .filter(|sample| sample.discard_from_track)
-            .count();
+        let encoded_samples = encoded_stats.encoded_samples;
+        let encoded_bytes = encoded_stats.encoded_bytes;
+        let discarded_header_units = encoded_stats.discarded_header_units;
         if encoded_samples == 0 {
             return Err(BackendError::unsupported(
                 "oneVPL encode",

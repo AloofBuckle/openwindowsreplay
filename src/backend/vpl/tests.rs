@@ -77,21 +77,6 @@ fn dll_candidates_include_env_first() {
 }
 
 #[test]
-#[cfg(windows)]
-fn wgc_queue_depth_counter_saturates_instead_of_panicking() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let depth = AtomicUsize::new(0);
-    assert_eq!(atomic_queue_depth_decrement(&depth), 0);
-    assert_eq!(atomic_queue_depth_increment(&depth), 1);
-    assert_eq!(atomic_queue_depth_decrement(&depth), 0);
-
-    depth.store(usize::MAX, Ordering::Relaxed);
-    assert_eq!(atomic_queue_depth_increment(&depth), usize::MAX);
-    assert_eq!(depth.load(Ordering::Relaxed), usize::MAX);
-}
-
-#[test]
 fn wgc_timestamp_quantization_exposes_sub_tick_duplicates() {
     assert_eq!(wgc_timestamp_from_origin_90k(1, 0), 0);
     assert_eq!(wgc_timestamp_from_origin_90k(55, 0), 0);
@@ -150,6 +135,27 @@ fn rate_control_config_writes_union_and_ext_fields() {
 
 #[cfg(windows)]
 fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
+    #[derive(Default)]
+    struct SmokeStatusSink {
+        video: Vec<crate::backend::mp4_mux::HevcAccessUnit>,
+    }
+    impl VplOneCopyRecordSink for SmokeStatusSink {
+        fn status(&mut self, message: &str) {
+            println!("smoke status: {message}");
+        }
+
+        fn video_track_started(&mut self, _info: VplOutputTrackInfo) {}
+        fn hevc_access_unit(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit) {
+            self.video.push(sample.clone());
+        }
+        fn aac_access_unit(&mut self, _sample: &crate::backend::mp4_mux::AacAccessUnit) {}
+    }
+
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
     // 手动短测时桌面可能完全静止，WGC 只在变化时产帧；把 warmup 缩短到 0
     // 只影响本 ignored 测试，生产默认仍使用较保守的 warmup。
     unsafe {
@@ -214,6 +220,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
         method: RateControlMethod::Cbr,
         ..RateControlConfig::default()
     };
+    let mut sink = SmokeStatusSink::default();
     let record_result = match capture_source {
         RecordCaptureSource::Dda => record_nvenc_d3d11_onecopy_memory_output_with_sink_cancelable(
             route_plan.adapter_index,
@@ -222,7 +229,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
             &rate_control,
             ChromaSampling::Yuv420,
             None,
-            None,
+            Some(&mut sink),
             Some(route_plan),
         ),
         RecordCaptureSource::Wgc => {
@@ -233,7 +240,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
                 &rate_control,
                 ChromaSampling::Yuv420,
                 None,
-                None,
+                Some(&mut sink),
                 Some(route_plan),
             )
         }
@@ -242,7 +249,15 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
     if let Some(cursor_thread) = cursor_thread {
         let _ = cursor_thread.join();
     }
-    let recorded = record_result.unwrap();
+    let mut recorded = record_result.unwrap();
+    if !recorded
+        .video_track
+        .samples
+        .iter()
+        .any(|sample| !sample.discard_from_track)
+    {
+        recorded.video_track.samples = std::mem::take(&mut sink.video);
+    }
     crate::backend::mp4_mux::write_hevc_aac_mp4(
         &path,
         &recorded.video_track,
@@ -264,11 +279,29 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
 #[test]
 #[ignore = "需要本机 NVIDIA 驱动、D3D11 桌面会话和可捕获桌面；手动验证 NVENC WGC 生产录制路径"]
 fn local_nvenc_wgc_d3d11_record_smoke() {
-    run_local_nvenc_d3d11_record_smoke(RecordCaptureSource::Wgc);
+    let repeats = std::env::var("RUST_REPLAY_NVENC_SMOKE_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100);
+    for repeat in 0..repeats {
+        println!("NVENC WGC repeat {}/{} start", repeat + 1, repeats);
+        run_local_nvenc_d3d11_record_smoke(RecordCaptureSource::Wgc);
+        println!("NVENC WGC repeat {}/{} done", repeat + 1, repeats);
+    }
 }
 
 #[test]
 #[ignore = "需要本机 NVIDIA 驱动、D3D11 桌面会话和可捕获桌面；手动验证 NVENC DDA 生产录制路径"]
 fn local_nvenc_dda_d3d11_record_smoke() {
-    run_local_nvenc_d3d11_record_smoke(RecordCaptureSource::Dda);
+    let repeats = std::env::var("RUST_REPLAY_NVENC_SMOKE_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100);
+    for repeat in 0..repeats {
+        println!("NVENC DDA repeat {}/{} start", repeat + 1, repeats);
+        run_local_nvenc_d3d11_record_smoke(RecordCaptureSource::Dda);
+        println!("NVENC DDA repeat {}/{} done", repeat + 1, repeats);
+    }
 }

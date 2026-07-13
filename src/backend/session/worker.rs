@@ -20,7 +20,7 @@ pub(super) fn run_recording_worker(
     });
     let mut disk_writer = disk_store
         .clone()
-        .map(|store| DiskSegmentWriter::spawn(store, tx.clone()));
+        .map(|store| DiskSegmentWriter::spawn(store, tx.clone(), stop_flag.clone()));
     let mut run_index = 0u64;
     while !stop_flag.load(Ordering::Relaxed) {
         let output_dir = cache_dir.as_ref().unwrap_or(&save_dir);
@@ -54,12 +54,13 @@ pub(super) fn run_recording_worker(
                         ));
                         return;
                     };
-                    ReplayRecordSink::Disk(DiskSegmentSink::new(
+                    ReplayRecordSink::Disk(Box::new(DiskSegmentSink::new(
                         writer_tx,
                         tx.clone(),
                         run_index,
                         replay_duration,
-                    ))
+                        stop_flag.clone(),
+                    )))
                 }
             };
             let result = pipeline::record_once_gpu_only_memory_output_with_sink_cancelable(
@@ -120,6 +121,11 @@ pub(super) fn run_recording_worker(
                 if let Some(writer) = disk_writer.take() {
                     writer.shutdown();
                 }
+                if let Some(store) = &disk_store
+                    && let Ok(mut store) = store.lock()
+                {
+                    let _ = store.clear_segments();
+                }
                 let _ = tx.send(ReplayEvent::Error(err.to_string()));
                 return;
             }
@@ -129,12 +135,30 @@ pub(super) fn run_recording_worker(
     if let Some(writer) = disk_writer.take() {
         writer.shutdown();
     }
+    if let Some(store) = &disk_store {
+        match store.lock() {
+            Ok(mut store) => {
+                if let Err(err) = store.clear_segments() {
+                    let _ = tx.send(ReplayEvent::BackendStatus {
+                        index: run_index,
+                        message: format!("停止后清理磁盘循环缓存失败：{err}"),
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = tx.send(ReplayEvent::BackendStatus {
+                    index: run_index,
+                    message: "停止后无法清理磁盘循环缓存：store 锁已中毒".to_owned(),
+                });
+            }
+        }
+    }
     let _ = tx.send(ReplayEvent::Stopped);
 }
 
 pub(super) enum ReplayRecordSink {
     Memory(SessionRingSink),
-    Disk(DiskSegmentSink),
+    Disk(Box<DiskSegmentSink>),
 }
 
 impl ReplayRecordSink {

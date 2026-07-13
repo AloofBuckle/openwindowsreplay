@@ -185,6 +185,7 @@ pub(super) fn wgc_timestamp_from_origin_90k(timestamp_100ns: i64, origin_100ns: 
 
 pub(super) fn encoded_timeline_duration_90k(
     samples: &[crate::backend::mp4_mux::HevcAccessUnit],
+    last_timestamp_90k: Option<u64>,
     fallback_90k: u64,
     extend_to_fallback: bool,
 ) -> u64 {
@@ -193,11 +194,15 @@ pub(super) fn encoded_timeline_duration_90k(
     // its VFR timeline is defined by accepted WGC SystemRelativeTime samples,
     // so an early stop should produce a shorter source-derived track instead
     // of stretching the last sample to an external wall-clock/CFR target.
-    let source_end_90k = samples
-        .iter()
-        .rev()
-        .find(|sample| !sample.discard_from_track)
-        .map(|sample| sample.timestamp_90k.saturating_add(1))
+    let source_end_90k = last_timestamp_90k
+        .or_else(|| {
+            samples
+                .iter()
+                .rev()
+                .find(|sample| !sample.discard_from_track)
+                .map(|sample| sample.timestamp_90k)
+        })
+        .map(|timestamp| timestamp.saturating_add(1))
         .unwrap_or(fallback_90k);
     if extend_to_fallback {
         source_end_90k.max(fallback_90k).max(1)

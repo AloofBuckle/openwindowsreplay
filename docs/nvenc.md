@@ -1,6 +1,6 @@
-# NVENC 兼容 fork 工作记录
+# NVENC 兼容后端合并记录
 
-本 fork 的目标是在保留现有 oneVPL 自动适配能力的前提下，增加 NVIDIA NVENC 后端，并由能力探测自动区分/选择 oneVPL 与 NVENC。
+该后端已合并到主线。在保留 oneVPL 自动适配能力的前提下，程序会探测 NVIDIA NVENC，并由统一能力探测结果自动选择 oneVPL 或 NVENC。
 
 ## 当前已落地
 
@@ -17,7 +17,7 @@
     - `splitEncodeMode`：SDK 全部原始值 `0/1/2/3/4/15`。该字段不是驱动枚举项；`NV_ENC_CAPS_NUM_ENCODER_ENGINES` 只用于向用户说明实际条带数，请求 3/4 条带但硬件 engine 更少时会退化到实际 engine 数。
     - `multiPass`：SDK 原始值 `0/1/2`，分别对应 disabled、quarter-resolution two-pass、full-resolution two-pass。
     - Spatial AQ：直接控制 `NV_ENC_RC_PARAMS::enableAQ`，AQ strength 保持 0，由驱动自动选择强度。
-  - 默认值保持本 fork 原有编码行为：P4、split Auto、single pass、Spatial AQ 关闭。旧配置里的 Temporal AQ/AQ strength 会被清零，不作为允许用户修改的额外调参。
+  - 默认值保持 NVENC 后端原有编码行为：P4、split Auto、single pass、Spatial AQ 关闭。旧配置里的 Temporal AQ/AQ strength 会被清零，不作为允许用户修改的额外调参。
   - Preset 主标签直接显示 P1-P7；split/multipass 使用“人话名称 | SDK 常量 = 原始值”的格式，并在悬停说明中解释实际条带退化和二遍首遍分辨率。
   - `tuningInfo` 是另一组独立参数；SDK 13.1 还定义 HQ、Low Latency、Ultra Low Latency、Lossless 与 Ultra High Quality。本项目即时回放路径固定使用 `NV_ENC_TUNING_INFO_LOW_LATENCY (2)`，不把它加入用户指定的额外调参集合。
   - Encoder 初始化先以所选 preset 和 low-latency tuning 调用 `NvEncGetEncodePresetConfigEx` 获取驱动基线，再只覆盖本项目拥有的 profile/chroma/bit-depth、低延迟、VUI 和码控字段，避免把 preset 其余参数全部抹成零。
@@ -72,7 +72,7 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 cargo test --locked --target x86_64-pc-windows-msvc
 ```
 
-通过：62 passed，11 ignored（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
+通过：69 passed，11 ignored（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
 
 ## NVENC 码控暴露与测试范围
 
@@ -86,6 +86,9 @@ cargo test --locked --target x86_64-pc-windows-msvc
 ## 已生产化的 NVENC 链路
 
 - `src/backend/vpl.rs` 复用现有 DDA/WGC capture、GPU route converter、WASAPI/AAC、encoded ring 与 MP4 mux，只把编码段替换成 NVENC registered-resource。
+- WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
+- DDA 保持独立 capture device。捕获线程把 route 输出写入 keyed shared snapshot，编码线程再执行一次 GPU `CopyResource` 到普通 NVENC registered input；这是当前 NVIDIA 驱动拒绝 keyed shared texture 直接注册后的兼容路线。
+- NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
 - 当前 production-ready 范围：
   - SDR/8-bit current-display route -> NV12 / HEVC Main
   - HDR PQ 或 10-bit current-display route -> P010 / HEVC Main10
@@ -126,28 +129,43 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 - NVENC HEVC/D3D11/current-display route 完整，`production_ready=true`。
 - `probe_all()` 最终选择 `NVENC`；纯单元测试同时验证两者都 ready 时优先 oneVPL。
 
-NVENC 真实生产录制冒烟（当前 HDR PQ BT.2020 full 桌面，WGC -> P010 -> NVENC -> MP4 mux）：
+NVENC 真实生产录制冒烟（当前 3840x2160、170 Hz、HDR PQ BT.2020 full 桌面）：
 
 ```powershell
-cargo test --locked --target x86_64-pc-windows-msvc backend::vpl::tests::local_nvenc_d3d11_record_smoke -- --ignored --nocapture
+$env:RUST_REPLAY_NVENC_SMOKE_REPEATS='5'
+$env:RUST_REPLAY_NVENC_SMOKE_SECONDS='3'
+cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::tests::local_nvenc_wgc_d3d11_record_smoke -- --ignored --nocapture --test-threads=1
+
+$env:RUST_REPLAY_NVENC_SMOKE_REPEATS='1'
+cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::tests::local_nvenc_dda_d3d11_record_smoke -- --ignored --nocapture --test-threads=1
 ```
 
 结果摘要：
 
-- route：P010 / HEVC Main10 / BT.2020 PQ full
-- captured_frames=820
-- encoded_samples=820
-- encoded_bytes=2187479
-- audio_access_units=237
-- 输出 HEVC/AAC track 可成功 mux 成 MP4
+- 两条 route 均为 P010 / HEVC Main10 / BT.2020 PQ full，并带 AAC LC。
+- WGC 连续 5 次开始/结束均通过；每次 3 秒得到 511 个视频 AU，`dropped_no_slot=0`、`dropped_queue_full=0`。首次 NVENC device/session 初始化约 35 ms，后续约 5-6 ms。
+- DDA 3 秒冒烟通过，成功产生 4K HDR HEVC/AAC MP4；独立 capture device、输入桌面绑定和 `DuplicateOutput1` 重试路径均实际运行。
+- `ffprobe` 识别为 HEVC Main10、`yuv420p10le`、BT.2020/PQ/full-range；WGC 与 DDA 文件均可由 ffmpeg 完整解码为 rawvideo，未发现 HEVC 解码错误。
+- DDA 在仅靠测试光标触发画面变化时，驱动可能把积累更新以极短源时间戳间隔突发交付。这是 DDA `LastPresentTime` 的源端节奏，不由 NVENC 合成 CFR；真实动态桌面仍需按目标设备长跑审计。
+
+## 合并后的可靠性修复
+
+- keyed mutex 改为检查原始 HRESULT，并用 guard 保证所有错误路径都释放；`WAIT_TIMEOUT` 和 `WAIT_ABANDONED` 均视为失败。
+- oneVPL loader/session/encoder/surface、capture thread 和共享 HANDLE 增加 RAII 清理；GPU event query 等待会检查 device removed，并在 2 秒后超时。
+- encoded ring 分离音视频有序队列，支持乱序音频裁剪、按时间戳合并快照、codec epoch 清空和真实关键帧起点校验。
+- MP4 mux 不再强制把首样本标为 sync；非 IDR/CRA 起始的视频会被拒绝。
+- 磁盘 writer 改为容量 3 的有界队列；队列满或 writer 失败会终止会话。分段、sidecar 和最终 replay 输出均通过 `.part` 事务写入。
 
 ## 明确边界 / 后续可选增强
 
 1. NVENC `NV_ENC_CONFIG` 已补齐 production 必需的 HEVC profile/chroma/bit-depth、IP-only/low-latency 初始化，并写入 CBR/VBR/CQP、VBV、Spatial AQ 与 VBR targetQuality；Preset、split encode 与 multipass 已按原始 SDK 值在 GUI 暴露。Lookahead 在延迟输出队列完成前隐藏；Temporal AQ/AQ strength 不属于允许用户修改的额外调参。
 2. 4:2:2 NV16/P210 与 planar 4:4:4 缺少本项目可证明的原生 D3D11 texture layout，保持 probe-only；未来若接入 CUDA interop 或 NVIDIA 给出可验证 D3D11 layout，再单独生产化。
 3. NVENC caps 报告 async=true，但当前编码器采用同步 registered-resource 提交；捕获 snapshot pool 与编码线程已解耦，本机 240 Hz 实录 `encode_submit` 平均约 2.2 ms。后续如引入 completion event + 多 bitstream buffer，需要保持现有 VFR 时间戳与停止语义。
-4. WGC 在静态桌面短测中可能因为 warmup 与“仅变化产帧”导致短时间无正式帧；生产长跑不改默认 warmup，手动 ignored smoke 使用环境变量把 warmup 缩短到 0，并在测试期间轻微移动鼠标来触发 WGC 帧，以验证链路。
-5. DDA 在当前 HDR/FP16 桌面上可能因 `DuplicateOutput1` FP16 不受支持而返回 `UnsupportedGpuPath`；这保持不伪装 SDR、不 CPU fallback 的策略。WGC 是当前 HDR 桌面的已验证路径。
+4. WGC 使用 500 us polling 获取 `TryGetNextFrame`，同时保留 WGC `SystemRelativeTime` 的 VFR 时间戳。短测已稳定，仍应在目标硬件上做长时间 4K/高刷新性能验证。
+5. DDA 的 keyed shared snapshot 不能直接注册为 NVENC input，当前保留一次同 GPU `CopyResource`。该路径不做 CPU readback，也不伪装成零拷贝。
+6. adapter/output 选择目前仍主要使用索引 0；多 GPU、非主输出和旋转显示器需要单独补齐选择与坐标验证。
+7. capture slot 固定为 32。正常 WGC/DDA 冒烟没有耗尽，但尚未按分辨率、刷新率和显存预算动态调整。
+8. 用户主动停止在底层仍通过 `BackendError` 表达；上层已有停止状态规避误报，但后续应引入独立的正常退出类型。
 
 ## 约束不变
 

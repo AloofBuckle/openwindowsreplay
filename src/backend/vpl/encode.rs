@@ -176,12 +176,34 @@ pub(super) fn sink_status(
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct RecordHevcStats {
+    pub(super) encoded_samples: u32,
+    pub(super) encoded_bytes: u64,
+    pub(super) discarded_header_units: u32,
+    pub(super) last_timestamp_90k: Option<u64>,
+}
+
+impl RecordHevcStats {
+    fn observe(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit) {
+        if sample.discard_from_track {
+            self.discarded_header_units = self.discarded_header_units.saturating_add(1);
+        } else {
+            self.encoded_samples = self.encoded_samples.saturating_add(1);
+            self.encoded_bytes = self.encoded_bytes.saturating_add(sample.data.len() as u64);
+            self.last_timestamp_90k = Some(sample.timestamp_90k);
+        }
+    }
+}
+
 pub(super) fn push_record_hevc_sample(
     samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
     sample: crate::backend::mp4_mux::HevcAccessUnit,
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     retain_sample: bool,
+    stats: &mut RecordHevcStats,
 ) {
+    stats.observe(&sample);
     if let Some(sink) = encoded_sink.as_deref_mut() {
         sink.hevc_access_unit(&sample);
     }
@@ -471,6 +493,7 @@ pub(super) unsafe fn flush_encoder(
     samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     retain_output_samples: bool,
+    stats: &mut RecordHevcStats,
 ) -> Result<u32, BackendError> {
     let mut skipped_non_monotonic = 0u32;
     loop {
@@ -480,7 +503,10 @@ pub(super) unsafe fn flush_encoder(
         }
         if !encoded.bytes.is_empty() {
             let last_timestamp = samples.last().map(|sample| sample.timestamp_90k);
-            let last_timestamp = last_track_timestamp_90k(samples).or(last_timestamp);
+            let last_timestamp = stats
+                .last_timestamp_90k
+                .or_else(|| last_track_timestamp_90k(samples))
+                .or(last_timestamp);
             let timestamp_90k = encoded.timestamp_90k;
             if let Some(last) = last_timestamp
                 && timestamp_90k <= last
@@ -499,6 +525,7 @@ pub(super) unsafe fn flush_encoder(
                 },
                 encoded_sink,
                 retain_output_samples,
+                stats,
             );
         } else {
             break;

@@ -105,6 +105,31 @@ fn hevc_annex_b_detects_sync_and_extracts_parameter_sets() {
 }
 
 #[test]
+fn video_track_rejects_non_key_first_sample() {
+    let mut non_key = Vec::new();
+    append_fake_nal(&mut non_key, 32, &[1, 2, 3]);
+    append_fake_nal(&mut non_key, 33, &[4, 5, 6]);
+    append_fake_nal(&mut non_key, 34, &[7, 8, 9]);
+    append_fake_nal(&mut non_key, 1, &[10, 11, 12]);
+    let track = HevcMp4Track {
+        width: 16,
+        height: 16,
+        duration_90k: 90_000,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+        samples: vec![HevcAccessUnit {
+            timestamp_90k: 0,
+            data: non_key.into(),
+            is_sync: false,
+            discard_from_track: false,
+        }],
+    };
+
+    let err = writer::prepare_video_track(&track).unwrap_err();
+    assert!(err.to_string().contains("不是 IDR/CRA 关键帧"));
+}
+
+#[test]
 fn mdat_header_switches_to_large_size() {
     let small = make_mdat_header(4);
     assert_eq!(&small[0..4], &12u32.to_be_bytes());

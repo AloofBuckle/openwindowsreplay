@@ -268,8 +268,15 @@ pub(super) fn prepare_video_track(
         converted.push(PreparedSample {
             duration_90k,
             data: SamplePayload::Memory(data.into()),
-            is_sync: sample.is_sync || is_sync || converted.is_empty(),
+            is_sync: sample.is_sync || is_sync,
         });
+    }
+    if !converted.first().is_some_and(|sample| sample.is_sync) {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "HEVC video track",
+            "首个可播放视频 sample 不是 IDR/CRA 关键帧，拒绝生成不可独立解码的 MP4",
+        ));
     }
     let prepared_duration_90k = converted
         .iter()
