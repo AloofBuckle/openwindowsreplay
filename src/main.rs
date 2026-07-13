@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod config;
+mod embedded_vpl;
 mod error;
 mod hotkey;
 mod indicator_overlay;
@@ -26,11 +27,12 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     set_process_dpi_awareness();
-    let Some(single_instance) = single_instance::SingleInstance::acquire()
-        .map_err(|err| anyhow::anyhow!(err))?
+    let Some(single_instance) =
+        single_instance::SingleInstance::acquire().map_err(|err| anyhow::anyhow!(err))?
     else {
         return Ok(());
     };
+    embedded_vpl::ensure_installed().map_err(anyhow::Error::msg)?;
 
     let start_to_tray = AppConfig::load_from_disk()
         .ok()

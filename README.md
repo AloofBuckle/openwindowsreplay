@@ -7,9 +7,9 @@ RustReplay 是一个 Windows 桌面即时回放程序，GUI 使用 `egui/eframe`
 - 启动即打开中文 GUI；不保留调试命令行、无窗口探测或自检入口。
 - GUI：开始/保存/停止即时回放、DDA/WGC 捕获后端、色度采样、oneVPL RateControlMethod 引导式参数、循环缓存目录/保存目录/回放时长、双日志区。
 - 启动能力探测：DXGI adapter LUID、oneVPL dispatcher/implementation、HEVC profile、输入 FourCC、RateControlMethod、当前显示器可生产路线。
-- 前端规则：当前机器/路径不可用的字段直接隐藏；详细原因写入日志。配置自动保存到 `%APPDATA%\RustReplay\config.json`。
+- 前端规则：当前机器/路径不可用的字段直接隐藏；详细原因写入日志。配置自动保存到 `%ProgramData%\OneVPL Replay\config.json`。
 - 视频生产路线：DDA texture 或 WGC BGRA8/FP16 → GPU shader/VideoProcessor 转换到目标 FourCC → 一次 GPU `CopyResource` 写入 oneVPL 内部分配 D3D11 surface → HEVC → MP4。
-- 发布规则：发布包包含 `rust_replay.exe`，并打包 `libvpl.dll` / `libvpl-2.dll` 等用户态依赖；GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提。
+- 发布规则：oneVPL dispatcher 及其用户态运行库内嵌于 `rust_replay.exe`，启动时释放到 `%ProgramData%\OneVPL Replay\`；发布目录不携带 DLL。GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提。
 - 色彩策略：按当前显示器状态与 DDA/WGC 实际给到的数据做高保真；未实现或不能保证的桌面模式返回 `UnsupportedGpuPath`，原因包含 `不支持的桌面模式`，不会伪装降级。
 - 位深策略：丢弃 12-bit 路线，只保留内部 8-bit / 10-bit。
 - 光标策略：DDA 不录光标；WGC 录光标。
@@ -30,7 +30,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-输出：`dist/RustReplay.zip`。脚本会把 `rust_replay.exe` 和找到的 oneVPL 用户态 DLL 放入 `dist/RustReplay/`。
+输出：`dist/RustReplay.zip`。脚本在构建时把找到的 oneVPL dispatcher 及相邻用户态运行库嵌入 `rust_replay.exe`，`dist/RustReplay/` 中不再放置 DLL。
 
 ## 不可能形成桌面同步路径时的行为
 

@@ -7,7 +7,7 @@
 //! `CopyResource` 写入 oneVPL 内部分配的 D3D11 surface，不保留旧外部 surface 导入或 0 拷贝分支。
 
 use crate::backend::mp4_mux::{HevcCodecMetadata, NclxColorMetadata};
-use crate::config::ChromaSampling;
+use crate::config::{AppConfig, ChromaSampling};
 use crate::error::BackendError;
 use crate::rate_control::{RateControlConfig, RateControlMethod};
 use libloading::Library;
@@ -1133,7 +1133,7 @@ impl VplApi {
     fn load() -> Result<(Self, PathBuf), String> {
         let mut attempts = Vec::new();
         for path in candidate_dlls() {
-            let result = unsafe { Library::new(&path) };
+            let result = unsafe { load_library(&path) };
             match result {
                 Ok(library) => {
                     let api = unsafe {
@@ -1226,7 +1226,15 @@ impl VplApi {
                     };
                     return Ok((api, path));
                 }
-                Err(err) => attempts.push(format!("{}: {err}", path.display())),
+                Err(err) => {
+                    attempts.push(format!("{}: {err}", path.display()));
+                    if path == AppConfig::vpl_dll_path() {
+                        return Err(format!(
+                            "内嵌 oneVPL dispatcher 加载失败，不允许回退系统 DLL：{}",
+                            attempts.join(" | ")
+                        ));
+                    }
+                }
             }
         }
         Err(format!(
@@ -1236,11 +1244,35 @@ impl VplApi {
     }
 }
 
+#[cfg(windows)]
+unsafe fn load_library(path: &Path) -> Result<Library, libloading::Error> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        Library as WindowsLibrary,
+    };
+
+    if path.is_absolute() {
+        WindowsLibrary::load_with_flags(
+            path,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+        .map(Into::into)
+    } else {
+        Library::new(path)
+    }
+}
+
+#[cfg(not(windows))]
+unsafe fn load_library(path: &Path) -> Result<Library, libloading::Error> {
+    Library::new(path)
+}
+
 fn candidate_dlls() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(path) = std::env::var("RUSTREPLAY_VPL_DLL") {
         out.push(PathBuf::from(path));
     }
+    out.push(AppConfig::vpl_dll_path());
     out.extend([
         PathBuf::from("libvpl-2.dll"),
         PathBuf::from("libvpl.dll"),
@@ -11014,7 +11046,15 @@ mod tests {
 
     #[test]
     fn dll_candidates_include_env_first() {
-        assert!(candidate_dlls().iter().any(|p| p.ends_with("libvpl-2.dll")));
+        let candidates = candidate_dlls();
+        let expected_config_index = if let Ok(path) = std::env::var("RUSTREPLAY_VPL_DLL") {
+            assert_eq!(candidates[0], PathBuf::from(path));
+            1
+        } else {
+            0
+        };
+        assert_eq!(candidates[expected_config_index], AppConfig::vpl_dll_path());
+        assert!(candidates.iter().any(|p| p.ends_with("libvpl-2.dll")));
     }
 
     #[test]

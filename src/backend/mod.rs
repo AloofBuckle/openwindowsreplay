@@ -498,9 +498,9 @@ pub fn probe_all() -> ProbeCaps {
             timestamp_rule: "允许重采样和声道混合，但必须保留/重建绝对时间戳，音画同步禁止按帧号硬凑".to_owned(),
         },
         package_policy: PackagePolicy {
-            single_exe_required: false,
+            single_exe_required: true,
             bundled_dependencies_allowed: true,
-            note: "发布包可携带 libvpl.dll 等用户态依赖；GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提".to_owned(),
+            note: "oneVPL dispatcher 及其用户态运行库内嵌于 EXE，启动时校验并释放到 ProgramData 配置目录；发布目录不携带 DLL。GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提".to_owned(),
         },
         path_blockers: reasons,
         vpl,

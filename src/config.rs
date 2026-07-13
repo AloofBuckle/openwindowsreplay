@@ -59,6 +59,10 @@ impl AppConfig {
         Self::config_dir().join("indicator")
     }
 
+    pub fn vpl_dll_path() -> PathBuf {
+        Self::config_dir().join("libvpl-2.dll")
+    }
+
     pub fn load_from_disk() -> Result<Option<Self>, String> {
         let path = Self::config_path();
         if !path.exists() {
