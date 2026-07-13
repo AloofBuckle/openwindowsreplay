@@ -1,0 +1,116 @@
+
+Texture2D<float4> src_tex : register(t0);
+Texture1D<float> transfer_lut : register(t1);
+static const bool RR_FULL_RANGE = RR_FULL_RANGE_PLACEHOLDER;
+
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 pos[3] = {
+        float2(-1.0,  1.0),
+        float2( 3.0,  1.0),
+        float2(-1.0, -3.0)
+    };
+    return float4(pos[id], 0.0, 1.0);
+}
+
+float pq_oetf(float normalized_luminance) {
+    uint idx = (uint)(saturate(normalized_luminance) * 4095.0 + 0.5);
+    return transfer_lut.Load(int2(idx, 0));
+}
+
+float3 rec709_linear_to_bt2020_linear(float3 rgb709) {
+    return float3(
+        0.6274039 * rgb709.r + 0.3292830 * rgb709.g + 0.0433131 * rgb709.b,
+        0.0690973 * rgb709.r + 0.9195404 * rgb709.g + 0.0113623 * rgb709.b,
+        0.0163914 * rgb709.r + 0.0880133 * rgb709.g + 0.8955953 * rgb709.b
+    );
+}
+
+float3 sc_rgb_to_pq2020(float3 sc_rgb) {
+    // Windows HDR desktop capture is scRGB linear with Rec.709/sRGB primaries
+    // and 1.0 == 80 cd/m^2. Convert that display-referred signal to BT.2020
+    // linear light, then encode each component with ST 2084 over 0..10000 nits.
+    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(max(sc_rgb, 0.0)), 0.0);
+    float3 normalized_nits = bt2020_linear * (80.0 / 10000.0);
+    return float3(
+        pq_oetf(normalized_nits.r),
+        pq_oetf(normalized_nits.g),
+        pq_oetf(normalized_nits.b)
+    );
+}
+
+float3 pq2020_to_full_ycbcr(float3 rgb) {
+    const float kr = 0.2627;
+    const float kb = 0.0593;
+    const float kg = 1.0 - kr - kb;
+    float y = kr * rgb.r + kg * rgb.g + kb * rgb.b;
+    float cb = (rgb.b - y) / (2.0 * (1.0 - kb));
+    float cr = (rgb.r - y) / (2.0 * (1.0 - kr));
+    return float3(
+        saturate(y),
+        saturate(cb + 0.5),
+        saturate(cr + 0.5)
+    );
+}
+
+float3 apply_yuv10_range(float3 ycbcr) {
+    ycbcr = saturate(ycbcr);
+    if (RR_FULL_RANGE) {
+        return ycbcr;
+    }
+    float cb = ycbcr.y - 0.5;
+    float cr = ycbcr.z - 0.5;
+    return float3(
+        (64.0 / 1023.0) + ycbcr.x * (876.0 / 1023.0),
+        (512.0 / 1023.0) + cb * (896.0 / 1023.0),
+        (512.0 / 1023.0) + cr * (896.0 / 1023.0)
+    );
+}
+
+float3 load_ycbcr(uint2 pixel) {
+    uint width;
+    uint height;
+    src_tex.GetDimensions(width, height);
+    pixel = min(pixel, uint2(width - 1, height - 1));
+    return apply_yuv10_range(pq2020_to_full_ycbcr(sc_rgb_to_pq2020(src_tex.Load(int3(pixel, 0)).rgb)));
+}
+
+float4 ps_luma(float4 pos : SV_Position) : SV_Target {
+    return load_ycbcr(uint2(pos.xy)).xxxx;
+}
+
+float4 ps_chroma(float4 pos : SV_Position) : SV_Target {
+    uint2 base_pixel = uint2(pos.xy) * 2;
+    float3 c = load_ycbcr(base_pixel + uint2(1, 1));
+    return float4(c.yz, 0.0, 1.0);
+}
+
+RWTexture2D<float> y_plane : register(u0);
+RWTexture2D<float2> uv_plane : register(u1);
+
+[numthreads(8, 8, 1)]
+void cs_main(uint3 tid : SV_DispatchThreadID) {
+    uint width;
+    uint height;
+    src_tex.GetDimensions(width, height);
+    uint2 base_pixel = tid.xy * 2;
+    if (base_pixel.x >= width || base_pixel.y >= height) {
+        return;
+    }
+
+    float2 chroma_sum = float2(0.0, 0.0);
+    float chroma_count = 0.0;
+    [unroll]
+    for (uint dy = 0; dy < 2; dy++) {
+        [unroll]
+        for (uint dx = 0; dx < 2; dx++) {
+            uint2 pixel = base_pixel + uint2(dx, dy);
+            if (pixel.x < width && pixel.y < height) {
+                float3 ycbcr = load_ycbcr(pixel);
+                y_plane[pixel] = ycbcr.x;
+                chroma_sum += ycbcr.yz;
+                chroma_count += 1.0;
+            }
+        }
+    }
+    uv_plane[tid.xy] = chroma_sum / max(chroma_count, 1.0);
+}
