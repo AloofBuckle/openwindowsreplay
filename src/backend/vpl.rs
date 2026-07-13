@@ -2722,10 +2722,13 @@ fn record_d3d11_onecopy_mp4_impl(
                 "capture snapshot pool: textures={}, queue={}",
                 capture_pool_size, capture_queue_size
             ));
-            notes.push(
-                "capture thread: encoder-side snapshot slots are returned asynchronously after GPU event queries confirm route shader/copy consumed them"
-                    .to_owned(),
-            );
+            notes.push(if capture_source.is_wgc() {
+                "WGC same-device ordinary slots are returned after encoder CopyResource submission; shared immediate-context command ordering prevents reuse before the copy"
+                    .to_owned()
+            } else {
+                "capture thread: encoder-side shared snapshot slots are returned asynchronously after GPU event queries confirm route shader/copy consumed them"
+                    .to_owned()
+            });
 
             let mut capture_stats: Option<CaptureStats> = None;
             let mut capture_error: Option<String> = None;
@@ -2975,6 +2978,8 @@ fn record_d3d11_onecopy_mp4_impl(
                                 Ok(())
                             })();
 
+                            let return_wgc_slot_immediately =
+                                matches!(&slot, CaptureFrameSlot::WgcLocal(_));
                             let fence_started = Instant::now();
                             match &slot {
                                 CaptureFrameSlot::Shared(shared) => {
@@ -2986,16 +2991,18 @@ fn record_d3d11_onecopy_mp4_impl(
                                         }
                                     })?;
                                 }
-                                CaptureFrameSlot::WgcLocal(local) => {
-                                    local.fence.mark(&immediate);
-                                }
+                                CaptureFrameSlot::WgcLocal(_) => {}
                             }
                             perf.source_fence.add(fence_started.elapsed());
                             conversion_result?;
-                            // The free slot is returned after encoder-side conversion/copy commands
-                            // have been submitted, the keyed mutex has been released, and a D3D11
-                            // event query later confirms the GPU has consumed the snapshot.
-                            pending_free_slots.push(slot);
+                            if return_wgc_slot_immediately {
+                                // WGC producer and encoder consumer share this immediate context.
+                                // A reused slot's next conversion is ordered after this copy, so an
+                                // event-query round trip would only delay slot recycling.
+                                let _ = free_tx.send(slot);
+                            } else {
+                                pending_free_slots.push(slot);
+                            }
 
                             if !same_route_format {
                                 let copy_started = Instant::now();
@@ -4458,7 +4465,6 @@ struct WgcLocalSlot {
     id: usize,
     texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     converter: GpuRecordConverter,
-    fence: GpuCompletionFence,
 }
 
 #[cfg(windows)]
@@ -4689,7 +4695,6 @@ unsafe fn create_wgc_local_slot(
         id,
         texture,
         converter,
-        fence: GpuCompletionFence::new(device)?,
     })
 }
 
@@ -5661,6 +5666,9 @@ unsafe fn run_wgc_capture_thread(
             return_slot(slot)?;
         }
         while let Ok(frame) = wgc_frame_rx.try_recv() {
+            while let Ok(slot) = free_rx.try_recv() {
+                return_slot(slot)?;
+            }
             wgc_frame_queue_depth.fetch_sub(1, Ordering::Relaxed);
             let frame_result = process_wgc_frame(frame);
             if let Err(message) = frame_result {
@@ -5689,6 +5697,9 @@ unsafe fn run_wgc_capture_thread(
         }
         match wgc_frame_rx.recv_timeout(std::time::Duration::from_millis(1)) {
             Ok(frame) => {
+                while let Ok(slot) = free_rx.try_recv() {
+                    return_slot(slot)?;
+                }
                 wgc_frame_queue_depth.fetch_sub(1, Ordering::Relaxed);
                 let frame_result = process_wgc_frame(frame);
                 if let Err(message) = frame_result {
@@ -6249,14 +6260,7 @@ unsafe fn return_ready_snapshot_slots(
                     slot.encoder_fence.is_ready(context)?
                 }
             }
-            CaptureFrameSlot::WgcLocal(slot) => {
-                if wait_all {
-                    slot.fence.wait_ready(context)?;
-                    true
-                } else {
-                    slot.fence.is_ready(context)?
-                }
-            }
+            CaptureFrameSlot::WgcLocal(_) => true,
         };
         if ready {
             let slot = pending.swap_remove(index);
