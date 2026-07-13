@@ -1,5 +1,5 @@
 #![allow(non_snake_case, dead_code, unsafe_op_in_unsafe_fn)]
-//! oneVPL capability probing and the production D3D11 recording backend.
+//! oneVPL and NVENC capability probing with the production D3D11 recording backend.
 //!
 //! The public API stays in this facade. Route selection, FFI, probing, capture,
 //! conversion, encoding, and timing live in focused child modules.
@@ -24,6 +24,7 @@ mod ffi;
 mod probe;
 mod record;
 mod record_loop;
+mod record_nvenc;
 mod route;
 mod shaders;
 mod timing;
@@ -55,6 +56,12 @@ pub use record::{
     record_wgc_d3d11_onecopy_memory_output_cancelable,
     record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable, record_wgc_d3d11_onecopy_mp4,
     record_wgc_d3d11_onecopy_mp4_cancelable, record_wgc_d3d11_onecopy_mp4_output_cancelable,
+};
+pub use record_nvenc::{
+    record_nvenc_d3d11_onecopy_memory_output_with_sink_cancelable,
+    record_nvenc_d3d11_onecopy_mp4_output_cancelable,
+    record_nvenc_wgc_d3d11_onecopy_memory_output_with_sink_cancelable,
+    record_nvenc_wgc_d3d11_onecopy_mp4_output_cancelable,
 };
 
 #[cfg(test)]

@@ -70,10 +70,20 @@ impl DiskReplayStore {
         &self,
         duration: Duration,
     ) -> Result<Option<DiskPreparedReplaySnapshot>, BackendError> {
-        let selected = self.select_recent_segments(duration);
+        self.snapshot_recent_tracks_after(duration, None)
+            .map(|snapshot| snapshot.map(|(tracks, _)| tracks))
+    }
+
+    pub(super) fn snapshot_recent_tracks_after(
+        &self,
+        duration: Duration,
+        after_segment: Option<u64>,
+    ) -> Result<Option<(DiskPreparedReplaySnapshot, u64)>, BackendError> {
+        let selected = self.select_recent_segments_after(duration, after_segment);
         if selected.is_empty() {
             return Ok(None);
         }
+        let last_segment = selected.last().map(|segment| segment.index).unwrap_or(0);
         let mut segments = Vec::with_capacity(selected.len());
         for meta in selected {
             segments.push(DiskSegmentIndexedTracks {
@@ -81,14 +91,27 @@ impl DiskReplayStore {
                 index: read_disk_segment_sidecar(&meta.sidecar_path)?,
             });
         }
-        Ok(concat_disk_indexed_segments(&segments))
+        Ok(concat_disk_indexed_segments(&segments).map(|tracks| (tracks, last_segment)))
     }
 
     pub(super) fn select_recent_segments(&self, duration: Duration) -> Vec<DiskSegmentMeta> {
+        self.select_recent_segments_after(duration, None)
+    }
+
+    pub(super) fn select_recent_segments_after(
+        &self,
+        duration: Duration,
+        after_segment: Option<u64>,
+    ) -> Vec<DiskSegmentMeta> {
         let target_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
         let mut selected = VecDeque::new();
         let mut accumulated_ns = 0u64;
-        for segment in self.segments.iter().rev() {
+        for segment in self
+            .segments
+            .iter()
+            .rev()
+            .filter(|segment| after_segment.is_none_or(|after| segment.index > after))
+        {
             selected.push_front(segment.clone());
             accumulated_ns = accumulated_ns.saturating_add(scale_90k_to_ns(segment.duration_90k));
             if accumulated_ns >= target_ns {

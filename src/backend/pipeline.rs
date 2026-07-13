@@ -109,42 +109,60 @@ pub fn record_once_gpu_only_cancelable(
     adapter_index: u32,
     external_stop: Option<Arc<AtomicBool>>,
 ) -> Result<super::vpl::VplOneCopyRecordReport, BackendError> {
-    if !caps.d3d11_texture_input_supported {
-        return Err(BackendError::unsupported(
-            "oneVPL 编码",
-            "D3D11 texture 输入",
-            "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
-        ));
-    }
-    let requested_chroma = request.chroma_writer.chroma();
-    if !caps.supported_chroma.contains(&requested_chroma) {
-        let reason = caps
-            .route_blocker_summary_for_chroma(requested_chroma)
-            .unwrap_or_else(|| "能力探测未确认该色度采样存在完整 GPU-only 生产 route".to_owned());
-        return Err(BackendError::unsupported(
-            "录制流水线",
-            requested_chroma.doc_label(),
-            reason,
-        ));
-    }
-    caps.validate_rate_control_config(requested_chroma, &request.rate_control, "录制流水线")?;
-    match request.capture_backend {
-        CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_cancelable(
-            adapter_index,
+    #[cfg(windows)]
+    {
+        Ok(record_once_gpu_only_output_cancelable(
+            request,
+            caps,
             output,
             duration_seconds,
-            &request.rate_control,
-            requested_chroma,
-            external_stop,
-        ),
-        CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_cancelable(
             adapter_index,
-            output,
-            duration_seconds,
-            &request.rate_control,
-            requested_chroma,
             external_stop,
-        ),
+        )?
+        .report)
+    }
+
+    #[cfg(not(windows))]
+    {
+        if !caps.d3d11_texture_input_supported {
+            return Err(BackendError::unsupported(
+                "oneVPL 编码",
+                "D3D11 texture 输入",
+                "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
+            ));
+        }
+        let requested_chroma = request.chroma_writer.chroma();
+        if !caps.supported_chroma.contains(&requested_chroma) {
+            let reason = caps
+                .route_blocker_summary_for_chroma(requested_chroma)
+                .unwrap_or_else(|| {
+                    "能力探测未确认该色度采样存在完整 GPU-only 生产 route".to_owned()
+                });
+            return Err(BackendError::unsupported(
+                "录制流水线",
+                requested_chroma.doc_label(),
+                reason,
+            ));
+        }
+        caps.validate_rate_control_config(requested_chroma, &request.rate_control, "录制流水线")?;
+        match request.capture_backend {
+            CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+            ),
+            CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+            ),
+        }
     }
 }
 
@@ -159,23 +177,60 @@ pub fn record_once_gpu_only_output_cancelable(
 ) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
     validate_record_request(request, caps)?;
     let requested_chroma = request.chroma_writer.chroma();
-    match request.capture_backend {
-        CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_output_cancelable(
-            adapter_index,
-            output,
-            duration_seconds,
-            &request.rate_control,
-            requested_chroma,
-            external_stop,
-        ),
-        CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_output_cancelable(
-            adapter_index,
-            output,
-            duration_seconds,
-            &request.rate_control,
-            requested_chroma,
-            external_stop,
-        ),
+    match caps.video_encoder_selection.active {
+        Some(super::VideoEncoderBackend::Nvenc) => {
+            let route_plan =
+                caps.nvenc.current_display_routes.iter().find(|route| {
+                    route.chroma == requested_chroma && !route.input_format.is_empty()
+                });
+            match request.capture_backend {
+                CaptureBackendKind::Dda => {
+                    super::vpl::record_nvenc_d3d11_onecopy_mp4_output_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        route_plan,
+                    )
+                }
+                CaptureBackendKind::Wgc => {
+                    super::vpl::record_nvenc_wgc_d3d11_onecopy_mp4_output_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        route_plan,
+                    )
+                }
+            }
+        }
+        Some(super::VideoEncoderBackend::OneVpl) => match request.capture_backend {
+            CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_output_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+            ),
+            CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_output_cancelable(
+                adapter_index,
+                output,
+                duration_seconds,
+                &request.rate_control,
+                requested_chroma,
+                external_stop,
+            ),
+        },
+        None => Err(BackendError::unsupported(
+            "录制流水线",
+            "视频编码器自动选择",
+            "能力探测没有选出 production_ready 的 oneVPL/NVENC 后端",
+        )),
     }
 }
 
@@ -211,36 +266,77 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
 ) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
     validate_record_request(request, caps)?;
     let requested_chroma = request.chroma_writer.chroma();
-    let route_plan = caps
-        .vpl
-        .current_display_routes
-        .iter()
-        .find(|route| route.chroma == requested_chroma && !route.fourcc.is_empty());
-    match request.capture_backend {
-        CaptureBackendKind::Dda => {
-            super::vpl::record_d3d11_onecopy_memory_output_with_sink_cancelable(
-                adapter_index,
-                output,
-                duration_seconds,
-                &request.rate_control,
-                requested_chroma,
-                external_stop,
-                encoded_sink,
-                route_plan,
-            )
+    match caps.video_encoder_selection.active {
+        Some(super::VideoEncoderBackend::Nvenc) => {
+            let route_plan =
+                caps.nvenc.current_display_routes.iter().find(|route| {
+                    route.chroma == requested_chroma && !route.input_format.is_empty()
+                });
+            match request.capture_backend {
+                CaptureBackendKind::Dda => {
+                    super::vpl::record_nvenc_d3d11_onecopy_memory_output_with_sink_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        encoded_sink,
+                        route_plan,
+                    )
+                }
+                CaptureBackendKind::Wgc => {
+                    super::vpl::record_nvenc_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        encoded_sink,
+                        route_plan,
+                    )
+                }
+            }
         }
-        CaptureBackendKind::Wgc => {
-            super::vpl::record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
-                adapter_index,
-                output,
-                duration_seconds,
-                &request.rate_control,
-                requested_chroma,
-                external_stop,
-                encoded_sink,
-                route_plan,
-            )
+        Some(super::VideoEncoderBackend::OneVpl) => {
+            let route_plan = caps
+                .vpl
+                .current_display_routes
+                .iter()
+                .find(|route| route.chroma == requested_chroma && !route.fourcc.is_empty());
+            match request.capture_backend {
+                CaptureBackendKind::Dda => {
+                    super::vpl::record_d3d11_onecopy_memory_output_with_sink_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        encoded_sink,
+                        route_plan,
+                    )
+                }
+                CaptureBackendKind::Wgc => {
+                    super::vpl::record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        encoded_sink,
+                        route_plan,
+                    )
+                }
+            }
         }
+        None => Err(BackendError::unsupported(
+            "录制流水线",
+            "视频编码器自动选择",
+            "能力探测没有选出 production_ready 的 oneVPL/NVENC 后端",
+        )),
     }
 }
 
@@ -250,9 +346,9 @@ fn validate_record_request(
 ) -> Result<(), BackendError> {
     if !caps.d3d11_texture_input_supported {
         return Err(BackendError::unsupported(
-            "oneVPL 编码",
+            "GPU 视频编码",
             "D3D11 texture 输入",
-            "oneVPL 能力探测未确认 MFX_RESOURCE_DX11_TEXTURE",
+            "active oneVPL/NVENC 后端能力探测未确认 D3D11 texture 输入",
         ));
     }
     let requested_chroma = request.chroma_writer.chroma();

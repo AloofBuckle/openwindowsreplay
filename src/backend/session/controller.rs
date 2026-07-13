@@ -61,6 +61,8 @@ pub struct ReplayController {
     pub(super) latest_clip: Option<CompletedClip>,
     pub(super) live_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
     pub(super) disk_store: Option<Arc<Mutex<DiskReplayStore>>>,
+    pub(super) memory_save_after_ns: Option<u64>,
+    pub(super) disk_save_after_segment: Option<u64>,
 }
 
 impl Default for ReplayController {
@@ -73,6 +75,8 @@ impl Default for ReplayController {
             latest_clip: None,
             live_ring: None,
             disk_store: None,
+            memory_save_after_ns: None,
+            disk_save_after_segment: None,
         }
     }
 }
@@ -262,6 +266,8 @@ impl ReplayController {
         self.event_rx = Some(rx);
         self.live_ring = live_ring;
         self.disk_store = disk_store;
+        self.memory_save_after_ns = None;
+        self.disk_save_after_segment = None;
         self.state = ReplayState::Running {
             started_at: Instant::now(),
         };
@@ -296,41 +302,52 @@ impl ReplayController {
         let replay_duration =
             Duration::from_secs_f32((config.replay_minutes.max(0.1) * 60.0).max(1.0));
         if let Some(ring) = &self.live_ring {
-            let snapshot = ring
-                .lock()
-                .map_err(|_| BackendError::Io("encoded ring 锁已中毒".to_owned()))?
-                .snapshot_recent_tracks(replay_duration);
-            if let Some(snapshot) = snapshot {
+            let packet_snapshot = {
+                ring.lock()
+                    .map_err(|_| BackendError::Io("encoded ring 锁已中毒".to_owned()))?
+                    .snapshot_recent_packets_after(replay_duration, self.memory_save_after_ns)
+            };
+            if let Some(packet_snapshot) = packet_snapshot {
+                let save_after_ns = packet_snapshot.save_cursor_pts_ns();
+                // Materializing packet bytes is intentionally outside the ring mutex so capture
+                // and NVENC can continue pushing access units while a replay is being saved.
+                let snapshot = packet_snapshot.into_tracks();
                 if snapshot.audio_track.is_some() {
                     super::mp4_mux::write_hevc_aac_mp4(
                         &dst,
                         &snapshot.video_track,
                         snapshot.audio_track.as_ref(),
                     )?;
+                    self.memory_save_after_ns = Some(save_after_ns);
                     return Ok(());
                 }
-                if self.latest_clip.is_none() {
-                    return Err(BackendError::unsupported(
-                        "保存即时回放",
-                        "内存 encoded ring AAC",
-                        "视频已进入 encoded ring，但音频 access unit 尚未进入；请稍后重试或等待一个完整片段完成，避免静默保存 video-only 文件",
-                    ));
-                }
+                return Err(BackendError::unsupported(
+                    "保存即时回放",
+                    "内存 encoded ring AAC",
+                    "视频已进入 encoded ring，但本次新时间窗口内尚无音频 access unit；请稍后重试",
+                ));
+            } else if self.memory_save_after_ns.is_some() {
+                return Err(BackendError::unsupported(
+                    "保存即时回放",
+                    "上次成功保存后的 encoded ring",
+                    "尚无新的关键帧和音频可保存；请稍后重试",
+                ));
             }
         }
 
         if let Some(store) = &self.disk_store {
-            let snapshot = store
+            let snapshot_with_cursor = store
                 .lock()
                 .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
-                .snapshot_recent_tracks(replay_duration)?;
-            if let Some(snapshot) = snapshot {
+                .snapshot_recent_tracks_after(replay_duration, self.disk_save_after_segment)?;
+            if let Some((snapshot, last_segment)) = snapshot_with_cursor {
                 if snapshot.audio_track.is_some() {
                     super::mp4_mux::write_prepared_hevc_aac_mp4(
                         &dst,
                         &snapshot.video_track,
                         snapshot.audio_track.as_ref(),
                     )?;
+                    self.disk_save_after_segment = Some(last_segment);
                     return Ok(());
                 }
                 return Err(BackendError::unsupported(
@@ -338,7 +355,21 @@ impl ReplayController {
                     "磁盘循环缓存 AAC",
                     "磁盘分段中没有可封装的音频 access unit",
                 ));
+            } else if self.disk_save_after_segment.is_some() {
+                return Err(BackendError::unsupported(
+                    "保存即时回放",
+                    "上次成功保存后的磁盘分段",
+                    "尚无新的完整分段可保存；请稍后重试",
+                ));
             }
+        }
+
+        if self.memory_save_after_ns.is_some() || self.disk_save_after_segment.is_some() {
+            return Err(BackendError::unsupported(
+                "保存即时回放",
+                "上次成功保存后的时间窗口",
+                "尚无新内容可保存，不会重复写入首次保存前的画面",
+            ));
         }
 
         let Some(clip) = &self.latest_clip else {

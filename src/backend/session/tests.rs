@@ -74,6 +74,15 @@ fn disk_store_selects_whole_recent_segments() {
             .collect::<Vec<_>>(),
         vec![2, 3, 4]
     );
+
+    let selected = store.select_recent_segments_after(Duration::from_secs(25), Some(3));
+    assert_eq!(
+        selected
+            .iter()
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
 }
 
 #[test]

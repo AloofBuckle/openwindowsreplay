@@ -710,15 +710,21 @@ pub(super) fn push_record_aac_sample(
 }
 
 #[cfg(windows)]
-pub(super) fn encoder_frame_rate_hint_from_output(
+pub(super) fn capture_dimensions_from_output(
     output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
-) -> (u32, u32, String) {
+) -> (u16, u16, String) {
     use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
     use windows::core::PCWSTR;
 
-    let mut devmode = DEVMODEW::default();
-    devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-    let ok = unsafe {
+    let desktop_width =
+        (output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left).max(1) as u32;
+    let desktop_height =
+        (output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top).max(1) as u32;
+    let mut devmode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let mode_available = unsafe {
         EnumDisplaySettingsW(
             PCWSTR(output_desc.DeviceName.as_ptr()),
             ENUM_CURRENT_SETTINGS,
@@ -726,8 +732,86 @@ pub(super) fn encoder_frame_rate_hint_from_output(
         )
         .as_bool()
     };
-    if ok && devmode.dmDisplayFrequency > 0 {
-        let hz = devmode.dmDisplayFrequency as u32;
+    let (width, height, source) =
+        if mode_available && devmode.dmPelsWidth > 0 && devmode.dmPelsHeight > 0 {
+            (
+                devmode.dmPelsWidth,
+                devmode.dmPelsHeight,
+                "EnumDisplaySettingsW physical mode",
+            )
+        } else {
+            (
+                desktop_width,
+                desktop_height,
+                "DXGI DesktopCoordinates fallback",
+            )
+        };
+    (
+        width.min(u32::from(u16::MAX)) as u16,
+        height.min(u32::from(u16::MAX)) as u16,
+        format!(
+            "{source}={}x{}; DXGI DesktopCoordinates={}x{}",
+            width, height, desktop_width, desktop_height
+        ),
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn display_frequency_hz_from_output(
+    output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+) -> Option<u32> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    use windows::core::PCWSTR;
+
+    let mut devmode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let available = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(output_desc.DeviceName.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut devmode,
+        )
+        .as_bool()
+    };
+    (available && devmode.dmDisplayFrequency > 0).then_some(devmode.dmDisplayFrequency)
+}
+
+pub(super) fn minimum_source_interval_90k_for_refresh(refresh_hz: u32) -> u64 {
+    if refresh_hz == 0 {
+        1
+    } else {
+        (VIDEO_CLOCK_HZ / (u64::from(refresh_hz) * 2)).max(1)
+    }
+}
+
+pub(super) fn wgc_coalesce_window_100ns_for_refresh(refresh_hz: u32) -> i64 {
+    if refresh_hz == 0 {
+        return 0;
+    }
+
+    // A display present remains outside this window, while cursor/window updates emitted
+    // between presents are grouped and only the newest compositor image is retained.
+    let nominal = 10_000_000u64 / u64::from(refresh_hz);
+    nominal.saturating_mul(21).div_ceil(25).min(i64::MAX as u64) as i64
+}
+
+pub(super) fn should_coalesce_wgc_timestamps(
+    previous_100ns: i64,
+    current_100ns: i64,
+    window: i64,
+) -> bool {
+    window > 0
+        && current_100ns >= previous_100ns
+        && current_100ns.saturating_sub(previous_100ns) < window
+}
+
+#[cfg(windows)]
+pub(super) fn encoder_frame_rate_hint_from_output(
+    output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+) -> (u32, u32, String) {
+    if let Some(hz) = display_frequency_hz_from_output(output_desc) {
         (
             hz,
             1,

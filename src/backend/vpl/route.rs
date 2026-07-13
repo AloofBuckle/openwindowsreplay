@@ -19,6 +19,7 @@ pub(super) const VIDEO_CLOCK_HZ: u64 = 90_000;
 pub(super) const VPL_RECORD_ASYNC_DEPTH: u16 = 16;
 pub(super) const VPL_RECORD_MAX_IN_FLIGHT: usize = 64;
 pub(super) const VPL_BITSTREAM_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const WGC_GPU_THREAD_PRIORITY: i32 = 0;
 pub(super) const MFX_CODINGOPTION_ON: u16 = 0x10;
 pub(super) const MFX_CODINGOPTION_OFF: u16 = 0x20;
 pub(super) const MFX_FRAMETYPE_I: u16 = 0x0001;
@@ -542,6 +543,56 @@ pub(super) fn record_route_from_display_plan(
     })
 }
 
+pub(super) fn record_route_from_nvenc_display_plan(
+    plan: &crate::backend::nvenc::NvencCurrentDisplayRouteInfo,
+) -> Result<VplRecordRoute, BackendError> {
+    let (fourcc, codec) = match plan.input_format.as_str() {
+        "NV12" => (MFX_FOURCC_NV12, HevcCodecMetadata::main_420_8()),
+        "P010" => (MFX_FOURCC_P010, HevcCodecMetadata::main10_420_10()),
+        "AYUV" => (MFX_FOURCC_AYUV, HevcCodecMetadata::rext(3, 8)),
+        other => {
+            return Err(BackendError::unsupported(
+                "NVENC 录制 RoutePlan",
+                format!("input_format={other}"),
+                "当前 NVENC 生产路径只接入 NV12/P010/AYUV；NV16/P210/planar YUV444 仍为 probe-only",
+            ));
+        }
+    };
+    Ok(VplRecordRoute {
+        label: "NVENC Probe RoutePlan",
+        fourcc,
+        chroma: if plan.input_format == "AYUV" { 3 } else { 1 },
+        bit_depth: plan.bit_depth,
+        profile: match plan.input_format.as_str() {
+            "P010" => MFX_PROFILE_HEVC_MAIN10 as u16,
+            "AYUV" => MFX_PROFILE_HEVC_REXT as u16,
+            _ => MFX_PROFILE_HEVC_MAIN as u16,
+        },
+        mp4_color: NclxColorMetadata {
+            colour_primaries: plan.nclx_colour_primaries,
+            transfer_characteristics: plan.nclx_transfer_characteristics,
+            matrix_coefficients: plan.nclx_matrix_coefficients,
+            full_range: plan.nclx_full_range,
+        },
+        mp4_codec: codec,
+    })
+}
+
+pub(super) fn nvenc_input_format_from_route(
+    route: VplRecordRoute,
+) -> Result<crate::backend::nvenc::NvencD3d11InputFormat, BackendError> {
+    match route.fourcc {
+        MFX_FOURCC_NV12 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Nv12),
+        MFX_FOURCC_P010 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::P010),
+        MFX_FOURCC_AYUV => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Ayuv),
+        _ => Err(BackendError::unsupported(
+            "NVENC 录制 route",
+            route.summary(),
+            "当前 NVENC 生产路径只接入 NV12/P010/AYUV；NV16/P210/planar YUV444 仍为 probe-only",
+        )),
+    }
+}
+
 #[cfg(windows)]
 pub(super) fn validate_current_display_route_plan(
     plan: &VplCurrentDisplayRouteInfo,
@@ -613,6 +664,104 @@ pub(super) fn validate_current_display_route_plan(
     if plan.color_space != desc1.ColorSpace.0 as u32 || plan.bits_per_color != desc1.BitsPerColor {
         return Err(BackendError::unsupported(
             "录制 RoutePlan",
+            format!(
+                "plan ColorSpace={} BitsPerColor={} current ColorSpace={} BitsPerColor={}",
+                plan.color_space, plan.bits_per_color, desc1.ColorSpace.0, desc1.BitsPerColor
+            ),
+            "显示色彩状态已变化，请重新探测能力",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn validate_current_nvenc_route_plan(
+    plan: &crate::backend::nvenc::NvencCurrentDisplayRouteInfo,
+    adapter_index: u32,
+    output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+    output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
+    requested_chroma: ChromaSampling,
+) -> Result<(), BackendError> {
+    use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
+    use windows::core::Interface;
+
+    if !matches!(
+        requested_chroma,
+        ChromaSampling::Yuv420 | ChromaSampling::Yuv444
+    ) {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            requested_chroma.doc_label(),
+            "NVENC 4:2:2 NV16/P210 缺少可直接注册且保持平面语义的原生 DXGI texture layout",
+        ));
+    }
+    if plan.chroma != requested_chroma || plan.input_format.is_empty() {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            format!(
+                "requested={} plan_chroma={} input_format={}",
+                requested_chroma.doc_label(),
+                plan.chroma.doc_label(),
+                plan.input_format
+            ),
+            "能力探测没有当前色度的可录制 NVENC route，请重新探测能力",
+        ));
+    }
+    if !matches!(plan.input_format.as_str(), "NV12" | "P010" | "AYUV") {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            format!("input_format={}", plan.input_format),
+            "当前 NVENC 生产路径只接入 NV12/P010/AYUV；其他格式仍为 probe-only",
+        ));
+    }
+    if plan.adapter_index != adapter_index || plan.output_index != 0 {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            format!(
+                "plan adapter/output={}/{} current adapter/output={}/0",
+                plan.adapter_index, plan.output_index, adapter_index
+            ),
+            "显示输出已变化，请重新探测能力",
+        ));
+    }
+    let rect = output_desc.DesktopCoordinates;
+    if plan.desktop_left != rect.left
+        || plan.desktop_top != rect.top
+        || plan.desktop_right != rect.right
+        || plan.desktop_bottom != rect.bottom
+    {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            format!(
+                "plan rect={},{},{},{} current rect={},{},{},{}",
+                plan.desktop_left,
+                plan.desktop_top,
+                plan.desktop_right,
+                plan.desktop_bottom,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom
+            ),
+            "显示输出区域已变化，请重新探测能力",
+        ));
+    }
+    let output6 = output.cast::<IDXGIOutput6>().map_err(|_| {
+        BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            "IDXGIOutput6::GetDesc1",
+            "不支持的桌面模式",
+        )
+    })?;
+    let desc1 = unsafe {
+        output6.GetDesc1().map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIOutput6::GetDesc1(NVENC record RoutePlan guard)",
+            message: err.to_string(),
+        })?
+    };
+    if plan.color_space != desc1.ColorSpace.0 as u32 || plan.bits_per_color != desc1.BitsPerColor {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
             format!(
                 "plan ColorSpace={} BitsPerColor={} current ColorSpace={} BitsPerColor={}",
                 plan.color_space, plan.bits_per_color, desc1.ColorSpace.0, desc1.BitsPerColor

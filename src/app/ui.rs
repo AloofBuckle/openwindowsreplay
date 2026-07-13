@@ -324,15 +324,36 @@ impl RustReplayApp {
                 if supported.contains(&self.config.rate_control.method) {
                     let features =
                         self.current_rate_control_features(self.config.rate_control.method);
-                    rate_control_fields(ui, &mut self.config.rate_control, &features);
+                    let backend = self
+                        .caps
+                        .as_ref()
+                        .and_then(|caps| caps.video_encoder_selection.active);
+                    rate_control_fields(ui, &mut self.config.rate_control, &features, backend);
                 } else if let Some(first) = supported.first() {
                     self.config.rate_control.method = *first;
                     let features =
                         self.current_rate_control_features(self.config.rate_control.method);
-                    rate_control_fields(ui, &mut self.config.rate_control, &features);
+                    let backend = self
+                        .caps
+                        .as_ref()
+                        .and_then(|caps| caps.video_encoder_selection.active);
+                    rate_control_fields(ui, &mut self.config.rate_control, &features, backend);
                 }
             }
         });
+
+        let nvenc_tuning = self.config.chroma.and_then(|chroma| {
+            self.caps
+                .as_ref()
+                .and_then(|caps| caps.nvenc_tuning_support_for_chroma(chroma))
+        });
+        if let Some(tuning) = nvenc_tuning {
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.label("NVENC 原始调参");
+                nvenc_tuning_fields(ui, &mut self.config.rate_control, &tuning);
+            });
+        }
     }
 
     pub(super) fn current_rate_controls(&self) -> Vec<RateControlMethod> {

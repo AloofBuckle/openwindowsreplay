@@ -173,11 +173,14 @@ pub(super) fn wgc_relative_timestamp_90k(
     // timebase.  Do not add an external CFR clock here; source gaps must
     // remain visible as longer sample durations.
     let origin = *origin_100ns.get_or_insert(timestamp_100ns);
-    let delta_100ns = timestamp_100ns.saturating_sub(origin).max(0) as i128;
-    let timestamp =
-        (((delta_100ns * VIDEO_CLOCK_HZ as i128) + 5_000_000i128) / 10_000_000i128).max(0) as u64;
+    let timestamp = wgc_timestamp_from_origin_90k(timestamp_100ns, origin);
     *last_timestamp_90k = Some(timestamp);
     timestamp
+}
+
+pub(super) fn wgc_timestamp_from_origin_90k(timestamp_100ns: i64, origin_100ns: i64) -> u64 {
+    let delta_100ns = timestamp_100ns.saturating_sub(origin_100ns).max(0) as i128;
+    (((delta_100ns * VIDEO_CLOCK_HZ as i128) + 5_000_000i128) / 10_000_000i128).max(0) as u64
 }
 
 pub(super) fn encoded_timeline_duration_90k(

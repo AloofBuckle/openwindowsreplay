@@ -307,6 +307,7 @@ impl MfxExtCodingOption2 {
             || self.ExtBRC != 0
             || self.LookAheadDepth != 0
             || self.RepeatPPS != 0
+            || self.DisableVUI != 0
     }
 }
 
@@ -435,6 +436,7 @@ impl VplEncodeExtBuffers {
             ext_params: [ptr::null_mut(); 3],
         };
         out.coding2.RepeatPPS = MFX_CODINGOPTION_ON;
+        out.coding2.DisableVUI = MFX_CODINGOPTION_OFF;
         out.coding3.apply_route(route);
         out
     }
@@ -447,6 +449,7 @@ impl VplEncodeExtBuffers {
             rate_control,
         );
         self.coding2.RepeatPPS = MFX_CODINGOPTION_ON;
+        self.coding2.DisableVUI = MFX_CODINGOPTION_OFF;
         self.coding3.apply_route(route);
     }
 

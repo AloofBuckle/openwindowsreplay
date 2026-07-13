@@ -4,7 +4,9 @@
 //! control controls, and log interaction are separated into focused modules.
 
 use crate::backend::session::{ReplayController, ReplaySaveReadiness, ReplayState};
-use crate::backend::{ProbeCaps, RateControlFeatureSupport};
+use crate::backend::{
+    NvencTuningSupport, ProbeCaps, RateControlFeatureSupport, VideoEncoderBackend,
+};
 use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey, ReplayBufferMode};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::indicator_overlay::{IndicatorOverlayRuntime, NativeIndicatorImage};
@@ -31,3 +33,6 @@ use platform::*;
 use rate_control::*;
 
 pub use model::RustReplayApp;
+
+#[cfg(test)]
+mod tests;

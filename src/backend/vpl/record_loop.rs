@@ -530,7 +530,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     message: err.to_string(),
                 })?;
         if capture_source.is_wgc() {
-            let priority = -7;
+            let priority = WGC_GPU_THREAD_PRIORITY;
             match set_d3d11_gpu_thread_priority(vpl_device, priority) {
                 Ok(()) => notes.push(format!(
                     "WGC encoder D3D11 device GPU thread priority set to {priority}"

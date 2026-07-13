@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::{Duration, Instant};
+
 pub(super) const INDICATOR_FLASH_DURATION: Duration = Duration::from_secs(2);
 pub(super) const MAX_VISIBLE_LOG_LINES: usize = 400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +208,26 @@ impl RustReplayApp {
                 adapter.dedicated_video_memory / 1024 / 1024
             ));
         }
+        self.encoder_log.push(format!(
+            "自动编码器选择：active={}；{}",
+            caps.video_encoder_selection
+                .active
+                .map(|backend| backend.label())
+                .unwrap_or("无"),
+            caps.video_encoder_selection.reason
+        ));
+        for candidate in &caps.video_encoder_selection.candidates {
+            self.encoder_log.push(format!(
+                "  候选编码器 {} available={} HEVC={} d3d11_texture={} current_routes={} production_ready={}；{}",
+                candidate.backend.label(),
+                candidate.available,
+                candidate.hevc_supported,
+                candidate.d3d11_texture_input_supported,
+                candidate.current_display_route_count,
+                candidate.production_ready,
+                candidate.reason
+            ));
+        }
         if caps.vpl.available {
             self.encoder_log.push(format!(
                 "oneVPL DLL: {}",
@@ -239,6 +261,106 @@ impl RustReplayApp {
             self.encoder_log.push(format!(
                 "oneVPL 不可用：{}",
                 caps.vpl.load_error.as_deref().unwrap_or("未知错误")
+            ));
+        }
+        if caps.nvenc.available {
+            self.encoder_log.push(format!(
+                "NVENC DLL: {}，compiled API={}，driver max API={}",
+                caps.nvenc.dll_path.as_deref().unwrap_or("未知"),
+                caps.nvenc.compiled_api_version,
+                caps.nvenc
+                    .max_supported_version
+                    .as_deref()
+                    .unwrap_or("未知")
+            ));
+            for adapter in &caps.nvenc.adapters {
+                self.encoder_log.push(format!(
+                    "NVENC[adapter{}] {} LUID={} HEVC={} d3d11_session={} profiles=[{}] presets=[{}] input=[{}] rate=[{}]",
+                    adapter.adapter_index,
+                    adapter.adapter_name,
+                    adapter.adapter_luid,
+                    adapter.hevc_supported,
+                    adapter.d3d11_session_opened,
+                    adapter.hevc_profiles.join(", "),
+                    adapter
+                        .hevc_presets
+                        .iter()
+                        .map(|preset| preset.raw_name())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    adapter.input_formats.join(", "),
+                    adapter
+                        .rate_controls
+                        .iter()
+                        .map(|m| m.short_name())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+                self.encoder_log.push(format!(
+                    "  caps: max={}x{} engines={:?} async={:?} 10bit={:?} 422={:?} 444={:?} lookahead={:?} temporal_aq={:?} rc_mask={:?}",
+                    adapter.caps.max_width.unwrap_or_default(),
+                    adapter.caps.max_height.unwrap_or_default(),
+                    adapter.caps.encoder_engines,
+                    adapter.caps.async_encode,
+                    adapter.caps.ten_bit,
+                    adapter.caps.yuv422,
+                    adapter.caps.yuv444,
+                    adapter.caps.lookahead,
+                    adapter.caps.temporal_aq,
+                    adapter.caps.rate_control_mask,
+                ));
+                for route in &adapter.route_candidates {
+                    self.encoder_log.push(format!(
+                        "  NVENC route 可见：input={} chroma={} bit_depth={} profile={}；production={}；{}",
+                        route.input_format,
+                        route.chroma.doc_label(),
+                        route.bit_depth,
+                        route.profile,
+                        route.production_record_supported,
+                        route
+                            .production_blocker
+                            .as_deref()
+                            .unwrap_or(route.note.as_str())
+                    ));
+                    for feature in &route.rate_control_features {
+                        self.encoder_log.push(format!(
+                            "    NVENC 码控字段：{} lookahead={} vbv={} spatial_aq={} temporal_aq={} target_quality={}",
+                            feature.method.short_name(),
+                            feature.lookahead,
+                            feature.vbv,
+                            feature.spatial_aq,
+                            feature.temporal_aq,
+                            feature.target_quality
+                        ));
+                    }
+                }
+                for route in &adapter.current_display_routes {
+                    if route.input_format.is_empty() {
+                        self.encoder_log.push(format!(
+                            "  NVENC 当前显示器 route：{} 不可用，{}",
+                            route.chroma.doc_label(),
+                            route.note
+                        ));
+                    } else {
+                        self.encoder_log.push(format!(
+                            "  NVENC 当前显示器 route：{} -> input={} bit_depth={} profile={}；{}",
+                            route.chroma.doc_label(),
+                            route.input_format,
+                            route.bit_depth,
+                            route.profile,
+                            route.route_summary
+                        ));
+                    }
+                }
+                for warning in &adapter.warnings {
+                    self.encoder_log
+                        .push(format!("  NVENC adapter warning：{warning}"));
+                }
+            }
+        } else {
+            self.encoder_log.push(format!(
+                "NVENC 不可用：{}",
+                caps.nvenc.load_error.as_deref().unwrap_or("未知错误")
             ));
         }
         if !caps.vpl_candidate_chroma.is_empty() {
@@ -311,14 +433,18 @@ impl RustReplayApp {
         for item in &caps.rate_control_features_by_chroma {
             for feature in &item.features {
                 self.encoder_log.push(format!(
-                    "码控可选字段：{} {} lookahead={} win_brc={} low_delay={} max_frame_size={} mbbrc={}",
+                    "码控可选字段：{} {} brc_multiplier={} lookahead={} win_brc={} low_delay={} max_frame_size={} mbbrc={} nvenc_spatial_aq={} nvenc_temporal_aq={} nvenc_target_quality={}",
                     item.chroma.doc_label(),
                     feature.method.short_name(),
+                    feature.brc_param_multiplier,
                     feature.look_ahead_depth,
                     feature.win_brc,
                     feature.low_delay_brc,
                     feature.max_frame_size,
-                    feature.mbbrc
+                    feature.mbbrc,
+                    feature.nvenc_spatial_aq,
+                    feature.nvenc_temporal_aq,
+                    feature.nvenc_target_quality
                 ));
             }
         }

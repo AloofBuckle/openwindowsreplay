@@ -32,11 +32,14 @@
 
 ## oneVPL / D3D11 后端
 
-- `src/backend/vpl.rs`：生产后端门面和稳定公开 API。
+- `src/backend/nvenc.rs`：NVENC 动态 FFI、能力探测、D3D11 registered-resource
+  编码器与 NVENC 参数映射。
+- `src/backend/vpl.rs`：oneVPL/NVENC 共用捕获生产后端门面和稳定公开 API。
 - `src/backend/vpl/route.rs`：显示色彩、色度、FourCC、profile 路线选择。
 - `src/backend/vpl/ffi.rs`：oneVPL 动态 API、FFI 结构和扩展 buffer。
 - `src/backend/vpl/probe/`：实现发现、编码能力查询和参数映射。
 - `src/backend/vpl/record.rs`：公开录制入口、音频增量 mixer 和 sink 接口。
+- `src/backend/vpl/record_nvenc.rs`：复用公共捕获/转换链路的 NVENC 录制循环。
 - `src/backend/vpl/record_loop.rs`：连续录制热路径。它保持为单个函数所在模块，避免把
   一条严格有序的资源生命周期机械拆散。
 - `src/backend/vpl/encode.rs`：异步提交、同步、bitstream 回收和 flush。

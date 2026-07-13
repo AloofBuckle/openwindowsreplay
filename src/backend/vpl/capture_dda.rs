@@ -91,7 +91,7 @@ pub(super) unsafe fn run_dda_capture_thread(
     let duplication =
         create_duplication_on_device(&adapter1, &device, route).map_err(|err| err.to_string())?;
     let mut stats = CaptureStats::new();
-    let mut free_slots: VecDeque<SnapshotSlot> = VecDeque::new();
+    let mut free_slots: VecDeque<CaptureFrameSlot> = VecDeque::new();
     let mut source_desc0: Option<D3D11_TEXTURE2D_DESC> = None;
     let mut snapshot_desc0: Option<D3D11_TEXTURE2D_DESC> = None;
     let mut route_intermediate: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
@@ -122,13 +122,13 @@ pub(super) unsafe fn run_dda_capture_thread(
                 last_timestamp_90k = None;
                 last_accepted_present_qpc = None;
             }
-            let CaptureFrameSlot::Shared(slot) = slot else {
-                continue;
+            let slot_matches = match &slot {
+                CaptureFrameSlot::Shared(shared) => snapshot_desc0
+                    .as_ref()
+                    .is_none_or(|desc| snapshot_slot_matches(shared, desc)),
+                CaptureFrameSlot::WgcLocal(_) => false,
             };
-            if snapshot_desc0
-                .as_ref()
-                .is_none_or(|desc| snapshot_slot_matches(&slot, desc))
-            {
+            if slot_matches {
                 free_slots.push_back(slot);
             }
         }
@@ -226,7 +226,7 @@ pub(super) unsafe fn run_dda_capture_thread(
                     let slot =
                         create_shared_snapshot_slot(id, &device, &encoder_device, &snapshot_desc)
                             .map_err(|err| err.to_string())?;
-                    free_slots.push_back(slot);
+                    free_slots.push_back(CaptureFrameSlot::Shared(slot));
                 }
                 if first_source {
                     stats.dropped_warmup += 1;
@@ -251,24 +251,40 @@ pub(super) unsafe fn run_dda_capture_thread(
 
             {
                 let _guard = D3d11MultithreadGuard::enter(&d3d_multithread);
-                slot.capture_mutex
-                    .AcquireSync(0, 1_000)
-                    .map_err(|err| format!("IDXGIKeyedMutex::AcquireSync(capture): {err}"))?;
-                let intermediate = route_intermediate
-                    .as_ref()
-                    .ok_or_else(|| "DDA route intermediate missing".to_owned())?;
-                let converter = route_converter
-                    .as_ref()
-                    .ok_or_else(|| "DDA route converter missing".to_owned())?;
-                converter
-                    .convert(&source)
-                    .and_then(|()| {
-                        copy_texture_resource(&context, intermediate, &slot.capture_texture)
-                    })
-                    .map_err(|err| err.to_string())?;
-                slot.capture_mutex
-                    .ReleaseSync(1)
-                    .map_err(|err| format!("IDXGIKeyedMutex::ReleaseSync(capture): {err}"))?;
+                match &slot {
+                    CaptureFrameSlot::Shared(shared) => {
+                        shared.capture_mutex.AcquireSync(0, 1_000).map_err(|err| {
+                            format!("IDXGIKeyedMutex::AcquireSync(capture): {err}")
+                        })?;
+                        let convert_result = (|| -> Result<(), BackendError> {
+                            let intermediate = route_intermediate.as_ref().ok_or_else(|| {
+                                BackendError::unsupported(
+                                    "DDA route",
+                                    "shared intermediate",
+                                    "DDA route intermediate missing",
+                                )
+                            })?;
+                            let converter = route_converter.as_ref().ok_or_else(|| {
+                                BackendError::unsupported(
+                                    "DDA route",
+                                    "shared converter",
+                                    "DDA route converter missing",
+                                )
+                            })?;
+                            converter.convert(&source)?;
+                            copy_texture_resource(&context, intermediate, &shared.capture_texture)
+                        })();
+                        let release_result = shared
+                            .capture_mutex
+                            .ReleaseSync(1)
+                            .map_err(|err| format!("IDXGIKeyedMutex::ReleaseSync(capture): {err}"));
+                        release_result?;
+                        convert_result.map_err(|err| err.to_string())?;
+                    }
+                    CaptureFrameSlot::WgcLocal(_) => {
+                        return Err("DDA received unexpected WGC-local slot".to_owned());
+                    }
+                }
             }
             stats.copied += 1;
             if frame_info.LastPresentTime > 0 {
@@ -276,7 +292,7 @@ pub(super) unsafe fn run_dda_capture_thread(
             }
             if !encoder_warmup_done {
                 let captured = CapturedSnapshot {
-                    slot: CaptureFrameSlot::Shared(slot),
+                    slot,
                     source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
@@ -305,7 +321,7 @@ pub(super) unsafe fn run_dda_capture_thread(
                 timestamp_origin_qpc = None;
                 last_timestamp_90k = None;
                 let captured = CapturedSnapshot {
-                    slot: CaptureFrameSlot::Shared(slot),
+                    slot,
                     source_desc: snapshot_desc,
                     move_rect_bytes: frame_metadata.move_rect_bytes,
                     dirty_rects: frame_metadata.dirty_rects,
@@ -341,7 +357,7 @@ pub(super) unsafe fn run_dda_capture_thread(
             }
             reached_source_end = timestamp_90k >= source_stop_90k;
             let captured = CapturedSnapshot {
-                slot: CaptureFrameSlot::Shared(slot),
+                slot,
                 source_desc: snapshot_desc,
                 move_rect_bytes: frame_metadata.move_rect_bytes,
                 dirty_rects: frame_metadata.dirty_rects,

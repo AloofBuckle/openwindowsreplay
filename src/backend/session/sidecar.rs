@@ -273,9 +273,9 @@ pub(super) fn scale_90k_to_ticks(value: u64, sample_rate: u32) -> u64 {
 }
 
 pub(super) fn timestamp_for_filename() -> String {
-    let secs = SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or_default();
-    secs.to_string()
+    millis.to_string()
 }

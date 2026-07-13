@@ -46,6 +46,30 @@ pub(super) fn spawn_wgc_capture_thread(
 }
 
 #[cfg(windows)]
+pub(super) fn atomic_queue_depth_increment(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    use std::sync::atomic::Ordering;
+
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        })
+        .unwrap_or_else(|value| value);
+    previous.saturating_add(1)
+}
+
+#[cfg(windows)]
+pub(super) fn atomic_queue_depth_decrement(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    use std::sync::atomic::Ordering;
+
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_sub(1))
+        })
+        .unwrap_or_else(|value| value);
+    previous.saturating_sub(1)
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn run_wgc_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
@@ -145,7 +169,10 @@ pub(super) unsafe fn run_wgc_capture_thread(
 
     struct WgcQueuedFrame {
         frame: Direct3D11CaptureFrame,
+        timestamp_100ns: i64,
         enqueued_at: std::time::Instant,
+        coalesce_origin_100ns: i64,
+        coalesce_started_at: std::time::Instant,
     }
 
     fn update_atomic_max(target: &AtomicUsize, value: usize) {
@@ -194,6 +221,13 @@ pub(super) unsafe fn run_wgc_capture_thread(
     let output_desc = output
         .GetDesc()
         .map_err(|err| win_err("IDXGIOutput::GetDesc(WGC record)", err))?;
+    let display_refresh_hz = display_frequency_hz_from_output(&output_desc);
+    let minimum_source_interval_90k = display_refresh_hz
+        .map(minimum_source_interval_90k_for_refresh)
+        .unwrap_or(1);
+    let wgc_coalesce_window_100ns = display_refresh_hz
+        .map(wgc_coalesce_window_100ns_for_refresh)
+        .unwrap_or(0);
     let dxgi_device: IDXGIDevice = device
         .cast()
         .map_err(|err| win_err("ID3D11Device::cast<IDXGIDevice>(WGC record)", err))?;
@@ -227,9 +261,19 @@ pub(super) unsafe fn run_wgc_capture_thread(
     // 固定 WGC 路线：按后端选择的 SDR/HDR route 捕获为 BGRA8/FP16，
     // 捕获线程 GPU shader 写目标 FourCC surface；编码线程仅 CopyResource 到 oneVPL surface。
     let wgc_frame_pool_size = 4;
-    let post_warmup_discard_frames = 24;
-    let pipeline_warmup_frames = 48;
-    let pipeline_warmup_stable_intervals_required = 0;
+    let post_warmup_discard_frames = std::env::var("RUST_REPLAY_WGC_POST_WARMUP_DISCARD_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(24);
+    let pipeline_warmup_frames = std::env::var("RUST_REPLAY_WGC_PIPELINE_WARMUP_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(48);
+    let pipeline_warmup_stable_intervals_required =
+        std::env::var("RUST_REPLAY_WGC_PIPELINE_WARMUP_STABLE_INTERVALS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         pixel_format,
@@ -253,6 +297,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
     let _ = session.SetMinUpdateInterval(TimeSpan { Duration: 0 });
 
     let mut initial_state = WgcCaptureState::new();
+    initial_state.stats.wgc_coalesce_window_100ns = wgc_coalesce_window_100ns;
     let initial_source_desc = D3D11_TEXTURE2D_DESC {
         Width: item_size.Width.max(1) as u32,
         Height: item_size.Height.max(1) as u32,
@@ -323,15 +368,37 @@ pub(super) unsafe fn run_wgc_capture_thread(
                         }
                     };
 
+                    let timestamp_100ns = match frame.SystemRelativeTime() {
+                        Ok(timestamp) => timestamp.Duration,
+                        Err(err) => {
+                            if let Ok(mut state) = handler_state.lock() {
+                                state.error = Some(win_err(
+                                    "Direct3D11CaptureFrame::SystemRelativeTime(WGC callback)",
+                                    err,
+                                ));
+                            }
+                            handler_stop.store(true, Ordering::Relaxed);
+                            let _ = frame.Close();
+                            break;
+                        }
+                    };
+                    let enqueued_at = std::time::Instant::now();
                     let queued = WgcQueuedFrame {
                         frame,
-                        enqueued_at: std::time::Instant::now(),
+                        timestamp_100ns,
+                        enqueued_at,
+                        coalesce_origin_100ns: timestamp_100ns,
+                        coalesce_started_at: enqueued_at,
                     };
+                    // Publish the queue-depth increment before the channel send. The receiver can
+                    // run immediately after `send`; incrementing afterwards lets it decrement 0
+                    // to usize::MAX and the next WinRT callback would panic across the ABI boundary.
+                    let depth = atomic_queue_depth_increment(&handler_wgc_frame_queue_depth);
                     if handler_wgc_frame_tx.send(queued).is_err() {
+                        atomic_queue_depth_decrement(&handler_wgc_frame_queue_depth);
                         handler_stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                    let depth = handler_wgc_frame_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
                     update_atomic_max(&handler_wgc_frame_queue_depth_max, depth);
                     if handler_stop.load(Ordering::Relaxed) {
                         break;
@@ -356,15 +423,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         let frame = queued.frame;
         let _close_guard = WgcFrameCloseGuard(frame.clone());
         let callback_frame_started = std::time::Instant::now();
-        let timestamp_100ns = frame
-            .SystemRelativeTime()
-            .map_err(|err| {
-                win_err(
-                    "Direct3D11CaptureFrame::SystemRelativeTime(WGC capture thread)",
-                    err,
-                )
-            })?
-            .Duration;
+        let timestamp_100ns = queued.timestamp_100ns;
         let mut state = callback_state
             .lock()
             .map_err(|_| "WGC callback state mutex poisoned".to_owned())?;
@@ -408,9 +467,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
             state.stats.dropped_warmup += 1;
             state.last_timestamp_100ns = Some(timestamp_100ns);
             drop_warmup_frame = true;
-            if state.warmup_stable_intervals >= WGC_WARMUP_STABLE_INTERVALS
-                && !state.encoder_warmup_pending
-            {
+            if !state.encoder_warmup_pending {
                 encoder_warmup_frame = true;
                 drop_warmup_frame = false;
                 state.encoder_warmup_pending = true;
@@ -423,6 +480,18 @@ pub(super) unsafe fn run_wgc_capture_thread(
             && (state.pipeline_warmup_remaining > 0
                 || state.pipeline_warmup_stable_intervals
                     < pipeline_warmup_stable_intervals_required);
+        if !encoder_warmup_frame
+            && !pipeline_warmup_frame
+            && let (Some(origin_100ns), Some(previous_90k)) =
+                (state.timestamp_origin_100ns, state.last_timestamp_90k)
+            && wgc_timestamp_from_origin_90k(timestamp_100ns, origin_100ns)
+                .saturating_sub(previous_90k)
+                < minimum_source_interval_90k
+        {
+            state.stats.dropped_duplicate_timestamp += 1;
+            state.last_timestamp_100ns = Some(timestamp_100ns);
+            return Ok(());
+        }
 
         let surface = frame
             .Surface()
@@ -468,14 +537,15 @@ pub(super) unsafe fn run_wgc_capture_thread(
         let _guard = D3d11MultithreadGuard::enter(&wgc_multithread);
         let copy_started = std::time::Instant::now();
         slot.converter.convert(&source).map_err(|err| {
-                format!(
-                    "WGC capture route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
-                    initial_source_desc.Format.0,
-                    initial_snapshot_desc.Format.0,
-                    initial_snapshot_desc.Width,
-                    initial_snapshot_desc.Height
-                )
-            })?;
+            format!(
+                "WGC capture route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
+                initial_source_desc.Format.0,
+                initial_snapshot_desc.Format.0,
+                initial_snapshot_desc.Width,
+                initial_snapshot_desc.Height
+            )
+        })?;
+        slot.capture_fence.mark(&context);
         let copy_duration = copy_started.elapsed();
         state.stats.copied += 1;
         let callback_frame_duration = callback_frame_started.elapsed();
@@ -592,6 +662,35 @@ pub(super) unsafe fn run_wgc_capture_thread(
 
     let startup_deadline =
         std::time::Instant::now() + capture_duration + std::time::Duration::from_secs(10);
+    let wgc_coalesce_window = std::time::Duration::from_nanos(
+        u64::try_from(wgc_coalesce_window_100ns.max(0))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(100),
+    );
+    let mut pending_wgc_frame: Option<WgcQueuedFrame> = None;
+    let mut wgc_coalesced_frames = 0u64;
+    let mut enqueue_wgc_frame = |pending: &mut Option<WgcQueuedFrame>,
+                                 mut frame: WgcQueuedFrame| {
+        let Some(current) = pending.take() else {
+            *pending = Some(frame);
+            return None;
+        };
+        if should_coalesce_wgc_timestamps(
+            current.coalesce_origin_100ns,
+            frame.timestamp_100ns,
+            wgc_coalesce_window_100ns,
+        ) {
+            frame.coalesce_origin_100ns = current.coalesce_origin_100ns;
+            frame.coalesce_started_at = current.coalesce_started_at;
+            let _ = current.frame.Close();
+            wgc_coalesced_frames = wgc_coalesced_frames.saturating_add(1);
+            *pending = Some(frame);
+            None
+        } else {
+            *pending = Some(frame);
+            Some(current)
+        }
+    };
     while !stop.load(Ordering::Relaxed) {
         while let Ok(slot) = free_rx.try_recv() {
             return_slot(slot)?;
@@ -600,16 +699,31 @@ pub(super) unsafe fn run_wgc_capture_thread(
             while let Ok(slot) = free_rx.try_recv() {
                 return_slot(slot)?;
             }
-            wgc_frame_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            let frame_result = process_wgc_frame(frame);
-            if let Err(message) = frame_result {
+            atomic_queue_depth_decrement(&wgc_frame_queue_depth);
+            if let Some(frame) = enqueue_wgc_frame(&mut pending_wgc_frame, frame) {
+                let frame_result = process_wgc_frame(frame);
+                if let Err(message) = frame_result {
+                    if let Ok(mut state) = callback_state.lock() {
+                        state.error = Some(message);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        if pending_wgc_frame
+            .as_ref()
+            .is_some_and(|frame| frame.coalesce_started_at.elapsed() >= wgc_coalesce_window)
+        {
+            let frame = pending_wgc_frame.take().expect("pending WGC frame");
+            if let Err(message) = process_wgc_frame(frame) {
                 if let Ok(mut state) = callback_state.lock() {
                     state.error = Some(message);
                 }
                 stop.store(true, Ordering::Relaxed);
-                break;
-            }
-            if stop.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -631,17 +745,33 @@ pub(super) unsafe fn run_wgc_capture_thread(
                 while let Ok(slot) = free_rx.try_recv() {
                     return_slot(slot)?;
                 }
-                wgc_frame_queue_depth.fetch_sub(1, Ordering::Relaxed);
-                let frame_result = process_wgc_frame(frame);
-                if let Err(message) = frame_result {
-                    if let Ok(mut state) = callback_state.lock() {
-                        state.error = Some(message);
+                atomic_queue_depth_decrement(&wgc_frame_queue_depth);
+                if let Some(frame) = enqueue_wgc_frame(&mut pending_wgc_frame, frame) {
+                    let frame_result = process_wgc_frame(frame);
+                    if let Err(message) = frame_result {
+                        if let Ok(mut state) = callback_state.lock() {
+                            state.error = Some(message);
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
                     }
-                    stop.store(true, Ordering::Relaxed);
-                    break;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if pending_wgc_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.coalesce_started_at.elapsed() >= wgc_coalesce_window)
+                {
+                    let frame = pending_wgc_frame.take().expect("pending WGC frame");
+                    if let Err(message) = process_wgc_frame(frame) {
+                        if let Ok(mut state) = callback_state.lock() {
+                            state.error = Some(message);
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         while let Ok(slot) = free_rx.try_recv() {
@@ -656,6 +786,9 @@ pub(super) unsafe fn run_wgc_capture_thread(
             stop.store(true, Ordering::Relaxed);
             break;
         }
+    }
+    if let Some(frame) = pending_wgc_frame.take() {
+        let _ = frame.frame.Close();
     }
 
     let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -690,6 +823,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         (state.error.clone(), state.stats.clone())
     };
     stats.wgc_input_queue_max = wgc_frame_queue_depth_max.load(Ordering::Relaxed) as u64;
+    stats.wgc_coalesced_frames = wgc_coalesced_frames;
     // Some WGC/WinRT wrappers have shown access violations when released
     // immediately on the capture thread after a high-rate recording. Keep only
     // the WinRT capture graph alive; snapshot slots and shared handles still drop.

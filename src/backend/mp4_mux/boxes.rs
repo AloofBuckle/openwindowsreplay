@@ -282,7 +282,7 @@ pub(super) fn make_hvc1_sample_entry(
     be32(&mut p, 0);
     be16(&mut p, 1);
     let mut compressor = [0u8; 32];
-    let name = b"oneVPL HEVC";
+    let name = b"RustReplay HEVC";
     compressor[0] = name.len() as u8;
     compressor[1..=name.len()].copy_from_slice(name);
     p.extend_from_slice(&compressor);

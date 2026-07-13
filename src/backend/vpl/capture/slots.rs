@@ -62,6 +62,7 @@ pub(in super::super) struct WgcLocalSlot {
     pub(in super::super) id: usize,
     pub(in super::super) texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     pub(in super::super) converter: GpuRecordConverter,
+    pub(in super::super) capture_fence: GpuCompletionFence,
 }
 
 #[cfg(windows)]
@@ -101,6 +102,8 @@ pub(in super::super) struct CaptureStats {
     pub(in super::super) wgc_frame_queue_total_us: u64,
     pub(in super::super) wgc_frame_queue_max_us: u64,
     pub(in super::super) wgc_input_queue_max: u64,
+    pub(in super::super) wgc_coalesced_frames: u64,
+    pub(in super::super) wgc_coalesce_window_100ns: i64,
 }
 
 #[cfg(windows)]
@@ -130,6 +133,8 @@ impl CaptureStats {
             wgc_frame_queue_total_us: 0,
             wgc_frame_queue_max_us: 0,
             wgc_input_queue_max: 0,
+            wgc_coalesced_frames: 0,
+            wgc_coalesce_window_100ns: 0,
         }
     }
 
@@ -211,7 +216,7 @@ impl CaptureStats {
             self.wgc_frame_queue_total_us as f64 / self.wgc_frame_queue_count as f64 / 1000.0
         };
         format!(
-            "capture-thread: acquired={}, copied={}, dropped_no_slot={}, dropped_queue_full={}, dropped_duplicate_timestamp={}, dropped_warmup={}, dda_timeouts={}, dda_accumulated avg/max={:.2}/{}, source_interval count={} min/max={:.3}/{:.3}ms above7.5={} below6.5={} bad_examples=[{}], callback_cpu avg/max={:.3}/{:.3}ms copy_max={:.3}ms, wgc_frame_queue avg/max={:.3}/{:.3}ms input_queue_max={}",
+            "capture-thread: acquired={}, copied={}, dropped_no_slot={}, dropped_queue_full={}, dropped_duplicate_timestamp={}, dropped_warmup={}, dda_timeouts={}, dda_accumulated avg/max={:.2}/{}, source_interval count={} min/max={:.3}/{:.3}ms above7.5={} below6.5={} bad_examples=[{}], callback_cpu avg/max={:.3}/{:.3}ms copy_max={:.3}ms, wgc_frame_queue avg/max={:.3}/{:.3}ms input_queue_max={}, wgc_coalesced={} window={:.3}ms",
             self.acquired,
             self.copied,
             self.dropped_no_slot,
@@ -233,6 +238,8 @@ impl CaptureStats {
             wgc_queue_avg_ms,
             self.wgc_frame_queue_max_us as f64 / 1000.0,
             self.wgc_input_queue_max,
+            self.wgc_coalesced_frames,
+            self.wgc_coalesce_window_100ns as f64 / 10_000.0,
         )
     }
 }
@@ -292,5 +299,6 @@ pub(in super::super) unsafe fn create_wgc_local_slot(
         id,
         texture,
         converter,
+        capture_fence: GpuCompletionFence::new(device)?,
     })
 }
