@@ -3914,7 +3914,7 @@ unsafe fn finish_synced_async_encode(
     bitstream_pool.push(flight.storage);
     Ok(Some(crate::backend::mp4_mux::HevcAccessUnit {
         timestamp_90k: flight.timestamp_90k,
-        data,
+        data: data.into(),
         is_sync,
         discard_from_track: flight.discard,
     }))
@@ -4039,7 +4039,7 @@ unsafe fn flush_encoder(
                 samples,
                 crate::backend::mp4_mux::HevcAccessUnit {
                     timestamp_90k,
-                    data: encoded.bytes,
+                    data: encoded.bytes.into(),
                     is_sync,
                     discard_from_track: false,
                 },
@@ -4425,6 +4425,7 @@ struct CapturedSnapshot {
 struct WgcLocalSlot {
     id: usize,
     texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    converter: GpuRecordConverter,
     fence: GpuCompletionFence,
 }
 
@@ -4630,39 +4631,32 @@ fn wgc_local_slot_matches(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_wgc_local_slot(
     id: usize,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     source_desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+    route: VplRecordRoute,
+    input_width: u32,
+    input_height: u32,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
 ) -> Result<WgcLocalSlot, BackendError> {
-    use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
-
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: source_desc.Width.max(1),
-        Height: source_desc.Height.max(1),
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: source_desc.Format,
-        SampleDesc: source_desc.SampleDesc,
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: 0,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let mut texture = None;
-    device
-        .CreateTexture2D(&desc, None, Some(&mut texture))
-        .map_err(|err| BackendError::WindowsApi {
-            func: "ID3D11Device::CreateTexture2D(WGC local snapshot)",
-            message: err.to_string(),
-        })?;
-    let texture = texture.ok_or_else(|| BackendError::WindowsApi {
-        func: "CreateTexture2D(WGC local snapshot)",
-        message: "返回空纹理".to_owned(),
-    })?;
+    let texture = create_route_intermediate(device, source_desc, route, true)?;
+    let converter = GpuRecordConverter::new_with_source_cache(
+        route,
+        device,
+        context,
+        &texture,
+        input_width,
+        input_height,
+        true,
+        source_srv_cache,
+    )?;
     Ok(WgcLocalSlot {
         id,
         texture,
+        converter,
         fence: GpuCompletionFence::new(device)?,
     })
 }
@@ -5313,25 +5307,24 @@ unsafe fn run_wgc_capture_thread(
         Format: route_dxgi_format,
         ..initial_source_desc
     };
-    let route_intermediate =
-        create_route_intermediate(&device, &initial_snapshot_desc, route, true)
-            .map_err(|err| err.to_string())?;
-    let route_converter = GpuRecordConverter::new(
-        route,
-        &device,
-        &context,
-        &route_intermediate,
-        initial_source_desc.Width,
-        initial_source_desc.Height,
-        true,
-    )
-    .map_err(|err| err.to_string())?;
-    let capture_route_path = (route_intermediate, route_converter);
     initial_state.source_desc = Some(initial_snapshot_desc);
+    // WGC frame-pool surfaces must not be retained by cached SRVs; holding a view
+    // pins the source buffer and prevents the small WinRT frame pool from recycling.
+    let source_srv_cache =
+        std::sync::Arc::new(std::sync::Mutex::new(ShaderResourceViewCache::transient()));
     for id in 0..pool_size {
         initial_state.free_slots.push_back(
-            create_wgc_local_slot(id, &device, &initial_snapshot_desc)
-                .map_err(|err| err.to_string())?,
+            create_wgc_local_slot(
+                id,
+                &device,
+                &context,
+                &initial_snapshot_desc,
+                route,
+                initial_source_desc.Width,
+                initial_source_desc.Height,
+                source_srv_cache.clone(),
+            )
+            .map_err(|err| err.to_string())?,
         );
     }
     let callback_state = Arc::new(Mutex::new(initial_state));
@@ -5506,13 +5499,7 @@ unsafe fn run_wgc_capture_thread(
         };
         let _guard = D3d11MultithreadGuard::enter(&wgc_multithread);
         let copy_started = std::time::Instant::now();
-        let (route_intermediate, route_converter) = &capture_route_path;
-        route_converter
-            .convert(&source)
-            .and_then(|()| {
-                copy_texture_resource(&context, route_intermediate, &slot.texture)
-            })
-            .map_err(|err| {
+        slot.converter.convert(&source).map_err(|err| {
                 format!(
                     "WGC capture route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
                     initial_source_desc.Format.0,
@@ -5828,17 +5815,73 @@ unsafe fn copy_texture_subresource_region(
 }
 
 #[cfg(windows)]
-unsafe fn create_shader_resource_view_with_gpu_copy_fallback(
+struct ShaderResourceViewCache {
+    direct: HashMap<usize, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>,
+    retain_views: bool,
+}
+
+#[cfg(windows)]
+impl ShaderResourceViewCache {
+    fn retained() -> Self {
+        Self {
+            direct: HashMap::new(),
+            retain_views: true,
+        }
+    }
+
+    fn transient() -> Self {
+        Self {
+            direct: HashMap::new(),
+            retain_views: false,
+        }
+    }
+
+    unsafe fn get_or_create(
+        &mut self,
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        label: &'static str,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, BackendError> {
+        if !self.retain_views {
+            return create_shader_resource_view_with_gpu_copy_fallback(
+                device, context, source, label,
+            );
+        }
+        let key = windows::core::Interface::as_raw(source) as usize;
+        if let Some(srv) = self.direct.get(&key) {
+            return Ok(srv.clone());
+        }
+        if let Ok(srv) = create_direct_shader_resource_view(device, source, label) {
+            if self.direct.len() >= 64 {
+                self.direct.clear();
+            }
+            self.direct.insert(key, srv.clone());
+            return Ok(srv);
+        }
+        create_shader_resource_view_with_gpu_copy_fallback(device, context, source, label)
+    }
+}
+
+#[cfg(windows)]
+fn lock_srv_cache(
+    cache: &std::sync::Mutex<ShaderResourceViewCache>,
+) -> Result<std::sync::MutexGuard<'_, ShaderResourceViewCache>, BackendError> {
+    cache
+        .lock()
+        .map_err(|_| BackendError::unsupported("D3D11 SRV cache", "mutex", "SRV cache 锁已中毒"))
+}
+
+#[cfg(windows)]
+unsafe fn create_direct_shader_resource_view(
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
-    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     label: &'static str,
 ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, BackendError> {
     use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC,
-        D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_DEFAULT, ID3D11Resource,
+        D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV,
+        D3D11_TEXTURE2D_DESC, ID3D11Resource,
     };
     use windows::core::Interface;
 
@@ -5871,23 +5914,49 @@ unsafe fn create_shader_resource_view_with_gpu_copy_fallback(
         },
     };
     let mut explicit_srv = None;
-    if device
+    device
         .CreateShaderResourceView(
             &source_resource,
             Some(&explicit_srv_desc),
             Some(&mut explicit_srv),
         )
-        .is_ok()
-    {
-        return explicit_srv.ok_or_else(|| BackendError::WindowsApi {
+        .map_err(|err| BackendError::WindowsApi {
             func: label,
             message: format!(
-                "显式 SRV desc 返回空 SRV，format={}, bind_flags=0x{:X}",
+                "CreateShaderResourceView direct failed: {err}; format={}, bind_flags=0x{:X}",
                 desc.Format.0, desc.BindFlags
             ),
-        });
+        })?;
+    explicit_srv.ok_or_else(|| BackendError::WindowsApi {
+        func: label,
+        message: format!(
+            "显式 SRV desc 返回空 SRV，format={}, bind_flags=0x{:X}",
+            desc.Format.0, desc.BindFlags
+        ),
+    })
+}
+
+#[cfg(windows)]
+unsafe fn create_shader_resource_view_with_gpu_copy_fallback(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    label: &'static str,
+) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, BackendError> {
+    use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC,
+        D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, ID3D11Resource,
+    };
+    use windows::core::Interface;
+
+    if let Ok(srv) = create_direct_shader_resource_view(device, source, label) {
+        return Ok(srv);
     }
 
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    source.GetDesc(&mut desc);
     let copy_desc = D3D11_TEXTURE2D_DESC {
         Width: desc.Width.max(1),
         Height: desc.Height.max(1),
@@ -6171,6 +6240,7 @@ unsafe fn return_ready_snapshot_slots(
 struct GpuSnapshotConverter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     output: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     render_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     vertex_shader: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
@@ -6245,6 +6315,9 @@ impl GpuSnapshotConverter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                ShaderResourceViewCache::retained(),
+            )),
             output,
             render_target,
             vertex_shader: vertex_shader.ok_or_else(|| BackendError::WindowsApi {
@@ -6293,26 +6366,14 @@ impl GpuSnapshotConverter {
     ) -> Result<(), BackendError> {
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         use windows::Win32::Graphics::Direct3D11::{
-            ID3D11RenderTargetView, ID3D11Resource, ID3D11ShaderResourceView,
+            ID3D11RenderTargetView, ID3D11ShaderResourceView,
         };
-        use windows::core::Interface;
-
-        let source_resource: ID3D11Resource =
-            source.cast().map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Texture2D::cast<ID3D11Resource>(shader snapshot source)",
-                message: err.to_string(),
-            })?;
-        let mut srv = None;
-        self.device
-            .CreateShaderResourceView(&source_resource, None, Some(&mut srv))
-            .map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Device::CreateShaderResourceView(shader snapshot source)",
-                message: err.to_string(),
-            })?;
-        let srv = srv.ok_or_else(|| BackendError::WindowsApi {
-            func: "CreateShaderResourceView(shader snapshot source)",
-            message: "返回空 SRV".to_owned(),
-        })?;
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
+            &self.device,
+            &self.context,
+            source,
+            "ID3D11Device::CreateShaderResourceView(shader snapshot source)",
+        )?;
 
         self.context
             .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -6362,6 +6423,7 @@ fn snapshot_viewport(
 struct GpuRgbaConverter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     output: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     render_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     vertex_shader: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
@@ -6443,6 +6505,9 @@ impl GpuRgbaConverter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                ShaderResourceViewCache::retained(),
+            )),
             output,
             render_target,
             vertex_shader: vertex_shader.ok_or_else(|| BackendError::WindowsApi {
@@ -6470,26 +6535,14 @@ impl GpuRgbaConverter {
     ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, BackendError> {
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         use windows::Win32::Graphics::Direct3D11::{
-            ID3D11RenderTargetView, ID3D11Resource, ID3D11ShaderResourceView,
+            ID3D11RenderTargetView, ID3D11ShaderResourceView,
         };
-        use windows::core::Interface;
-
-        let source_resource: ID3D11Resource =
-            source.cast().map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Texture2D::cast<ID3D11Resource>(RGBA source)",
-                message: err.to_string(),
-            })?;
-        let mut srv = None;
-        self.device
-            .CreateShaderResourceView(&source_resource, None, Some(&mut srv))
-            .map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Device::CreateShaderResourceView(RGBA source)",
-                message: err.to_string(),
-            })?;
-        let srv = srv.ok_or_else(|| BackendError::WindowsApi {
-            func: "CreateShaderResourceView(RGBA source)",
-            message: "返回空 SRV".to_owned(),
-        })?;
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
+            &self.device,
+            &self.context,
+            source,
+            "ID3D11Device::CreateShaderResourceView(RGBA source)",
+        )?;
 
         self.context.RSSetViewports(Some(&[self.viewport]));
         self.context
@@ -6516,6 +6569,7 @@ impl GpuRgbaConverter {
 struct GpuRgb4Converter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     render_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     vertex_shader: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
     pixel_shader: windows::Win32::Graphics::Direct3D11::ID3D11PixelShader,
@@ -6530,6 +6584,7 @@ impl GpuRgb4Converter {
         output: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         width: u32,
         height: u32,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     ) -> Result<Self, BackendError> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
@@ -6572,6 +6627,7 @@ impl GpuRgb4Converter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache,
             render_target: render_target.ok_or_else(|| BackendError::WindowsApi {
                 func: "CreateRenderTargetView(RGB4 writer)",
                 message: "返回空 RTV".to_owned(),
@@ -6604,7 +6660,7 @@ impl GpuRgb4Converter {
             ID3D11RenderTargetView, ID3D11ShaderResourceView,
         };
 
-        let srv = create_shader_resource_view_with_gpu_copy_fallback(
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
             &self.device,
             &self.context,
             source,
@@ -6647,9 +6703,38 @@ impl GpuRecordConverter {
         height: u32,
         enable_compute: bool,
     ) -> Result<Self, BackendError> {
+        Self::new_with_source_cache(
+            route,
+            device,
+            context,
+            output,
+            width,
+            height,
+            enable_compute,
+            std::sync::Arc::new(std::sync::Mutex::new(ShaderResourceViewCache::retained())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn new_with_source_cache(
+        route: VplRecordRoute,
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        output: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        enable_compute: bool,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
+    ) -> Result<Self, BackendError> {
         match route.fourcc {
             MFX_FOURCC_NV12 => Ok(Self::Nv12(GpuNv12Converter::new(
-                route, device, context, output, width, height,
+                route,
+                device,
+                context,
+                output,
+                width,
+                height,
+                source_srv_cache,
             )?)),
             MFX_FOURCC_P010 => Ok(Self::P010(GpuP010Converter::new(
                 route,
@@ -6659,14 +6744,26 @@ impl GpuRecordConverter {
                 width,
                 height,
                 enable_compute,
+                source_srv_cache,
             )?)),
             MFX_FOURCC_YUY2 | MFX_FOURCC_Y210 | MFX_FOURCC_AYUV | MFX_FOURCC_Y410 => {
                 Ok(Self::Packed(GpuPackedConverter::new(
-                    route, device, context, output, width, height,
+                    route,
+                    device,
+                    context,
+                    output,
+                    width,
+                    height,
+                    source_srv_cache,
                 )?))
             }
             MFX_FOURCC_RGB4 => Ok(Self::Rgb4(GpuRgb4Converter::new(
-                device, context, output, width, height,
+                device,
+                context,
+                output,
+                width,
+                height,
+                source_srv_cache,
             )?)),
             _ => Err(BackendError::unsupported(
                 "GPU ChromaWriter",
@@ -6693,6 +6790,7 @@ impl GpuRecordConverter {
 struct GpuNv12Converter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     luma_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
     chroma_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
     compute_shader: windows::Win32::Graphics::Direct3D11::ID3D11ComputeShader,
@@ -6709,6 +6807,7 @@ impl GpuNv12Converter {
         output: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         width: u32,
         height: u32,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     ) -> Result<Self, BackendError> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_TEX2D_UAV1, D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC1,
@@ -6812,6 +6911,7 @@ impl GpuNv12Converter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache,
             luma_uav,
             chroma_uav,
             compute_shader: compute_shader.ok_or_else(|| BackendError::WindowsApi {
@@ -6831,7 +6931,7 @@ impl GpuNv12Converter {
             ID3D11ComputeShader, ID3D11ShaderResourceView, ID3D11UnorderedAccessView,
         };
 
-        let srv = create_shader_resource_view_with_gpu_copy_fallback(
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
             &self.device,
             &self.context,
             source,
@@ -6862,6 +6962,7 @@ impl GpuNv12Converter {
 struct GpuPackedConverter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     output_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
     compute_shader: windows::Win32::Graphics::Direct3D11::ID3D11ComputeShader,
     dispatch_width: u32,
@@ -6878,6 +6979,7 @@ impl GpuPackedConverter {
         output: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         width: u32,
         height: u32,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     ) -> Result<Self, BackendError> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_TEX2D_UAV1, D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC1,
@@ -6993,6 +7095,7 @@ impl GpuPackedConverter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache,
             output_uav,
             compute_shader: compute_shader.ok_or_else(|| BackendError::WindowsApi {
                 func: "CreateComputeShader(packed converter)",
@@ -7012,7 +7115,7 @@ impl GpuPackedConverter {
             ID3D11ComputeShader, ID3D11ShaderResourceView, ID3D11UnorderedAccessView,
         };
 
-        let srv = create_shader_resource_view_with_gpu_copy_fallback(
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
             &self.device,
             &self.context,
             source,
@@ -7043,6 +7146,7 @@ impl GpuPackedConverter {
 struct GpuP010Converter {
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     luma_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     chroma_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     pq_lut: Option<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>,
@@ -7060,6 +7164,7 @@ struct GpuP010Converter {
 
 #[cfg(windows)]
 impl GpuP010Converter {
+    #[allow(clippy::too_many_arguments)]
     unsafe fn new(
         route: VplRecordRoute,
         device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -7068,6 +7173,7 @@ impl GpuP010Converter {
         width: u32,
         height: u32,
         enable_compute: bool,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
     ) -> Result<Self, BackendError> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_RENDER_TARGET_VIEW_DESC1, D3D11_RENDER_TARGET_VIEW_DESC1_0,
@@ -7282,6 +7388,7 @@ impl GpuP010Converter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
+            source_srv_cache,
             luma_target,
             chroma_target,
             pq_lut: transfer_lut,
@@ -7331,7 +7438,7 @@ impl GpuP010Converter {
             ID3D11UnorderedAccessView,
         };
 
-        let srv = create_shader_resource_view_with_gpu_copy_fallback(
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
             &self.device,
             &self.context,
             source,
@@ -7405,26 +7512,14 @@ impl GpuP010Converter {
 
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         use windows::Win32::Graphics::Direct3D11::{
-            D3D11_VIEWPORT, ID3D11RenderTargetView, ID3D11Resource, ID3D11ShaderResourceView,
+            D3D11_VIEWPORT, ID3D11RenderTargetView, ID3D11ShaderResourceView,
         };
-        use windows::core::Interface;
-
-        let source_resource: ID3D11Resource =
-            source.cast().map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Texture2D::cast<ID3D11Resource>(P010 dirty source)",
-                message: err.to_string(),
-            })?;
-        let mut srv = None;
-        self.device
-            .CreateShaderResourceView(&source_resource, None, Some(&mut srv))
-            .map_err(|err| BackendError::WindowsApi {
-                func: "ID3D11Device::CreateShaderResourceView(P010 dirty source)",
-                message: err.to_string(),
-            })?;
-        let srv = srv.ok_or_else(|| BackendError::WindowsApi {
-            func: "CreateShaderResourceView(P010 dirty source)",
-            message: "返回空 SRV".to_owned(),
-        })?;
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
+            &self.device,
+            &self.context,
+            source,
+            "ID3D11Device::CreateShaderResourceView(P010 dirty source)",
+        )?;
 
         self.context
             .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -8880,14 +8975,39 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
 "#;
 
 #[cfg(windows)]
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ShaderCompileKey {
+    source: String,
+    entry: Vec<u8>,
+    target: Vec<u8>,
+}
+
+#[cfg(windows)]
+static SHADER_BYTECODE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<ShaderCompileKey, std::sync::Arc<[u8]>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
 unsafe fn compile_shader(
     source: &str,
     entry: &[u8],
     target: &[u8],
-) -> Result<Vec<u8>, BackendError> {
+) -> Result<std::sync::Arc<[u8]>, BackendError> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
     use windows::core::PCSTR;
+
+    let key = ShaderCompileKey {
+        source: source.to_owned(),
+        entry: entry.to_vec(),
+        target: target.to_vec(),
+    };
+    let cache = SHADER_BYTECODE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(code) = cache.get(&key)
+    {
+        return Ok(code.clone());
+    }
 
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -8923,7 +9043,11 @@ unsafe fn compile_shader(
     })?;
     let ptr = code.GetBufferPointer() as *const u8;
     let len = code.GetBufferSize();
-    Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    let bytes: std::sync::Arc<[u8]> = std::slice::from_raw_parts(ptr, len).to_vec().into();
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, bytes.clone());
+    }
+    Ok(bytes)
 }
 
 #[cfg(windows)]

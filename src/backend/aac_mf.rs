@@ -208,7 +208,7 @@ mod platform {
                 Ok(Some(AacAccessUnit {
                     timestamp_ticks: time_100ns_to_ticks(timestamp_100ns),
                     duration_ticks: time_100ns_to_ticks(duration_100ns).max(1) as u32,
-                    data,
+                    data: data.into(),
                 }))
             }
         }

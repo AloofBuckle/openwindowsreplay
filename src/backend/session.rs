@@ -1090,13 +1090,13 @@ impl DiskSegmentSink {
         if self
             .header_units
             .iter()
-            .any(|header| header.data.as_slice() == data.as_slice())
+            .any(|header| header.data.as_ref() == data.as_slice())
         {
             return;
         }
         self.header_units.push(HevcAccessUnit {
             timestamp_90k: 0,
-            data,
+            data: data.into(),
             is_sync: false,
             discard_from_track: true,
         });
@@ -1724,14 +1724,14 @@ mod tests {
         builder.end_90k = Some(180_000);
         builder.push_video(&HevcAccessUnit {
             timestamp_90k: 90_000,
-            data: vec![0, 0, 1, 38, 1],
+            data: vec![0, 0, 1, 38, 1].into(),
             is_sync: true,
             discard_from_track: false,
         });
         builder.push_audio(&AacAccessUnit {
             timestamp_ticks: 48_000,
             duration_ticks: 1024,
-            data: vec![0x21, 0x10],
+            data: vec![0x21, 0x10].into(),
         });
 
         let segment = builder.into_tracks(&[]).unwrap();
@@ -1755,13 +1755,13 @@ mod tests {
                 samples: vec![
                     HevcAccessUnit {
                         timestamp_90k: video_start_90k,
-                        data: fake_hevc_parameter_sets(),
+                        data: fake_hevc_parameter_sets().into(),
                         is_sync: false,
                         discard_from_track: true,
                     },
                     HevcAccessUnit {
                         timestamp_90k: video_start_90k,
-                        data: fake_hevc_idr(),
+                        data: fake_hevc_idr().into(),
                         is_sync: true,
                         discard_from_track: false,
                     },
@@ -1775,12 +1775,12 @@ mod tests {
                     AacAccessUnit {
                         timestamp_ticks: audio_start_ticks,
                         duration_ticks: 1024,
-                        data: vec![0x21, 0x10],
+                        data: vec![0x21, 0x10].into(),
                     },
                     AacAccessUnit {
                         timestamp_ticks: audio_start_ticks + audio_duration_ticks / 2,
                         duration_ticks: 1024,
-                        data: vec![0x21, 0x10],
+                        data: vec![0x21, 0x10].into(),
                     },
                 ],
             }),

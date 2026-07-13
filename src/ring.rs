@@ -9,6 +9,7 @@ use crate::backend::mp4_mux::{
     NclxColorMetadata,
 };
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub struct EncodedPacket {
     pub dts_ns: u64,
     pub duration_ns: u64,
     pub is_key: bool,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
 }
 
 impl EncodedPacket {
@@ -517,6 +518,8 @@ mod tests {
             duration_ticks: 96_000,
             samples: vec![aac(0), aac(48_000)],
         };
+        let video_bytes = video.samples[0].data.clone();
+        let audio_bytes = audio.samples[0].data.clone();
         let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
         replay.push_tracks(&video, Some(&audio));
         let snap = replay
@@ -525,7 +528,10 @@ mod tests {
         assert_eq!(snap.video_track.width, 16);
         assert_eq!(snap.video_track.samples[0].timestamp_90k, 0);
         assert!(snap.video_track.samples[0].is_sync);
-        assert_eq!(snap.audio_track.unwrap().samples[0].timestamp_ticks, 0);
+        assert!(Arc::ptr_eq(&video_bytes, &snap.video_track.samples[0].data));
+        let audio_track = snap.audio_track.unwrap();
+        assert_eq!(audio_track.samples[0].timestamp_ticks, 0);
+        assert!(Arc::ptr_eq(&audio_bytes, &audio_track.samples[0].data));
     }
 
     #[test]
@@ -563,14 +569,14 @@ mod tests {
             dts_ns: pts_ns,
             duration_ns: 1,
             is_key: false,
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
         }
     }
 
     fn hevc(timestamp_90k: u64, is_sync: bool) -> HevcAccessUnit {
         HevcAccessUnit {
             timestamp_90k,
-            data: vec![0, 0, 1, 38, 1],
+            data: vec![0, 0, 1, 38, 1].into(),
             is_sync,
             discard_from_track: false,
         }
@@ -580,7 +586,7 @@ mod tests {
         AacAccessUnit {
             timestamp_ticks,
             duration_ticks: 1024,
-            data: vec![0x21, 0x10],
+            data: vec![0x21, 0x10].into(),
         }
     }
 }

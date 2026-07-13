@@ -9,6 +9,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const VIDEO_TIMESCALE: u32 = 90_000;
 const MOVIE_TIMESCALE: u32 = 1_000;
@@ -16,7 +17,7 @@ const MOVIE_TIMESCALE: u32 = 1_000;
 #[derive(Debug, Clone)]
 pub struct HevcAccessUnit {
     pub timestamp_90k: u64,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     pub is_sync: bool,
     /// 只用于从预热帧中提取 VPS/SPS/PPS 等参数集，不写入 MP4 sample 表。
     pub discard_from_track: bool,
@@ -37,7 +38,7 @@ pub struct AacAccessUnit {
     pub timestamp_ticks: u64,
     pub duration_ticks: u32,
     /// MP4 `mp4a` sample 应写入裸 AAC access unit，不包含 ADTS 头。
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +173,7 @@ struct PreparedAudioSample {
 
 #[derive(Debug, Clone)]
 enum SamplePayload {
-    Memory(Vec<u8>),
+    Memory(Arc<[u8]>),
     FileRange(Mp4SampleFileRange),
 }
 
@@ -545,7 +546,7 @@ fn prepare_video_track(
         playable_index += 1;
         converted.push(PreparedSample {
             duration_90k,
-            data: SamplePayload::Memory(data),
+            data: SamplePayload::Memory(data.into()),
             is_sync: sample.is_sync || is_sync || converted.is_empty(),
         });
     }
@@ -1513,7 +1514,7 @@ mod tests {
             codec: HevcCodecMetadata::main_420_8(),
             samples: vec![HevcAccessUnit {
                 timestamp_90k: 0,
-                data: fake_hevc_annex_b_access_unit(),
+                data: fake_hevc_annex_b_access_unit().into(),
                 is_sync: true,
                 discard_from_track: false,
             }],
@@ -1526,12 +1527,12 @@ mod tests {
                 AacAccessUnit {
                     timestamp_ticks: 0,
                     duration_ticks: 1024,
-                    data: vec![0x21, 0x10, 0x04, 0x60],
+                    data: vec![0x21, 0x10, 0x04, 0x60].into(),
                 },
                 AacAccessUnit {
                     timestamp_ticks: 1024,
                     duration_ticks: 1024,
-                    data: vec![0x21, 0x10, 0x04, 0x61],
+                    data: vec![0x21, 0x10, 0x04, 0x61].into(),
                 },
             ],
         };
