@@ -6,13 +6,18 @@ pub(super) struct DiskSegmentSink {
     pub(super) run_index: u64,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) failed: bool,
+    pub(super) failure_message: Option<String>,
     pub(super) metadata: Option<EncodedReplayMetadata>,
-    pub(super) header_units: Vec<HevcAccessUnit>,
+    pub(super) parameter_sets: super::mp4_mux::HevcParameterSetTracker,
+    pub(super) pending_codec_epoch_change: bool,
     pub(super) current: Option<DiskSegmentBuilder>,
     pub(super) pending: VecDeque<DiskSegmentBuilder>,
     pub(super) target_duration_90k: u64,
+    pub(super) max_open_duration_90k: u64,
+    pub(super) waiting_for_sync_start_90k: Option<u64>,
     pub(super) latest_audio_ticks: u64,
     pub(super) live_ring: Arc<Mutex<EncodedReplayRing>>,
+    pub(super) live_run_index: Arc<AtomicU64>,
 }
 
 impl DiskSegmentSink {
@@ -23,6 +28,7 @@ impl DiskSegmentSink {
         replay_duration: Duration,
         stop: Arc<AtomicBool>,
         live_ring: Arc<Mutex<EncodedReplayRing>>,
+        live_run_index: Arc<AtomicU64>,
     ) -> Self {
         let target_seconds = DISK_SEGMENT_TARGET_SECONDS
             .min((replay_duration.as_secs_f32() / 2.0).max(1.0))
@@ -33,13 +39,18 @@ impl DiskSegmentSink {
             run_index,
             stop,
             failed: false,
+            failure_message: None,
             metadata: None,
-            header_units: Vec::new(),
+            parameter_sets: super::mp4_mux::HevcParameterSetTracker::default(),
+            pending_codec_epoch_change: false,
             current: None,
             pending: VecDeque::new(),
             target_duration_90k: seconds_to_90k(target_seconds),
+            max_open_duration_90k: seconds_to_90k(target_seconds).saturating_mul(4).max(1),
+            waiting_for_sync_start_90k: None,
             latest_audio_ticks: 0,
             live_ring,
+            live_run_index,
         }
     }
 
@@ -72,6 +83,14 @@ impl DiskSegmentSink {
         }
     }
 
+    pub(super) fn abort(&mut self) {
+        self.current = None;
+        self.pending.clear();
+        if let Ok(mut ring) = self.live_ring.lock() {
+            ring.abort_segment();
+        }
+    }
+
     pub(super) fn status(&mut self, message: &str) {
         self.send_status(message);
     }
@@ -87,16 +106,22 @@ impl DiskSegmentSink {
         };
         self.metadata = Some(metadata.clone());
         if let Ok(mut ring) = self.live_ring.lock() {
-            ring.start_segment(metadata);
+            ring.restart_timeline(metadata);
+            self.live_run_index.store(self.run_index, Ordering::Release);
         }
-        self.send_status("oneVPL 编码器已 Init，磁盘循环分段器已建立。");
+        self.send_status("视频编码器已 Init，磁盘循环分段器已建立。");
     }
 
     pub(super) fn hevc_access_unit(&mut self, sample: &HevcAccessUnit) {
         if self.failed {
             return;
         }
-        self.remember_parameter_sets(sample);
+        let parameter_sets_changed =
+            (!self.parameter_sets.is_ready() || sample.discard_from_track || sample.is_sync)
+                && self.parameter_sets.observe(&sample.data, sample.is_sync);
+        if parameter_sets_changed && self.current.is_some() {
+            self.pending_codec_epoch_change = true;
+        }
         if sample.discard_from_track {
             if let Ok(mut ring) = self.live_ring.lock() {
                 ring.push_video_au_90k(sample);
@@ -106,10 +131,57 @@ impl DiskSegmentSink {
         let Some(metadata) = self.metadata.clone() else {
             return;
         };
-        if self.current.is_none() {
-            if !sample.is_sync {
-                return;
+        if self.pending_codec_epoch_change && !sample.is_sync {
+            if let Ok(mut ring) = self.live_ring.lock() {
+                ring.push_video_au_90k(sample);
             }
+            return;
+        }
+        if self.current.is_none() && !sample.is_sync {
+            let waiting_start = *self
+                .waiting_for_sync_start_90k
+                .get_or_insert(sample.timestamp_90k);
+            if sample.timestamp_90k.saturating_sub(waiting_start) >= self.max_open_duration_90k {
+                self.fail(format!(
+                    "磁盘循环等待首个关键帧超过 {:.1}s，编码器未产生可独立解码的 HEVC IRAP",
+                    self.max_open_duration_90k as f64 / VIDEO_CLOCK_HZ as f64
+                ));
+            }
+            return;
+        }
+        if !sample.is_sync
+            && self.current.as_ref().is_some_and(|current| {
+                sample.timestamp_90k.saturating_sub(current.start_90k) >= self.max_open_duration_90k
+            })
+        {
+            self.fail(format!(
+                "磁盘循环开放分段超过 {:.1}s 仍未出现新的关键帧，拒绝无限积累编码数据",
+                self.max_open_duration_90k as f64 / VIDEO_CLOCK_HZ as f64
+            ));
+            return;
+        }
+
+        let should_rotate = self.current.as_ref().is_some_and(|current| {
+            sample.is_sync
+                && current.has_video()
+                && (self.pending_codec_epoch_change
+                    || sample.timestamp_90k.saturating_sub(current.start_90k)
+                        >= self.target_duration_90k)
+        });
+        let needs_new_builder = self.current.is_none() || should_rotate;
+        let mut parameter_set_header = if needs_new_builder {
+            let Some(header) = self.parameter_sets.header_access_unit() else {
+                self.fail(
+                    "磁盘循环收到 HEVC IRAP，但此前尚未取得完整 VPS/SPS/PPS 参数集".to_owned(),
+                );
+                return;
+            };
+            Some(header)
+        } else {
+            None
+        };
+        if self.current.is_none() {
+            self.waiting_for_sync_start_90k = None;
             self.current = Some(DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
@@ -117,15 +189,11 @@ impl DiskSegmentSink {
                     sample.timestamp_90k,
                     crate::backend::audio::TARGET_SAMPLE_RATE,
                 ),
+                parameter_set_header
+                    .take()
+                    .expect("new disk segment requires parameter sets"),
             ));
         }
-
-        let should_rotate = self.current.as_ref().is_some_and(|current| {
-            sample.is_sync
-                && current.has_video()
-                && sample.timestamp_90k.saturating_sub(current.start_90k)
-                    >= self.target_duration_90k
-        });
         if should_rotate {
             if let Some(mut current) = self.current.take() {
                 current.end_90k = Some(sample.timestamp_90k);
@@ -145,7 +213,11 @@ impl DiskSegmentSink {
                     sample.timestamp_90k,
                     crate::backend::audio::TARGET_SAMPLE_RATE,
                 ),
+                parameter_set_header
+                    .take()
+                    .expect("rotated disk segment requires parameter sets"),
             ));
+            self.pending_codec_epoch_change = false;
             if let Ok(mut ring) = self.live_ring.lock() {
                 ring.restart_timeline(metadata);
             }
@@ -186,29 +258,6 @@ impl DiskSegmentSink {
         self.flush_ready_pending();
     }
 
-    pub(super) fn remember_parameter_sets(&mut self, sample: &HevcAccessUnit) {
-        if !sample.discard_from_track && !sample.is_sync && !self.header_units.is_empty() {
-            return;
-        }
-        let Some(data) = super::mp4_mux::hevc_annex_b_parameter_set_access_unit(&sample.data)
-        else {
-            return;
-        };
-        if self
-            .header_units
-            .iter()
-            .any(|header| header.data.as_ref() == data.as_slice())
-        {
-            return;
-        }
-        self.header_units.push(HevcAccessUnit {
-            timestamp_90k: 0,
-            data: data.into(),
-            is_sync: false,
-            discard_from_track: true,
-        });
-    }
-
     pub(super) fn flush_ready_pending(&mut self) {
         loop {
             let ready = self
@@ -226,7 +275,7 @@ impl DiskSegmentSink {
     }
 
     pub(super) fn write_completed_segment(&mut self, segment: DiskSegmentBuilder) {
-        let Some(segment) = segment.into_tracks(&self.header_units) else {
+        let Some(segment) = segment.into_tracks() else {
             return;
         };
         let job = DiskSegmentWriteJob {
@@ -251,8 +300,12 @@ impl DiskSegmentSink {
             return;
         }
         self.failed = true;
+        self.failure_message = Some(message.clone());
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(ReplayEvent::Error(message));
+        let _ = self.tx.send(ReplayEvent::BackendStatus {
+            index: self.run_index,
+            message,
+        });
     }
 
     pub(super) fn send_status(&mut self, message: &str) {
@@ -271,6 +324,7 @@ pub(super) struct DiskSegmentBuilder {
     pub(super) end_90k: Option<u64>,
     pub(super) video_samples: Vec<HevcAccessUnit>,
     pub(super) audio_samples: Vec<AacAccessUnit>,
+    pub(super) parameter_set_header: Arc<[u8]>,
 }
 
 impl DiskSegmentBuilder {
@@ -278,6 +332,7 @@ impl DiskSegmentBuilder {
         metadata: EncodedReplayMetadata,
         start_90k: u64,
         start_audio_ticks: u64,
+        parameter_set_header: Arc<[u8]>,
     ) -> Self {
         Self {
             metadata,
@@ -286,6 +341,7 @@ impl DiskSegmentBuilder {
             end_90k: None,
             video_samples: Vec::new(),
             audio_samples: Vec::new(),
+            parameter_set_header,
         }
     }
 
@@ -322,7 +378,7 @@ impl DiskSegmentBuilder {
                 .is_some_and(|end_ticks| timestamp_ticks < end_ticks)
     }
 
-    pub(super) fn into_tracks(self, header_units: &[HevcAccessUnit]) -> Option<DiskSegmentTracks> {
+    pub(super) fn into_tracks(self) -> Option<DiskSegmentTracks> {
         let end_90k = self.end_90k?;
         let duration_90k = end_90k.saturating_sub(self.start_90k).max(1);
         if !self.has_video() {
@@ -335,15 +391,12 @@ impl DiskSegmentBuilder {
         {
             return None;
         }
-        let mut samples = header_units
-            .iter()
-            .map(|sample| {
-                let mut sample = sample.clone();
-                sample.timestamp_90k = 0;
-                sample.discard_from_track = true;
-                sample
-            })
-            .collect::<Vec<_>>();
+        let mut samples = vec![HevcAccessUnit {
+            timestamp_90k: 0,
+            data: self.parameter_set_header,
+            is_sync: false,
+            discard_from_track: true,
+        }];
         samples.extend(self.video_samples);
         let audio_track = if self.audio_samples.is_empty() {
             None

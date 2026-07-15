@@ -72,7 +72,7 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 cargo test --locked --target x86_64-pc-windows-msvc
 ```
 
-通过：88 passed，11 ignored（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
+通过：103 passed，11 ignored，0 failed（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
 
 ## NVENC 码控暴露与测试范围
 
@@ -89,6 +89,7 @@ cargo test --locked --target x86_64-pc-windows-msvc
 - WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
 - DDA 保持独立 capture device。捕获线程把 route 输出写入 keyed shared snapshot，编码线程再执行一次 GPU `CopyResource` 到普通 NVENC registered input；这是当前 NVIDIA 驱动拒绝 keyed shared texture 直接注册后的兼容路线。
 - NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
+- current-display route 自身记录 adapter LUID；录制初始化同时验证 route LUID、当前 DXGI adapter LUID 与 NVENC encoder D3D11 device LUID，防止多 NVIDIA GPU 或枚举顺序变化造成跨设备误配。
 - oneVPL implementation 同样通过 dispatcher 的 `mfxExtendedDeviceId.DeviceLUID` 与 DXGI adapter 精确绑定；同厂商多 GPU 不再只按 vendor ID 猜测。
 - 所有 adapter/output 都参与 route 探测，优先包含桌面原点的主显示器；rotation、desktop rect、DXGI color space 和 bits-per-color 会被验证并周期复核。
 - 当前 production-ready 范围：
@@ -158,6 +159,11 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 - MP4 mux 不再强制把首样本标为 sync；非 IDR/CRA 起始的视频会被拒绝。
 - 磁盘 writer 改为容量 3 的有界队列；队列满或 writer 失败会终止会话。分段、sidecar 和最终 replay 输出均通过 `.part` 事务写入。
 - 磁盘开放分段和已完成分段共用源时间保存游标；跨分段重复保存从下一处真实关键帧继续。
+- 磁盘保存游标进一步扩展为 `run_index + source PTS`；显示环境重探测导致新录制轮次 PTS 归零时，旧游标不会屏蔽新分段。
+- memory ring 保存游标绑定 codec epoch；分辨率、色彩、AAC 格式或 VPS/SPS/PPS 变化后不会沿用旧 epoch 的 PTS 游标。
+- VPS/SPS/PPS 按类别累计并只在 HEVC IRAP 边界切换；每个磁盘分段固定持有创建时的参数集 header。
+- NVENC 正常路径显式检查 unlock、unmap、unregister、bitstream destroy 和 encoder destroy；异常路径继续由幂等 RAII guard 兜底。
+- `NvEncodeAPIGetMaxSupportedVersion` 使用独立的 driver-version 编码比较；低于编译 API 13.1 的驱动会明确拒绝，不与 FFI struct-version 编码混淆。
 
 ## 明确边界 / 后续可选增强
 

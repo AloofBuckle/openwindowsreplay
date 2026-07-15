@@ -136,7 +136,6 @@ impl Drop for VplEncodeCleanupGuard<'_> {
     fn drop(&mut self) {
         unsafe {
             let runtime = &mut *self.runtime;
-            let _ = runtime.close_encoder();
             if let Some(surface) = (&mut *self.pending_surface).take()
                 && !surface.is_null()
             {
@@ -145,6 +144,7 @@ impl Drop for VplEncodeCleanupGuard<'_> {
                     let _ = ((*interface).Release)(surface);
                 }
             }
+            let _ = runtime.close_encoder();
             let _ = runtime.close_session_and_loader();
         }
     }
@@ -589,6 +589,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 "oneVPL surface 没有 FrameInterface",
             ));
         }
+        let surface_release = (*first_interface).Release;
         let first_surface_guard = MfxSurfaceGuard::new(first_surface, first_interface);
         let mut first_native: MfxHDL = ptr::null_mut();
         let mut first_native_type = 0u32;
@@ -643,6 +644,20 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 "GetDeviceHandle 返回值不是 ID3D11Device",
             ));
         };
+        let (vpl_luid_low, vpl_luid_high) = d3d11_device_adapter_luid(vpl_device)?;
+        if vpl_luid_low != desc.AdapterLuid.LowPart || vpl_luid_high != desc.AdapterLuid.HighPart {
+            return Err(BackendError::unsupported(
+                "oneVPL D3D11 device",
+                format!(
+                    "session LUID={:08X}:{:08X}, desktop adapter LUID={:08X}:{:08X}",
+                    vpl_luid_high as u32,
+                    vpl_luid_low,
+                    desc.AdapterLuid.HighPart as u32,
+                    desc.AdapterLuid.LowPart
+                ),
+                "不支持的桌面模式：oneVPL session 与捕获输出不在同一 DXGI adapter",
+            ));
+        }
         sink_status(
             &mut encoded_sink,
             format!(
@@ -1057,6 +1072,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
 
                             let frame_interface = (*surface).FrameInterface;
                             if frame_interface.is_null() {
+                                let _ = surface_release(surface);
                                 return Err(BackendError::unsupported(
                                     "oneVPL record",
                                     "FrameInterface",
@@ -1503,6 +1519,12 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         );
         surface_texture_cache.clear();
         let (close_status, mfx_close_status) = runtime.shutdown();
+        if close_status != MFX_ERR_NONE {
+            return Err(BackendError::VplStatus {
+                func: "MFXVideoENCODE_Close",
+                status: close_status,
+            });
+        }
         if mfx_close_status != MFX_ERR_NONE {
             return Err(BackendError::VplStatus {
                 func: "MFXClose",

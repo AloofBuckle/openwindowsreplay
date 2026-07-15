@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod boxes;
+mod parameter_sets;
 mod payload;
 mod types;
 mod writer;
 
 use boxes::*;
+pub(crate) use parameter_sets::HevcParameterSetTracker;
 use payload::*;
 use types::*;
 #[cfg(test)]
@@ -31,9 +33,10 @@ pub(crate) use types::{
     HevcIndexedMp4Track, HevcIndexedSample, HevcParameterSets, HevcPreparedMp4Track,
     HevcPreparedSample, Mp4SampleFileRange,
 };
+#[cfg(test)]
+pub(crate) use writer::hevc_annex_b_parameter_set_access_unit;
 pub(crate) use writer::{
-    hevc_annex_b_has_random_access_nal, hevc_annex_b_parameter_set_access_unit,
-    write_hevc_aac_mp4_with_index, write_prepared_hevc_aac_mp4,
+    hevc_annex_b_has_random_access_nal, write_hevc_aac_mp4_with_index, write_prepared_hevc_aac_mp4,
 };
 #[allow(unused_imports)]
 pub use writer::{write_hevc_aac_mp4, write_hevc_mp4};

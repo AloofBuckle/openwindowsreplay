@@ -29,6 +29,7 @@ const NV_ENC_SUCCESS: i32 = 0;
 const NVENCAPI_MAJOR_VERSION: u32 = 13;
 const NVENCAPI_MINOR_VERSION: u32 = 1;
 const NVENCAPI_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
+const NVENCAPI_DRIVER_VERSION: u32 = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
 const fn nvencapi_struct_version(version: u32) -> u32 {
     NVENCAPI_VERSION | (version << 16) | (0x7 << 28)
 }
@@ -308,6 +309,8 @@ pub struct NvencRateControlFeatureProbe {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NvencCurrentDisplayRouteInfo {
     pub adapter_index: u32,
+    #[serde(default)]
+    pub adapter_luid: String,
     pub output_index: u32,
     pub rotation: u32,
     pub color_space: u32,
@@ -551,7 +554,7 @@ impl NvencD3d11Encoder {
                     )
                 })?
             };
-            let mapped = map_input_resource(&self._api, self.session.encoder, registered)?;
+            let mut mapped = map_input_resource(&self._api, self.session.encoder, registered)?;
             encode_one_d3d11_frame(
                 &self._api,
                 self.session.encoder,
@@ -564,8 +567,11 @@ impl NvencD3d11Encoder {
                 timestamp_90k,
                 force_idr || self.frame_idx == 0,
             )?;
-            let (bytes, annex_b_start_code_seen) =
-                lock_and_copy_bitstream(&self._api, self.session.encoder, &self.bitstream)?;
+            let bitstream_result =
+                lock_and_copy_bitstream(&self._api, self.session.encoder, &self.bitstream);
+            let unmap_status = mapped.unmap_now();
+            let (bytes, annex_b_start_code_seen) = bitstream_result?;
+            nvenc_check("NvEncUnmapInputResource", unmap_status)?;
             if bytes.is_empty() {
                 return Err(BackendError::unsupported(
                     "NVENC encode",
@@ -592,6 +598,35 @@ impl NvencD3d11Encoder {
                 is_sync,
                 discard_from_track,
             })
+        }
+    }
+
+    pub fn shutdown(mut self) -> Result<(), BackendError> {
+        let mut failures = Vec::new();
+        for (_, mut resource) in self.registered_inputs.drain() {
+            let status = unsafe { resource.unregister_now() };
+            if status != NV_ENC_SUCCESS {
+                failures.push(format!("NvEncUnregisterResource status={status}"));
+            }
+        }
+        let bitstream_status = unsafe { self.bitstream.destroy_now() };
+        if bitstream_status != NV_ENC_SUCCESS {
+            failures.push(format!(
+                "NvEncDestroyBitstreamBuffer status={bitstream_status}"
+            ));
+        }
+        let encoder_status = unsafe { self.session.destroy_now() };
+        if encoder_status != NV_ENC_SUCCESS {
+            failures.push(format!("NvEncDestroyEncoder status={encoder_status}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::unsupported(
+                "NVENC shutdown",
+                self.input_format.label(),
+                failures.join(" | "),
+            ))
         }
     }
 }
@@ -703,6 +738,7 @@ fn probe_current_display_routes_for_adapter(
                 for chroma in ChromaSampling::all() {
                     routes.push(NvencCurrentDisplayRouteInfo {
                         adapter_index: adapter.index,
+                        adapter_luid: adapter.luid_string(),
                         output_index,
                         rotation,
                         color_space: 0,
@@ -741,6 +777,7 @@ fn probe_current_display_routes_for_adapter(
                 for chroma in ChromaSampling::all() {
                     routes.push(NvencCurrentDisplayRouteInfo {
                         adapter_index: adapter.index,
+                        adapter_luid: adapter.luid_string(),
                         output_index,
                         rotation,
                         color_space: 0,
@@ -857,6 +894,7 @@ fn probe_current_display_routes_for_adapter(
                         };
                         routes.push(NvencCurrentDisplayRouteInfo {
                             adapter_index: adapter.index,
+                            adapter_luid: adapter.luid_string(),
                             output_index,
                             rotation,
                             color_space: desc1.ColorSpace.0 as u32,
@@ -884,6 +922,7 @@ fn probe_current_display_routes_for_adapter(
                     for chroma in ChromaSampling::all() {
                         routes.push(NvencCurrentDisplayRouteInfo {
                             adapter_index: adapter.index,
+                            adapter_luid: adapter.luid_string(),
                             output_index,
                             rotation,
                             color_space: 0,
@@ -1774,6 +1813,10 @@ unsafe fn open_d3d11_session_for_adapter(
         .functions
         .nvEncOpenEncodeSessionEx
         .ok_or_else(|| nvenc_missing("NvEncOpenEncodeSessionEx"))?;
+    let destroy = api
+        .functions
+        .nvEncDestroyEncoder
+        .ok_or_else(|| nvenc_missing("NvEncDestroyEncoder"))?;
     let mut params = NvEncOpenEncodeSessionExParams {
         version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
         deviceType: NV_ENC_DEVICE_TYPE_DIRECTX,
@@ -1797,7 +1840,7 @@ unsafe fn open_d3d11_session_for_adapter(
     }
     Ok(NvencSession {
         encoder,
-        destroy: api.functions.nvEncDestroyEncoder,
+        destroy: Some(destroy),
         _device: device,
         _context: context,
     })
@@ -2098,6 +2141,10 @@ unsafe fn create_bitstream_buffer(
         .functions
         .nvEncCreateBitstreamBuffer
         .ok_or_else(|| nvenc_missing("NvEncCreateBitstreamBuffer"))?;
+    let destroy = api
+        .functions
+        .nvEncDestroyBitstreamBuffer
+        .ok_or_else(|| nvenc_missing("NvEncDestroyBitstreamBuffer"))?;
     let mut params: NvEncCreateBitstreamBuffer = std::mem::zeroed();
     params.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
     nvenc_check("NvEncCreateBitstreamBuffer", create(encoder, &mut params))?;
@@ -2111,7 +2158,7 @@ unsafe fn create_bitstream_buffer(
     Ok(NvencBitstreamBuffer {
         encoder,
         buffer: params.bitstreamBuffer,
-        destroy: api.functions.nvEncDestroyBitstreamBuffer,
+        destroy: Some(destroy),
     })
 }
 
@@ -2259,6 +2306,10 @@ unsafe fn register_d3d11_input_texture(
         .functions
         .nvEncRegisterResource
         .ok_or_else(|| nvenc_missing("NvEncRegisterResource"))?;
+    let unregister = api
+        .functions
+        .nvEncUnregisterResource
+        .ok_or_else(|| nvenc_missing("NvEncUnregisterResource"))?;
     let mut params: NvEncRegisterResource = std::mem::zeroed();
     params.version = NV_ENC_REGISTER_RESOURCE_VER;
     params.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
@@ -2286,7 +2337,7 @@ unsafe fn register_d3d11_input_texture(
     Ok(NvencRegisteredResource {
         encoder,
         resource: params.registeredResource,
-        unregister: api.functions.nvEncUnregisterResource,
+        unregister: Some(unregister),
         _texture: texture.clone(),
     })
 }
@@ -2301,6 +2352,10 @@ unsafe fn map_input_resource(
         .functions
         .nvEncMapInputResource
         .ok_or_else(|| nvenc_missing("NvEncMapInputResource"))?;
+    let unmap = api
+        .functions
+        .nvEncUnmapInputResource
+        .ok_or_else(|| nvenc_missing("NvEncUnmapInputResource"))?;
     let mut params: NvEncMapInputResource = std::mem::zeroed();
     params.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
     params.registeredResource = registered.resource;
@@ -2319,7 +2374,7 @@ unsafe fn map_input_resource(
         encoder,
         mapped: params.mappedResource,
         format: params.mappedBufferFmt,
-        unmap: api.functions.nvEncUnmapInputResource,
+        unmap: Some(unmap),
     })
 }
 
@@ -2378,10 +2433,19 @@ unsafe fn lock_and_copy_bitstream(
         .functions
         .nvEncLockBitstream
         .ok_or_else(|| nvenc_missing("NvEncLockBitstream"))?;
+    let unlock = api
+        .functions
+        .nvEncUnlockBitstream
+        .ok_or_else(|| nvenc_missing("NvEncUnlockBitstream"))?;
     let mut params: NvEncLockBitstream = std::mem::zeroed();
     params.version = NV_ENC_LOCK_BITSTREAM_VER;
     params.outputBitstream = bitstream.buffer;
     nvenc_check("NvEncLockBitstream", lock(encoder, &mut params))?;
+    let mut locked = NvencLockedBitstream {
+        encoder,
+        buffer: bitstream,
+        unlock: Some(unlock),
+    };
     if params.bitstreamBufferPtr.is_null() {
         return Err(BackendError::unsupported(
             "NVENC encode smoke",
@@ -2389,11 +2453,6 @@ unsafe fn lock_and_copy_bitstream(
             "返回空 bitstreamBufferPtr",
         ));
     }
-    let _locked = NvencLockedBitstream {
-        encoder,
-        buffer: bitstream,
-        unlock: api.functions.nvEncUnlockBitstream,
-    };
     let bytes = std::slice::from_raw_parts(
         params.bitstreamBufferPtr as *const u8,
         params.bitstreamSizeInBytes as usize,
@@ -2402,6 +2461,7 @@ unsafe fn lock_and_copy_bitstream(
     let annex_b_start_code_seen = bytes
         .windows(4)
         .any(|window| window == [0x00, 0x00, 0x00, 0x01]);
+    nvenc_check("NvEncUnlockBitstream", locked.unlock_now())?;
     Ok((bytes, annex_b_start_code_seen))
 }
 
@@ -2422,18 +2482,23 @@ impl NvencSession {
     fn context(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext {
         &self._context
     }
+
+    unsafe fn destroy_now(&mut self) -> i32 {
+        if self.encoder.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let encoder = std::mem::replace(&mut self.encoder, ptr::null_mut());
+        self.destroy
+            .map(|destroy| destroy(encoder))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
 }
 
 #[cfg(windows)]
 impl Drop for NvencSession {
     fn drop(&mut self) {
-        if !self.encoder.is_null() {
-            if let Some(destroy) = self.destroy {
-                unsafe {
-                    let _ = destroy(self.encoder);
-                }
-            }
-            self.encoder = ptr::null_mut();
+        unsafe {
+            let _ = self.destroy_now();
         }
     }
 }
@@ -2446,15 +2511,23 @@ struct NvencBitstreamBuffer {
 }
 
 #[cfg(windows)]
+impl NvencBitstreamBuffer {
+    unsafe fn destroy_now(&mut self) -> i32 {
+        if self.encoder.is_null() || self.buffer.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let buffer = std::mem::replace(&mut self.buffer, ptr::null_mut());
+        self.destroy
+            .map(|destroy| destroy(self.encoder, buffer))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
+}
+
+#[cfg(windows)]
 impl Drop for NvencBitstreamBuffer {
     fn drop(&mut self) {
-        if !self.encoder.is_null() && !self.buffer.is_null() {
-            if let Some(destroy) = self.destroy {
-                unsafe {
-                    let _ = destroy(self.encoder, self.buffer);
-                }
-            }
-            self.buffer = ptr::null_mut();
+        unsafe {
+            let _ = self.destroy_now();
         }
     }
 }
@@ -2469,15 +2542,23 @@ struct NvencRegisteredResource {
 }
 
 #[cfg(windows)]
+impl NvencRegisteredResource {
+    unsafe fn unregister_now(&mut self) -> i32 {
+        if self.encoder.is_null() || self.resource.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let resource = std::mem::replace(&mut self.resource, ptr::null_mut());
+        self.unregister
+            .map(|unregister| unregister(self.encoder, resource))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
+}
+
+#[cfg(windows)]
 impl Drop for NvencRegisteredResource {
     fn drop(&mut self) {
-        if !self.encoder.is_null() && !self.resource.is_null() {
-            if let Some(unregister) = self.unregister {
-                unsafe {
-                    let _ = unregister(self.encoder, self.resource);
-                }
-            }
-            self.resource = ptr::null_mut();
+        unsafe {
+            let _ = self.unregister_now();
         }
     }
 }
@@ -2491,15 +2572,23 @@ struct NvencMappedInputResource {
 }
 
 #[cfg(windows)]
+impl NvencMappedInputResource {
+    unsafe fn unmap_now(&mut self) -> i32 {
+        if self.encoder.is_null() || self.mapped.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let mapped = std::mem::replace(&mut self.mapped, ptr::null_mut());
+        self.unmap
+            .map(|unmap| unmap(self.encoder, mapped))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
+}
+
+#[cfg(windows)]
 impl Drop for NvencMappedInputResource {
     fn drop(&mut self) {
-        if !self.encoder.is_null() && !self.mapped.is_null() {
-            if let Some(unmap) = self.unmap {
-                unsafe {
-                    let _ = unmap(self.encoder, self.mapped);
-                }
-            }
-            self.mapped = ptr::null_mut();
+        unsafe {
+            let _ = self.unmap_now();
         }
     }
 }
@@ -2512,15 +2601,23 @@ struct NvencLockedBitstream<'a> {
 }
 
 #[cfg(windows)]
+impl NvencLockedBitstream<'_> {
+    unsafe fn unlock_now(&mut self) -> i32 {
+        if self.encoder.is_null() || self.buffer.buffer.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let encoder = std::mem::replace(&mut self.encoder, ptr::null_mut());
+        self.unlock
+            .map(|unlock| unlock(encoder, self.buffer.buffer))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
+}
+
+#[cfg(windows)]
 impl Drop for NvencLockedBitstream<'_> {
     fn drop(&mut self) {
-        if !self.encoder.is_null()
-            && !self.buffer.buffer.is_null()
-            && let Some(unlock) = self.unlock
-        {
-            unsafe {
-                let _ = unlock(self.encoder, self.buffer.buffer);
-            }
+        unsafe {
+            let _ = self.unlock_now();
         }
     }
 }
@@ -2562,6 +2659,19 @@ impl NvencApi {
                     None
                 }
             };
+            if let Some(version) = max_supported_version
+                && version < NVENCAPI_DRIVER_VERSION
+            {
+                errors.push(format!(
+                    "{}: NVIDIA driver NVENC API {}.{} 低于本程序编译所需 {}.{}",
+                    candidate.display(),
+                    version >> 4,
+                    version & 0xF,
+                    NVENCAPI_MAJOR_VERSION,
+                    NVENCAPI_MINOR_VERSION
+                ));
+                continue;
+            }
             let create = unsafe {
                 lib.get::<unsafe extern "system" fn(*mut NvEncodeApiFunctionList) -> i32>(
                     b"NvEncodeAPICreateInstance\0",
@@ -3405,6 +3515,12 @@ mod tests {
     #[cfg(windows)]
     unsafe fn read_u8(config: &NvEncConfigOpaque, offset: usize) -> u8 {
         ptr::read_unaligned(config.bytes.as_ptr().add(offset))
+    }
+
+    #[test]
+    fn driver_api_version_encoding_is_distinct_from_struct_version_encoding() {
+        assert_eq!(NVENCAPI_DRIVER_VERSION, (13 << 4) | 1);
+        assert_ne!(NVENCAPI_DRIVER_VERSION, NVENCAPI_VERSION);
     }
 
     #[test]

@@ -189,12 +189,22 @@ pub(super) unsafe fn run_dda_capture_thread(
                 return Ok(());
             }
 
-            let source_changed = source_desc0.is_none_or(|first| {
-                first.Width != source_desc.Width
+            if let Some(first) = source_desc0
+                && (first.Width != source_desc.Width
                     || first.Height != source_desc.Height
-                    || first.Format.0 != source_desc.Format.0
-            });
-            if source_changed {
+                    || first.Format.0 != source_desc.Format.0)
+            {
+                return Err(format!(
+                    "{DDA_RECONFIGURE_PREFIX} DDA source desc changed during capture: {}x{} fmt {} -> {}x{} fmt {}",
+                    first.Width,
+                    first.Height,
+                    first.Format.0,
+                    source_desc.Width,
+                    source_desc.Height,
+                    source_desc.Format.0
+                ));
+            }
+            if source_desc0.is_none() {
                 if !route.accepts_unconverted_capture_format(source_desc.Format) {
                     return Err(format!(
                         "DDA DuplicateOutput1 returned DXGI_FORMAT({}) for {}; the route requires FP16 source data and refuses an 8-bit HDR downgrade",

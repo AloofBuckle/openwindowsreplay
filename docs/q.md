@@ -1,77 +1,171 @@
-# NVENC 合并审计状态
+# NVENC 合并与问题审计状态
 
-本文记录 `RustReplay-NVENC` 合并到主线时对 fork 审计项的处理结果。它不是新增功能清单，而是用于区分已关闭风险和仍需保留的工程债务。
+本文对应 `RustReplay-NVENC/docs/q.md` 的 16 项问题，并补充审计合并后新增的 NVENC DDA/WGC 代码。基线 NVENC 合并提交为 `88a8367`；本轮审计日期为 2026-07-15。
 
-## 已关闭
+## 结论
 
-1. **oneVPL/GPU/线程异常路径泄漏**
-   - 增加 oneVPL loader/session/encoder、surface、capture thread、shared HANDLE 与 keyed mutex guard。
-   - GPU event query 等待加入退避、device removed 检查和 2 秒超时。
+- NVENC 已同时具备 WGC 与 DDA 生产路线。
+- WGC：capture shader 直接写同设备普通 NVENC input texture，无额外 `CopyResource`。
+- DDA：独立 D3D11 capture device 写 keyed shared route snapshot，编码设备执行一次 GPU `CopyResource` 到普通 NVENC input。该兼容拷贝不经过 CPU readback/staging。
+- oneVPL 与 NVENC 共用 encoded ring、磁盘循环、AAC、MP4 和保存控制器；本轮修复均同时覆盖两种编码后端。
+- 当前没有发现阻止主线构建、NVENC WGC 录制或 NVENC DDA 录制的剩余 P0/P1 缺陷。
 
-2. **ring 依赖最后插入包判断最新时间**
-   - 视频和音频使用独立有序队列；旧音频晚到时独立裁剪。
-   - snapshot 按时间戳归并，保存 cursor 同时考虑音频完成位置和 pending video。
+## 逐项状态
 
-3. **磁盘 writer 队列无界**
-   - 改为容量 3 的 `sync_channel` 和 `try_send`。
-   - 队列满、writer 错误和 pending audio-gated segment 超限均升级为会话错误，不再无限积压。
+### 1. oneVPL / NVENC / GPU 资源异常释放
 
-4. **不同编码 epoch 被错误合并**
-   - metadata 变化会清空旧 ring epoch。
-   - 磁盘拼接验证宽高、色彩、codec、VPS/SPS/PPS、AAC 格式及每段 sync 起点。
+**已关闭主要运行时风险。**
 
-5. **无关键帧仍保存**
-   - 内存保存必须找到真实视频关键帧。
-   - MP4 writer 拒绝首个可播放样本不是 IDR/CRA 的 track。
+- oneVPL loader/session/encoder、surface、capture thread、shared HANDLE 与 keyed mutex 均有 RAII guard。
+- oneVPL 正常结束显式检查 `MFXVideoENCODE_Close` 与 `MFXClose`；异常路径由幂等 `Drop` 继续清理。
+- surface 获取后尽早进入 guard；后续 surface 即使返回空 `FrameInterface` 也使用已验证的 release function 释放引用。
+- NVENC 正常路径显式检查 `NvEncUnlockBitstream`、`NvEncUnmapInputResource`、`NvEncUnregisterResource`、`NvEncDestroyBitstreamBuffer` 与 `NvEncDestroyEncoder`。
+- NVENC 任一中途错误仍由 guard / `Drop` 解锁、unmap、unregister 和 destroy。
+- 所有会产生资源的 NVENC FFI 调用在调用前先确认对应释放函数存在。
 
-6. **磁盘临时文件与中途失败残留**
-   - 分段 MP4、sidecar 和最终 replay 输出均使用 `.part` 后 rename。
-   - 失败会 rollback；启动只清理 RustReplay 自己的旧分段产物，停止会清空当前磁盘缓存。
-   - segment lease 防止保存读取期间被 prune 删除。
+### 2. ring 使用最后插入包判断最新时间
 
-7. **正常停止与并发错误混淆**
-   - 用户取消使用独立取消错误；worker 只把该错误视作正常停止，不再因为 stop flag 已置位而吞掉同时发生的真实后端错误。
+**已关闭。**
 
-8. **adapter/output 与跨 GPU 误配**
-   - 所有 DXGI adapter/output 都参与探测，并优先包含桌面原点的主显示器。
-   - oneVPL implementation 使用 `mfxExtendedDeviceId.DeviceLUID` 精确匹配 DXGI adapter；旧 dispatcher 无 LUID 时只允许同厂商唯一 adapter 的无歧义兼容路径。
-   - 非 identity rotation 明确返回“`不支持的桌面模式`”；显示 rect/rotation/HDR 指纹变化会触发重新探测。
+- 音视频使用独立有序队列。
+- ring 独立维护最大 PTS / 最大结束时间，不依赖最后插入顺序。
+- 乱序晚到音频按自身时间线裁剪，snapshot 再按 PTS 合并。
 
-9. **无界 bitstream/surface 显存占用**
-   - oneVPL bitstream 按分辨率、route 与 HRD 推导初始容量，仅在 `MFX_ERR_NOT_ENOUGH_BUFFER` 时复用并增长。
-   - capture slot 在 4K 保留 32 个，8K/跨设备路径按显存预算收紧。
+### 3. 磁盘 writer 队列无界
 
-10. **磁盘开放分段与完成分段保存游标分裂**
-    - 两者改为共用源时间游标；游标落在分段中间时从下一段可独立解码关键帧继续，不会因保存过开放分段而永久跳过后来落盘的片段。
+**已关闭。**
 
-## 部分关闭
+- 使用容量 3 的 `sync_channel`。
+- 队列满、writer 断开、writer panic、等待音频的开放分段超限都会终止会话。
+- writer 失败只通过 worker 的单一终结通道上报，不再同时产生 `Error` 与误导性的 `Stopped`。
 
-1. **资源释放故障覆盖**
-   - RAII 已落地，WGC 连续五次开始/停止和 DDA 冒烟通过。
-   - 尚无覆盖每个初始化阶段的系统化 failpoint 测试。
+### 4. 编码格式变化后合并不兼容数据
 
-2. **乱序、慢磁盘与格式变化测试**
-   - 已增加乱序音频、保存 cursor、关键帧、writer queue full、事务清理和分段不兼容测试。
-   - 磁盘空间耗尽、权限变化、文件占用及 writer panic 尚未全部自动化。
+**已关闭。**
 
-3. **录制主函数职责与 unsafe 范围**
-   - `vpl.rs` 已拆成真实 Rust 模块，capture、encode、route、timing、oneVPL loop 和 NVENC loop 已分离。
-   - `record_loop.rs` 仍较大，部分 FFI 控制流仍位于宽 `unsafe` 边界内。
+- metadata 变化会切换 memory-ring codec epoch。
+- 内存保存游标由 `codec_epoch + PTS` 共同约束，旧 epoch 的高 PTS 不会永久屏蔽新 epoch。
+- VPS/SPS/PPS 使用共享 tracker 按类别累计；初始参数集三类齐全后才可保存。
+- 参数集更新暂存到下一个 HEVC IRAP 边界，再切换 codec epoch。
+- 每个磁盘 builder 固定持有创建时的参数集 header，后续 epoch 不会污染旧分段。
+- 磁盘拼接验证宽高、色彩、profile/bit-depth、VPS/SPS/PPS、AAC 采样率/声道和关键帧起点。
 
-## 未关闭
+### 5. 找不到关键帧仍生成文件
 
-1. 通配符导入、长参数列表和局部 lint 抑制仍存在，需在不改变热路径行为的前提下渐进清理。
-2. oneVPL/D3D11 FFI 的完整句柄 RAII 和逐操作 `SAFETY` 说明尚未全部完成。
-3. WGC 持久捕获服务与两种后端仍缺少多小时长跑、睡眠/唤醒和显示器热插拔自动化。
-4. 系统化 failpoint、磁盘空间耗尽、权限变化、writer panic 等故障测试仍未全部自动化。
+**已关闭。**
 
-## 本次合并验证
+- memory snapshot 找不到真实 HEVC random-access AU 时返回不可保存。
+- readiness 同时要求完整参数集、关键帧和音频。
+- MP4 writer 再次验证首个可播放 sample 必须为 IDR/CRA/BLA。
+
+### 6. 用户主动停止被表示为失败
+
+**已关闭。**
+
+- backend cancellation 与真实错误分离。
+- 用户停止最终只产生 `Stopped`。
+- sink queue full、writer failure、无关键帧超时等内部失败最终只产生 `Error`。
+- 用户停止与 writer 失败并发时，真实 writer 失败不会被 cancellation 吞掉。
+
+### 7. 停止时临时磁盘文件依赖完整流程清理
+
+**已关闭主要路径。**
+
+- MP4、sidecar 和最终 replay 均使用 `.part -> rename` 事务。
+- sidecar publish 失败会回滚已经发布的 MP4。
+- writer 先停止并 join，再清理 store。
+- 所有 worker 早退都进入同一终结清理路径。
+- 删除失败保留 segment metadata，后续 prune/clear 可以重试并报告具体路径。
+- store mutex 中毒时停止路径会恢复锁并继续尝试清理。
+- 启动时只删除 RustReplay 自己命名的残留缓存文件。
+
+### 8. 录制主函数职责过多
+
+**部分关闭，剩余为维护性债务。**
+
+- capture、route、timing、encode、oneVPL loop、NVENC loop、session、disk store、disk segment 和 MP4 已是实际 Rust 模块。
+- `record_loop.rs` 仍较大，但本轮没有为纯行数目标重写已验证的热路径。
+
+### 9. `unsafe` 作用域过大
+
+**部分关闭。**
+
+- 资源所有权已由 guard 封装，关键 FFI 正常/异常释放路径已验证。
+- `record_loop.rs` 与 `nvenc.rs` 仍存在较宽 `unsafe` 边界和模块级 `unsafe_op_in_unsafe_fn` 抑制；这是后续渐进整理项，不是当前已复现的运行时故障。
+
+### 10. 通配符导入过多
+
+**未作为本轮生产修复处理。**
+
+- 模块边界已经拆开，但若全面替换 `use super::*` 会产生大范围无行为收益 diff。
+- 后续按模块维护时逐步改为显式导入。
+
+### 11. 参数数量过多
+
+**部分关闭。**
+
+- session、route、sink、record request 已有结构化对象。
+- 底层 capture/record FFI 入口仍有长参数列表；本轮不为形式重构改变已验证调用顺序。
+
+### 12. lint 抑制范围过大
+
+**部分关闭。**
+
+- 当前 `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings` 通过。
+- 少量 FFI/长参数局部抑制仍保留，原因与 ABI 或现有接口有关。
+
+### 13. 缺少资源释放故障注入
+
+**部分关闭。**
+
+- 增加 disk writer panic 注入并验证 stop/error 传播。
+- 增加 sidecar publish 失败后的事务回滚测试。
+- NVENC 空 bitstream pointer、缺失释放函数和正常关闭状态均由代码防护或硬件 smoke 覆盖。
+- 尚未给每一个 oneVPL/NVENC 初始化步骤建立系统化 failpoint 矩阵。
+
+### 14. 缺少乱序时间戳测试
+
+**已关闭主要数据结构风险。**
+
+- 覆盖旧音频晚到、VFR retention 边界、pending video、重复保存 cursor、同 PTS 合并和长时间绝对时间清理。
+
+### 15. 缺少慢磁盘和磁盘失败测试
+
+**部分关闭。**
+
+- 覆盖 queue full、writer panic、publish rollback、删除失败保留并重试、lease 延迟删除。
+- 尚未自动化真实磁盘空间耗尽、ACL 动态变化、网络卷断开和第三方长期占用文件。
+
+### 16. 缺少编码格式变化测试
+
+**已关闭主要 epoch 合并风险。**
+
+- 覆盖分辨率变化、AAC 采样率变化、参数集变化、分散 VPS/SPS/PPS、旧/new epoch 保存游标及不兼容磁盘拼接。
+- HDR/SDR 与 profile 变化走同一 metadata/参数集比较路径。
+
+## 新增 NVENC 审计结论
+
+- NVENC route 记录并验证 adapter LUID，避免 DXGI 枚举顺序变化后把旧计划应用到另一张 NVIDIA GPU。
+- NVENC encoder D3D11 device 在运行时再次与当前桌面 adapter LUID 对比。
+- DDA/WGC 源纹理宽高或格式变化会触发 `ReconfigureRequired`，不会在旧 encoder/session 内临时换格式。
+- NVENC `frameRateNum/Den` 只取当前显示器刷新率作为码控提示；MP4 继续使用 DDA `LastPresentTime` / WGC `SystemRelativeTime` 的 VFR 时间戳。
+- 驱动 API 兼容检查使用 `NvEncodeAPIGetMaxSupportedVersion` 的 `(major << 4) | minor` 编码，不与 NVENC FFI struct version 编码混用。
+- 低于本程序编译 API 13.1 的驱动会明确报告版本不足，不会尝试错误 ABI。
+
+## 当前验证
 
 - `cargo fmt --check`
-- `cargo test --locked --target x86_64-pc-windows-msvc`：88 passed，11 ignored
 - `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`
-- `cargo build --release --locked --target x86_64-pc-windows-msvc`
-- NVENC WGC：4K/170 Hz/HDR PQ/P010，真实录制、MP4 封装及五次重复启停通过
-- NVENC DDA：4K/170 Hz/HDR PQ/P010，真实录制、MP4 封装及五次重复启停通过
-- `ffprobe`：HEVC Main10、yuv420p10le、BT.2020/PQ/full-range、AAC LC
-- ffmpeg rawvideo 完整解码：WGC/DDA 均无 HEVC 解码错误
+- `cargo test --locked --target x86_64-pc-windows-msvc`：103 passed，11 ignored，0 failed；ignored 项均为显式硬件 smoke。
+- 本机 RTX 5090，4K/170 Hz/HDR PQ/P010：NVENC WGC 与 NVENC DDA 真实桌面录制均通过。
+- 保留的 3 秒审计文件经 `ffprobe` 识别为 HEVC Main10 / yuv420p10le / BT.2020 / PQ / full-range + AAC LC。
+- WGC/DDA 视频与音频分别完整解码到 raw sink，0 decode error；视频 packet DTS 严格递增。
+
+## 剩余验证边界
+
+以下项目仍需要真实环境或长期测试，不能用单元测试声称完成：
+
+1. 多小时 WGC/DDA 长跑、睡眠/唤醒、显示器热插拔与 GPU driver reset。
+2. 真实磁盘满、权限撤销、SMB 中断及文件被外部进程长期占用。
+3. 每个 oneVPL/NVENC FFI 初始化步骤的系统化 failpoint 注入。
+4. 更广泛的多 NVIDIA GPU、eGPU、非主输出和不同驱动版本矩阵。

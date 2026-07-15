@@ -696,6 +696,7 @@ pub(super) fn validate_current_display_route_plan(
 pub(super) fn validate_current_nvenc_route_plan(
     plan: &crate::backend::nvenc::NvencCurrentDisplayRouteInfo,
     adapter_index: u32,
+    adapter_luid: &str,
     output_index: u32,
     output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
     output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
@@ -741,6 +742,16 @@ pub(super) fn validate_current_nvenc_route_plan(
                 plan.adapter_index, plan.output_index, adapter_index, output_index
             ),
             "显示输出已变化，请重新探测能力",
+        ));
+    }
+    if !plan.adapter_luid.is_empty() && !plan.adapter_luid.eq_ignore_ascii_case(adapter_luid) {
+        return Err(BackendError::unsupported(
+            "NVENC 录制 RoutePlan",
+            format!(
+                "plan adapter LUID={} current adapter LUID={adapter_luid}",
+                plan.adapter_luid
+            ),
+            "DXGI adapter 枚举顺序或设备身份已变化，请重新探测能力",
         ));
     }
     validate_output_rotation(

@@ -13,6 +13,7 @@ pub(super) fn run_recording_worker(
     encoded_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
     disk_store: Option<Arc<Mutex<DiskReplayStore>>>,
     disk_live_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
+    disk_live_run_index: Option<Arc<AtomicU64>>,
 ) {
     let start_path = cache_dir.clone().unwrap_or_else(|| save_dir.clone());
     let _ = tx.send(ReplayEvent::RecordingStarted {
@@ -24,13 +25,14 @@ pub(super) fn run_recording_worker(
         .map(|store| DiskSegmentWriter::spawn(store, tx.clone(), stop_flag.clone()));
     let requested_chroma = request.chroma_writer.chroma();
     let mut run_index = 0u64;
-    while !stop_flag.load(Ordering::Relaxed) {
+    let mut terminal_error = None;
+    'recording: while !stop_flag.load(Ordering::Relaxed) {
         let Some(record_target) = caps.record_target_for_chroma(requested_chroma) else {
-            let _ = tx.send(ReplayEvent::Error(format!(
+            terminal_error = Some(format!(
                 "能力探测没有为 active 编码后端选出 {} 的 adapter/output 录制目标",
                 requested_chroma.doc_label()
-            )));
-            return;
+            ));
+            break;
         };
         let _ = tx.send(ReplayEvent::BackendStatus {
             index: run_index,
@@ -50,10 +52,8 @@ pub(super) fn run_recording_worker(
             let mut sink = match buffer_mode {
                 ReplayBufferMode::Memory => {
                     let Some(ring) = encoded_ring.clone() else {
-                        let _ = tx.send(ReplayEvent::Error(
-                            "内存循环模式缺少 encoded ring".to_owned(),
-                        ));
-                        return;
+                        terminal_error = Some("内存循环模式缺少 encoded ring".to_owned());
+                        break 'recording;
                     };
                     ReplayRecordSink::Memory(SessionRingSink {
                         ring,
@@ -65,16 +65,16 @@ pub(super) fn run_recording_worker(
                 ReplayBufferMode::Disk => {
                     let Some(writer_tx) = disk_writer.as_ref().and_then(DiskSegmentWriter::sender)
                     else {
-                        let _ = tx.send(ReplayEvent::Error(
-                            "磁盘循环模式缺少异步 segment writer".to_owned(),
-                        ));
-                        return;
+                        terminal_error = Some("磁盘循环模式缺少异步 segment writer".to_owned());
+                        break 'recording;
                     };
                     let Some(live_ring) = disk_live_ring.clone() else {
-                        let _ = tx.send(ReplayEvent::Error(
-                            "磁盘循环模式缺少开放分段 encoded ring".to_owned(),
-                        ));
-                        return;
+                        terminal_error = Some("磁盘循环模式缺少开放分段 encoded ring".to_owned());
+                        break 'recording;
+                    };
+                    let Some(live_run_index) = disk_live_run_index.clone() else {
+                        terminal_error = Some("磁盘循环模式缺少开放分段录制轮次".to_owned());
+                        break 'recording;
                     };
                     ReplayRecordSink::Disk(Box::new(DiskSegmentSink::new(
                         writer_tx,
@@ -83,6 +83,7 @@ pub(super) fn run_recording_worker(
                         replay_duration,
                         stop_flag.clone(),
                         live_ring,
+                        live_run_index,
                     )))
                 }
             };
@@ -101,6 +102,10 @@ pub(super) fn run_recording_worker(
         match result {
             Ok(recorded) => {
                 sink.finish_success(&recorded);
+                if let Some(failure) = sink.failure_message() {
+                    terminal_error = Some(failure.to_owned());
+                    break;
+                }
                 if let ReplayRecordSink::Memory(_) = sink {
                     let report = recorded.report;
                     let (snapshot, ring_packets, ring_bytes) = encoded_ring
@@ -138,9 +143,14 @@ pub(super) fn run_recording_worker(
             }
             Err(err) => {
                 if err.is_cancelled() {
+                    sink.abort();
+                    if let Some(failure) = sink.failure_message() {
+                        terminal_error = Some(failure.to_owned());
+                    }
                     break;
                 }
                 if err.is_reconfigure_required() {
+                    sink.abort();
                     let _ = tx.send(ReplayEvent::BackendStatus {
                         index: run_index,
                         message: format!("显示环境变化，重新执行能力探测后重启录制段：{err}"),
@@ -158,23 +168,22 @@ pub(super) fn run_recording_worker(
                     run_index = run_index.saturating_add(1);
                     continue;
                 }
+                terminal_error = Some(
+                    sink.failure_message()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| err.to_string()),
+                );
                 drop(sink);
-                if let Some(writer) = disk_writer.take() {
-                    writer.shutdown();
-                }
-                if let Some(store) = &disk_store
-                    && let Ok(mut store) = store.lock()
-                {
-                    let _ = store.clear_segments();
-                }
-                let _ = tx.send(ReplayEvent::Error(err.to_string()));
-                return;
+                break;
             }
         }
         run_index = run_index.saturating_add(1);
     }
-    if let Some(writer) = disk_writer.take() {
-        writer.shutdown();
+    if let Some(writer) = disk_writer.take()
+        && let Some(writer_failure) = writer.shutdown()
+        && terminal_error.is_none()
+    {
+        terminal_error = Some(writer_failure);
     }
     if let Some(store) = &disk_store {
         match store.lock() {
@@ -186,15 +195,23 @@ pub(super) fn run_recording_worker(
                     });
                 }
             }
-            Err(_) => {
+            Err(poisoned) => {
+                let mut store = poisoned.into_inner();
+                let message = match store.clear_segments() {
+                    Ok(()) => "磁盘循环 store 锁曾中毒；已恢复锁并完成停止清理".to_owned(),
+                    Err(err) => format!("磁盘循环 store 锁曾中毒；恢复后清理缓存仍失败：{err}"),
+                };
                 let _ = tx.send(ReplayEvent::BackendStatus {
                     index: run_index,
-                    message: "停止后无法清理磁盘循环缓存：store 锁已中毒".to_owned(),
+                    message,
                 });
             }
         }
     }
-    let _ = tx.send(ReplayEvent::Stopped);
+    let _ = tx.send(match terminal_error {
+        Some(message) => ReplayEvent::Error(message),
+        None => ReplayEvent::Stopped,
+    });
 }
 
 pub(super) enum ReplayRecordSink {
@@ -207,6 +224,20 @@ impl ReplayRecordSink {
         match self {
             Self::Memory(sink) => sink.finish_success(recorded),
             Self::Disk(sink) => sink.finish_success(recorded),
+        }
+    }
+
+    pub(super) fn abort(&mut self) {
+        match self {
+            Self::Memory(sink) => sink.abort(),
+            Self::Disk(sink) => sink.abort(),
+        }
+    }
+
+    pub(super) fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Disk(sink) => sink.failure_message.as_deref(),
         }
     }
 }
@@ -249,6 +280,14 @@ pub(super) struct SessionRingSink {
 }
 
 impl SessionRingSink {
+    pub(super) fn abort(&mut self) {
+        if self.started
+            && let Ok(mut ring) = self.ring.lock()
+        {
+            ring.abort_segment();
+        }
+    }
+
     pub(super) fn finish_success(&mut self, recorded: &super::vpl::VplOneCopyRecordOutput) {
         if self.started {
             if let Ok(mut ring) = self.ring.lock() {
@@ -272,7 +311,7 @@ impl super::vpl::VplOneCopyRecordSink for SessionRingSink {
     }
 
     fn video_track_started(&mut self, info: super::vpl::VplOutputTrackInfo) {
-        self.status("oneVPL 编码器已 Init，encoded ring 元数据已建立。");
+        self.status("视频编码器已 Init，encoded ring 元数据已建立。");
         if let Ok(mut ring) = self.ring.lock() {
             ring.start_segment(EncodedReplayMetadata {
                 width: info.width,

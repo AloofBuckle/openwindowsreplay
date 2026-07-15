@@ -182,7 +182,7 @@ pub(super) struct PreparedAacTrackRef<'a> {
     pub(super) offsets: &'a [u64],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HevcParameterSets {
     pub(crate) vps: Vec<Vec<u8>>,
     pub(crate) sps: Vec<Vec<u8>>,

@@ -242,6 +242,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         validate_current_nvenc_route_plan(
             plan,
             adapter_index,
+            &adapter_luid,
             selected_output_index,
             &output_desc,
             &selected_output,
@@ -276,6 +277,22 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         )?;
         let encoder_device = nvenc_encoder.device().clone();
         let immediate = nvenc_encoder.context().clone();
+        let (encoder_luid_low, encoder_luid_high) = d3d11_device_adapter_luid(&encoder_device)?;
+        if encoder_luid_low != desc.AdapterLuid.LowPart
+            || encoder_luid_high != desc.AdapterLuid.HighPart
+        {
+            return Err(BackendError::unsupported(
+                "NVENC D3D11 device",
+                format!(
+                    "encoder LUID={:08X}:{:08X}, desktop adapter LUID={:08X}:{:08X}",
+                    encoder_luid_high as u32,
+                    encoder_luid_low,
+                    desc.AdapterLuid.HighPart as u32,
+                    desc.AdapterLuid.LowPart
+                ),
+                "不支持的桌面模式：NVENC session 与捕获输出不在同一 DXGI adapter",
+            ));
+        }
         notes.push(format!(
             "NVENC D3D11 registration mode: {}",
             nvenc_encoder.registration_mode()
@@ -494,6 +511,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                     validate_current_nvenc_route_plan(
                         plan,
                         adapter_index,
+                        &adapter_luid,
                         selected_output_index,
                         &current_desc,
                         &selected_output,
@@ -834,6 +852,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             codec: record_route.mp4_codec,
             samples,
         };
+        nvenc_encoder.shutdown()?;
         if write_output_mp4 {
             write_hevc_aac_mp4(output, &video_track, audio_track.as_ref())?;
         } else {

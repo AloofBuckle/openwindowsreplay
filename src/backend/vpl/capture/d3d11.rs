@@ -432,6 +432,30 @@ pub(in super::super) unsafe fn set_d3d11_gpu_thread_priority(
 }
 
 #[cfg(windows)]
+pub(in super::super) unsafe fn d3d11_device_adapter_luid(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+) -> Result<(u32, i32), BackendError> {
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::core::Interface;
+
+    let dxgi_device: IDXGIDevice = device.cast().map_err(|err| BackendError::WindowsApi {
+        func: "ID3D11Device::cast<IDXGIDevice>(adapter LUID)",
+        message: err.to_string(),
+    })?;
+    let adapter = dxgi_device
+        .GetAdapter()
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIDevice::GetAdapter(adapter LUID)",
+            message: err.to_string(),
+        })?;
+    let desc = adapter.GetDesc().map_err(|err| BackendError::WindowsApi {
+        func: "IDXGIAdapter::GetDesc(adapter LUID)",
+        message: err.to_string(),
+    })?;
+    Ok((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
+}
+
+#[cfg(windows)]
 pub(in super::super) struct DdaFrameMetadata {
     pub(in super::super) move_rect_bytes: u32,
     pub(in super::super) dirty_rects: Vec<windows::Win32::Foundation::RECT>,

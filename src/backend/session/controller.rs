@@ -62,8 +62,10 @@ pub struct ReplayController {
     pub(super) live_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
     pub(super) disk_store: Option<Arc<Mutex<DiskReplayStore>>>,
     pub(super) disk_live_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
+    pub(super) disk_live_run_index: Option<Arc<AtomicU64>>,
     pub(super) memory_save_after_ns: Option<u64>,
-    pub(super) disk_save_after_ns: Option<u64>,
+    pub(super) memory_save_codec_epoch: Option<u64>,
+    pub(super) disk_save_after: Option<DiskSaveCursor>,
 }
 
 impl Default for ReplayController {
@@ -77,8 +79,10 @@ impl Default for ReplayController {
             live_ring: None,
             disk_store: None,
             disk_live_ring: None,
+            disk_live_run_index: None,
             memory_save_after_ns: None,
-            disk_save_after_ns: None,
+            memory_save_codec_epoch: None,
+            disk_save_after: None,
         }
     }
 }
@@ -114,8 +118,8 @@ impl ReplayController {
                 return ReplaySaveReadiness::Starting;
             };
             let availability = ring.availability();
-            let video_available =
-                availability.video_packets > 0 || availability.pending_video_packet;
+            let video_available = availability.parameter_sets_ready
+                && (availability.video_key_packets > 0 || availability.pending_video_key);
             if video_available && availability.audio_packets > 0 {
                 return ReplaySaveReadiness::Ready;
             }
@@ -137,8 +141,8 @@ impl ReplayController {
                 return ReplaySaveReadiness::Starting;
             };
             let availability = ring.availability();
-            let video_available =
-                availability.video_packets > 0 || availability.pending_video_packet;
+            let video_available = availability.parameter_sets_ready
+                && (availability.video_key_packets > 0 || availability.pending_video_key);
             if video_available && availability.audio_packets > 0 {
                 ReplaySaveReadiness::Ready
             } else if video_available {
@@ -190,6 +194,7 @@ impl ReplayController {
                         self.live_ring = None;
                         self.disk_store = None;
                         self.disk_live_ring = None;
+                        self.disk_live_run_index = None;
                         terminal = true;
                     }
                     Ok(ReplayEvent::Stopped) => {
@@ -199,6 +204,7 @@ impl ReplayController {
                         self.live_ring = None;
                         self.disk_store = None;
                         self.disk_live_ring = None;
+                        self.disk_live_run_index = None;
                         terminal = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -209,6 +215,7 @@ impl ReplayController {
                         self.live_ring = None;
                         self.disk_store = None;
                         self.disk_live_ring = None;
+                        self.disk_live_run_index = None;
                         terminal = true;
                         break;
                     }
@@ -280,9 +287,13 @@ impl ReplayController {
                 replay_duration + Duration::from_secs(5),
             )))
         });
+        let disk_live_run_index = buffer_mode
+            .is_disk()
+            .then(|| Arc::new(AtomicU64::new(u64::MAX)));
         let worker_ring = live_ring.clone();
         let worker_disk_store = disk_store.clone();
         let worker_disk_live_ring = disk_live_ring.clone();
+        let worker_disk_live_run_index = disk_live_run_index.clone();
         let worker = thread::Builder::new()
             .name("rustreplay-recording-worker".to_owned())
             .spawn(move || {
@@ -298,6 +309,7 @@ impl ReplayController {
                     worker_ring,
                     worker_disk_store,
                     worker_disk_live_ring,
+                    worker_disk_live_run_index,
                 );
             })
             .map_err(|err| BackendError::Io(format!("创建录制工作线程失败：{err}")))?;
@@ -309,8 +321,10 @@ impl ReplayController {
         self.live_ring = live_ring;
         self.disk_store = disk_store;
         self.disk_live_ring = disk_live_ring;
+        self.disk_live_run_index = disk_live_run_index;
         self.memory_save_after_ns = None;
-        self.disk_save_after_ns = None;
+        self.memory_save_codec_epoch = None;
+        self.disk_save_after = None;
         self.state = ReplayState::Running {
             started_at: Instant::now(),
         };
@@ -345,12 +359,17 @@ impl ReplayController {
         let replay_duration =
             Duration::from_secs_f32((config.replay_minutes.max(0.1) * 60.0).max(1.0));
         if let Some(ring) = &self.live_ring {
-            let packet_snapshot = {
-                ring.lock()
-                    .map_err(|_| BackendError::Io("encoded ring 锁已中毒".to_owned()))?
-                    .snapshot_recent_packets_after(replay_duration, self.memory_save_after_ns)
-            };
+            let ring = ring
+                .lock()
+                .map_err(|_| BackendError::Io("encoded ring 锁已中毒".to_owned()))?;
+            let not_before_pts_ns = (self.memory_save_codec_epoch == Some(ring.codec_epoch()))
+                .then_some(self.memory_save_after_ns)
+                .flatten();
+            let packet_snapshot =
+                ring.snapshot_recent_packets_after(replay_duration, not_before_pts_ns);
+            drop(ring);
             if let Some(packet_snapshot) = packet_snapshot {
+                let save_codec_epoch = packet_snapshot.codec_epoch();
                 let save_after_ns = packet_snapshot.save_cursor_pts_ns();
                 // Materializing packet bytes is intentionally outside the ring mutex so capture
                 // and NVENC can continue pushing access units while a replay is being saved.
@@ -363,6 +382,7 @@ impl ReplayController {
                             snapshot.audio_track.as_ref(),
                         )
                     })?;
+                    self.memory_save_codec_epoch = Some(save_codec_epoch);
                     self.memory_save_after_ns = Some(save_after_ns);
                     return Ok(());
                 }
@@ -384,8 +404,8 @@ impl ReplayController {
             let snapshot_with_cursor = store
                 .lock()
                 .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
-                .snapshot_recent_tracks_after(replay_duration, self.disk_save_after_ns)?;
-            if let Some((snapshot, last_source_end_ns)) = snapshot_with_cursor {
+                .snapshot_recent_tracks_after(replay_duration, self.disk_save_after)?;
+            if let Some((snapshot, last_cursor)) = snapshot_with_cursor {
                 if snapshot.audio_track.is_some() {
                     write_replay_output_atomically(&dst, |path| {
                         super::mp4_mux::write_prepared_hevc_aac_mp4(
@@ -394,7 +414,7 @@ impl ReplayController {
                             snapshot.audio_track.as_ref(),
                         )
                     })?;
-                    self.disk_save_after_ns = Some(last_source_end_ns);
+                    self.disk_save_after = Some(last_cursor);
                     return Ok(());
                 }
                 return Err(BackendError::unsupported(
@@ -408,7 +428,7 @@ impl ReplayController {
         if self.try_save_open_disk_segment(&dst, replay_duration)? {
             return Ok(());
         }
-        if self.disk_save_after_ns.is_some() {
+        if self.disk_save_after.is_some() {
             return Err(BackendError::unsupported(
                 "保存即时回放",
                 "上次成功保存后的磁盘循环时间线",
@@ -416,7 +436,7 @@ impl ReplayController {
             ));
         }
 
-        if self.memory_save_after_ns.is_some() || self.disk_save_after_ns.is_some() {
+        if self.memory_save_after_ns.is_some() || self.disk_save_after.is_some() {
             return Err(BackendError::unsupported(
                 "保存即时回放",
                 "上次成功保存后的时间窗口",
@@ -445,10 +465,24 @@ impl ReplayController {
         let Some(ring) = &self.disk_live_ring else {
             return Ok(false);
         };
-        let packet_snapshot = ring
+        let Some(live_run_index) = &self.disk_live_run_index else {
+            return Ok(false);
+        };
+        let ring = ring
             .lock()
-            .map_err(|_| BackendError::Io("开放磁盘分段 ring 锁已中毒".to_owned()))?
-            .snapshot_recent_packets_after(replay_duration, self.disk_save_after_ns);
+            .map_err(|_| BackendError::Io("开放磁盘分段 ring 锁已中毒".to_owned()))?;
+        let run_index = live_run_index.load(Ordering::Acquire);
+        if run_index == u64::MAX {
+            return Ok(false);
+        }
+        let not_before_pts_ns = match self.disk_save_after {
+            Some(cursor) if cursor.run_index == run_index => Some(cursor.source_pts_ns),
+            Some(cursor) if cursor.run_index > run_index => return Ok(false),
+            _ => None,
+        };
+        let packet_snapshot =
+            ring.snapshot_recent_packets_after(replay_duration, not_before_pts_ns);
+        drop(ring);
         let Some(packet_snapshot) = packet_snapshot else {
             return Ok(false);
         };
@@ -464,7 +498,10 @@ impl ReplayController {
                 snapshot.audio_track.as_ref(),
             )
         })?;
-        self.disk_save_after_ns = Some(save_after_ns);
+        self.disk_save_after = Some(DiskSaveCursor {
+            run_index,
+            source_pts_ns: save_after_ns,
+        });
         Ok(true)
     }
 }

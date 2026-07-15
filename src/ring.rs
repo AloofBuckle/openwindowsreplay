@@ -49,6 +49,7 @@ pub struct EncodedRingBuffer {
     video_packets: VecDeque<EncodedPacket>,
     audio_packets: VecDeque<EncodedPacket>,
     bytes: usize,
+    video_key_packets: usize,
     newest_pts_ns: u64,
     newest_end_ns: u64,
 }
@@ -60,6 +61,7 @@ impl EncodedRingBuffer {
             video_packets: VecDeque::new(),
             audio_packets: VecDeque::new(),
             bytes: 0,
+            video_key_packets: 0,
             newest_pts_ns: 0,
             newest_end_ns: 0,
         }
@@ -67,6 +69,9 @@ impl EncodedRingBuffer {
 
     pub fn push(&mut self, packet: EncodedPacket) {
         self.bytes += packet.data.len();
+        if packet.stream == EncodedStreamKind::Video && packet.is_key {
+            self.video_key_packets = self.video_key_packets.saturating_add(1);
+        }
         self.newest_pts_ns = self.newest_pts_ns.max(packet.pts_ns);
         self.newest_end_ns = self
             .newest_end_ns
@@ -161,8 +166,13 @@ impl EncodedRingBuffer {
     }
 
     fn prune_before(&mut self, min_pts: u64) {
-        prune_queue_before(&mut self.video_packets, min_pts, &mut self.bytes);
-        prune_queue_before(&mut self.audio_packets, min_pts, &mut self.bytes);
+        prune_queue_before(
+            &mut self.video_packets,
+            min_pts,
+            &mut self.bytes,
+            Some(&mut self.video_key_packets),
+        );
+        prune_queue_before(&mut self.audio_packets, min_pts, &mut self.bytes, None);
     }
 
     fn snapshot_from_pts(&self, min_pts: u64) -> Vec<EncodedPacket> {
@@ -193,6 +203,7 @@ impl EncodedRingBuffer {
         self.video_packets.clear();
         self.audio_packets.clear();
         self.bytes = 0;
+        self.video_key_packets = 0;
         self.newest_pts_ns = 0;
         self.newest_end_ns = 0;
     }
@@ -213,13 +224,23 @@ fn insert_packet_ordered(queue: &mut VecDeque<EncodedPacket>, packet: EncodedPac
     queue.insert(insert_at, packet);
 }
 
-fn prune_queue_before(queue: &mut VecDeque<EncodedPacket>, min_pts: u64, bytes: &mut usize) {
+fn prune_queue_before(
+    queue: &mut VecDeque<EncodedPacket>,
+    min_pts: u64,
+    bytes: &mut usize,
+    mut video_key_packets: Option<&mut usize>,
+) {
     while queue
         .front()
         .is_some_and(|packet| packet_end_ns(packet) <= min_pts)
     {
         if let Some(packet) = queue.pop_front() {
             *bytes = bytes.saturating_sub(packet.data.len());
+            if packet.is_key
+                && let Some(count) = video_key_packets.as_deref_mut()
+            {
+                *count = count.saturating_sub(1);
+            }
         }
     }
 }
@@ -272,6 +293,7 @@ pub struct EncodedReplaySnapshot {
 
 #[derive(Debug, Clone)]
 pub struct EncodedReplayPacketSnapshot {
+    codec_epoch: u64,
     metadata: EncodedReplayMetadata,
     header_units: Vec<HevcAccessUnit>,
     packets: Vec<EncodedPacket>,
@@ -281,6 +303,10 @@ pub struct EncodedReplayPacketSnapshot {
 }
 
 impl EncodedReplayPacketSnapshot {
+    pub fn codec_epoch(&self) -> u64 {
+        self.codec_epoch
+    }
+
     pub fn video_end_pts_ns(&self) -> u64 {
         self.video_end_pts_ns
     }
@@ -372,20 +398,24 @@ impl EncodedReplayPacketSnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EncodedReplayAvailability {
     pub metadata_ready: bool,
+    pub parameter_sets_ready: bool,
     pub video_packets: usize,
+    pub video_key_packets: usize,
     pub audio_packets: usize,
     pub pending_video_packet: bool,
+    pub pending_video_key: bool,
     pub bytes: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct EncodedReplayRing {
     ring: EncodedRingBuffer,
+    codec_epoch: u64,
     metadata: Option<EncodedReplayMetadata>,
     next_segment_base_ns: u64,
     active_segment_base_ns: u64,
     pending_video: Option<EncodedPacket>,
-    parameter_sets: Option<Arc<[u8]>>,
+    parameter_sets: crate::backend::mp4_mux::HevcParameterSetTracker,
     header_units: Vec<HevcAccessUnit>,
 }
 
@@ -393,11 +423,12 @@ impl EncodedReplayRing {
     pub fn new(retention: Duration) -> Self {
         Self {
             ring: EncodedRingBuffer::new(retention),
+            codec_epoch: 0,
             metadata: None,
             next_segment_base_ns: 0,
             active_segment_base_ns: 0,
             pending_video: None,
-            parameter_sets: None,
+            parameter_sets: crate::backend::mp4_mux::HevcParameterSetTracker::default(),
             header_units: Vec::new(),
         }
     }
@@ -423,7 +454,7 @@ impl EncodedReplayRing {
             .as_ref()
             .is_some_and(|current| current != &metadata)
         {
-            self.reset_epoch();
+            self.reset_codec_epoch();
         } else {
             self.flush_pending_video_with_duration_ns(1);
         }
@@ -433,11 +464,31 @@ impl EncodedReplayRing {
     }
 
     pub fn restart_timeline(&mut self, metadata: EncodedReplayMetadata) {
-        self.ring.clear();
-        self.next_segment_base_ns = 0;
-        self.active_segment_base_ns = 0;
-        self.pending_video = None;
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|current| current != &metadata)
+        {
+            self.reset_codec_epoch();
+        } else {
+            self.reset_media_timeline();
+        }
         self.metadata = Some(metadata);
+    }
+
+    pub fn abort_segment(&mut self) {
+        if let Some(pending) = self.pending_video.as_ref() {
+            let segment_end_offset_ns = pending
+                .pts_ns
+                .saturating_sub(self.active_segment_base_ns)
+                .saturating_add(1);
+            self.flush_pending_video_with_duration_ns(segment_end_offset_ns);
+        }
+        self.next_segment_base_ns = self
+            .ring
+            .newest_end_ns()
+            .max(self.active_segment_base_ns.saturating_add(1));
+        self.active_segment_base_ns = self.next_segment_base_ns;
     }
 
     pub fn push_video_au_90k(&mut self, sample: &HevcAccessUnit) {
@@ -543,23 +594,19 @@ impl EncodedReplayRing {
     }
 
     fn remember_parameter_sets(&mut self, sample: &HevcAccessUnit) {
-        let Some(parameter_sets) =
-            crate::backend::mp4_mux::hevc_annex_b_parameter_set_access_unit(&sample.data)
-        else {
+        if self.parameter_sets.is_ready() && !sample.discard_from_track && !sample.is_sync {
+            return;
+        }
+        if !self.parameter_sets.observe(&sample.data, sample.is_sync) {
+            return;
+        }
+        let Some(parameter_sets) = self.parameter_sets.header_access_unit() else {
             return;
         };
-        let parameter_sets: Arc<[u8]> = parameter_sets.into();
-        if self
-            .parameter_sets
-            .as_ref()
-            .is_some_and(|current| current.as_ref() == parameter_sets.as_ref())
-        {
-            return;
+        if !self.header_units.is_empty() || !self.ring.is_empty() || self.pending_video.is_some() {
+            self.reset_media_timeline();
+            self.codec_epoch = self.codec_epoch.saturating_add(1);
         }
-        if self.parameter_sets.is_some() || !self.ring.is_empty() || self.pending_video.is_some() {
-            self.reset_epoch();
-        }
-        self.parameter_sets = Some(parameter_sets.clone());
         self.header_units = vec![HevcAccessUnit {
             timestamp_90k: 0,
             data: parameter_sets,
@@ -568,13 +615,18 @@ impl EncodedReplayRing {
         }];
     }
 
-    fn reset_epoch(&mut self) {
+    fn reset_codec_epoch(&mut self) {
+        self.reset_media_timeline();
+        self.codec_epoch = self.codec_epoch.saturating_add(1);
+        self.parameter_sets.clear();
+        self.header_units.clear();
+    }
+
+    fn reset_media_timeline(&mut self) {
         self.ring.clear();
         self.next_segment_base_ns = 0;
         self.active_segment_base_ns = 0;
         self.pending_video = None;
-        self.parameter_sets = None;
-        self.header_units.clear();
     }
 
     pub fn snapshot_recent_tracks(&self, duration: Duration) -> Option<EncodedReplaySnapshot> {
@@ -612,6 +664,7 @@ impl EncodedReplayRing {
             .map(|audio_end| video_end_pts_ns.min(audio_end))
             .unwrap_or(video_end_pts_ns);
         Some(EncodedReplayPacketSnapshot {
+            codec_epoch: self.codec_epoch,
             metadata,
             header_units: self.header_units.clone(),
             packets,
@@ -634,11 +687,21 @@ impl EncodedReplayRing {
     pub fn availability(&self) -> EncodedReplayAvailability {
         EncodedReplayAvailability {
             metadata_ready: self.metadata.is_some(),
+            parameter_sets_ready: self.parameter_sets.is_ready(),
             video_packets: self.ring.video_packets.len(),
+            video_key_packets: self.ring.video_key_packets,
             audio_packets: self.ring.audio_packets.len(),
             pending_video_packet: self.pending_video.is_some(),
+            pending_video_key: self
+                .pending_video
+                .as_ref()
+                .is_some_and(|packet| packet.is_key),
             bytes: self.ring.bytes(),
         }
+    }
+
+    pub fn codec_epoch(&self) -> u64 {
+        self.codec_epoch
     }
 
     pub fn bytes(&self) -> usize {
@@ -889,11 +952,32 @@ mod tests {
         replay.finish_segment_with_audio_duration(180_000, None);
         assert!(!replay.ring.is_empty());
 
+        let previous_epoch = replay.codec_epoch();
         replay.start_segment(metadata(32, 16));
 
         assert!(replay.ring.is_empty());
+        assert!(replay.codec_epoch() > previous_epoch);
         assert_eq!(replay.metadata.as_ref().unwrap().width, 32);
         assert_eq!(replay.active_segment_base_ns, 0);
+    }
+
+    #[test]
+    fn audio_format_change_discards_previous_codec_epoch() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        let initial = metadata(16, 16);
+        replay.start_segment(initial.clone());
+        replay.push_video_au_90k(&hevc_header(1));
+        replay.push_video_au_90k(&hevc(0, true));
+        replay.push_audio_au_ticks(&aac(0), initial.audio_sample_rate);
+        let previous_epoch = replay.codec_epoch();
+        let mut changed = initial;
+        changed.audio_sample_rate = 44_100;
+
+        replay.start_segment(changed);
+
+        assert!(replay.ring.is_empty());
+        assert!(replay.pending_video.is_none());
+        assert!(replay.codec_epoch() > previous_epoch);
     }
 
     #[test]
@@ -912,7 +996,7 @@ mod tests {
         assert!(snapshot.video_track.samples[0].discard_from_track);
         assert!(Arc::ptr_eq(
             &snapshot.video_track.samples[0].data,
-            replay.parameter_sets.as_ref().unwrap()
+            &replay.header_units[0].data
         ));
         assert_eq!(
             snapshot
@@ -933,13 +1017,16 @@ mod tests {
         replay.push_video_au_90k(&hevc(0, true));
         replay.push_video_au_90k(&hevc(90_000, false));
         assert!(!replay.ring.is_empty());
+        let previous_epoch = replay.codec_epoch();
 
         let new_header = hevc_header(2);
         let new_header_data = new_header.data.clone();
         replay.push_video_au_90k(&new_header);
-        assert!(replay.ring.is_empty());
-        assert!(replay.pending_video.is_none());
+        assert!(!replay.ring.is_empty());
+        assert!(replay.pending_video.is_some());
         replay.push_video_au_90k(&hevc(180_000, true));
+        assert!(replay.ring.is_empty());
+        assert!(replay.codec_epoch() > previous_epoch);
         replay.push_video_au_90k(&hevc(270_000, false));
 
         let snapshot = replay
@@ -955,6 +1042,76 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn codec_epoch_allows_a_controller_to_discard_a_stale_pts_cursor() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc_header(1));
+        replay.push_video_au_90k(&hevc(0, true));
+        replay.push_video_au_90k(&hevc(90_000, false));
+        replay.push_audio_au_ticks(&aac(0), 48_000);
+        let old = replay
+            .snapshot_recent_packets_after(Duration::from_secs(10), None)
+            .unwrap();
+        let old_epoch = old.codec_epoch();
+        let old_cursor = old.save_cursor_pts_ns();
+
+        replay.start_segment(metadata(32, 16));
+        replay.push_video_au_90k(&hevc_header(2));
+        replay.push_video_au_90k(&hevc(0, true));
+        replay.push_audio_au_ticks(&aac(0), 48_000);
+
+        assert_ne!(replay.codec_epoch(), old_epoch);
+        assert!(
+            replay
+                .snapshot_recent_packets_after(Duration::from_secs(10), Some(old_cursor))
+                .is_none()
+        );
+        assert!(
+            replay
+                .snapshot_recent_packets_after(Duration::from_secs(10), None)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn aborted_segment_advances_same_metadata_timeline_before_restart() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc_header(1));
+        replay.push_video_au_90k(&hevc(0, true));
+        replay.push_video_au_90k(&hevc(90_000, false));
+        replay.abort_segment();
+        let previous_end = replay.ring.newest_end_ns();
+
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc(0, true));
+
+        assert!(
+            replay
+                .pending_video
+                .as_ref()
+                .is_some_and(|packet| packet.pts_ns >= previous_end)
+        );
+    }
+
+    #[test]
+    fn availability_requires_complete_parameter_sets_and_a_keyframe() {
+        let mut replay = EncodedReplayRing::new(Duration::from_secs(10));
+        replay.start_segment(metadata(16, 16));
+        replay.push_video_au_90k(&hevc(0, false));
+        let availability = replay.availability();
+        assert!(!availability.parameter_sets_ready);
+        assert_eq!(availability.video_key_packets, 0);
+        assert!(!availability.pending_video_key);
+
+        replay.push_video_au_90k(&hevc_header(1));
+        replay.push_video_au_90k(&hevc(90_000, true));
+        let availability = replay.availability();
+        assert!(availability.parameter_sets_ready);
+        assert!(availability.pending_video_key);
     }
 
     #[test]
