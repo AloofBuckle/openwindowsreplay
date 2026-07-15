@@ -95,6 +95,12 @@ pub enum VideoEncoderBackend {
     Nvenc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordTarget {
+    pub adapter_index: u32,
+    pub output_index: u32,
+}
+
 impl VideoEncoderBackend {
     pub const fn label(self) -> &'static str {
         match self {
@@ -227,6 +233,70 @@ impl RateControlFeatureSupport {
 }
 
 impl ProbeCaps {
+    pub fn preferred_vpl_route_for_chroma(
+        &self,
+        chroma: ChromaSampling,
+    ) -> Option<&vpl::VplCurrentDisplayRouteInfo> {
+        self.vpl
+            .current_display_routes
+            .iter()
+            .filter(|route| {
+                route.chroma == chroma
+                    && !route.fourcc.is_empty()
+                    && route.implementation_index != u32::MAX
+            })
+            .min_by_key(|route| {
+                display_route_priority(
+                    route.desktop_left,
+                    route.desktop_top,
+                    route.desktop_right,
+                    route.desktop_bottom,
+                    route.adapter_index,
+                    route.output_index,
+                )
+            })
+    }
+
+    pub fn preferred_nvenc_route_for_chroma(
+        &self,
+        chroma: ChromaSampling,
+    ) -> Option<&nvenc::NvencCurrentDisplayRouteInfo> {
+        self.nvenc
+            .current_display_routes
+            .iter()
+            .filter(|route| route.chroma == chroma && !route.input_format.is_empty())
+            .min_by_key(|route| {
+                display_route_priority(
+                    route.desktop_left,
+                    route.desktop_top,
+                    route.desktop_right,
+                    route.desktop_bottom,
+                    route.adapter_index,
+                    route.output_index,
+                )
+            })
+    }
+
+    pub fn record_target_for_chroma(&self, chroma: ChromaSampling) -> Option<RecordTarget> {
+        match self.video_encoder_selection.active {
+            Some(VideoEncoderBackend::OneVpl) => {
+                self.preferred_vpl_route_for_chroma(chroma)
+                    .map(|route| RecordTarget {
+                        adapter_index: route.adapter_index,
+                        output_index: route.output_index,
+                    })
+            }
+            Some(VideoEncoderBackend::Nvenc) => {
+                self.preferred_nvenc_route_for_chroma(chroma)
+                    .map(|route| RecordTarget {
+                        adapter_index: route.adapter_index,
+                        output_index: route.output_index,
+                    })
+            }
+            None => None,
+        }
+    }
+
     pub fn route_blocker_summary_for_chroma(&self, chroma: ChromaSampling) -> Option<String> {
         let mut blockers = BTreeSet::new();
         let include_vpl = !matches!(
@@ -338,17 +408,23 @@ impl ProbeCaps {
         ) {
             return None;
         }
-        let route = self.nvenc.current_display_routes.iter().find(|route| {
-            route.chroma == chroma
-                && !route.input_format.is_empty()
-                && self.nvenc.route_candidates.iter().any(|candidate| {
-                    candidate.production_record_supported
-                        && candidate.chroma == route.chroma
-                        && candidate.input_format == route.input_format
-                        && candidate.bit_depth == route.bit_depth
-                        && candidate.profile == route.profile
-                })
-        })?;
+        let route = self
+            .preferred_nvenc_route_for_chroma(chroma)
+            .filter(|route| {
+                self.nvenc
+                    .adapters
+                    .iter()
+                    .find(|adapter| adapter.adapter_index == route.adapter_index)
+                    .is_some_and(|adapter| {
+                        adapter.route_candidates.iter().any(|candidate| {
+                            candidate.production_record_supported
+                                && candidate.chroma == route.chroma
+                                && candidate.input_format == route.input_format
+                                && candidate.bit_depth == route.bit_depth
+                                && candidate.profile == route.profile
+                        })
+                    })
+            })?;
         let adapter = self
             .nvenc
             .adapters
@@ -527,6 +603,18 @@ impl ProbeCaps {
     }
 }
 
+fn display_route_priority(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    adapter_index: u32,
+    output_index: u32,
+) -> (bool, u32, u32) {
+    let contains_desktop_origin = left <= 0 && right > 0 && top <= 0 && bottom > 0;
+    (!contains_desktop_origin, adapter_index, output_index)
+}
+
 impl ProbeCaps {
     pub fn short_status(&self) -> String {
         if !self.desktop_sync_path_available {
@@ -621,49 +709,15 @@ pub fn probe_all() -> ProbeCaps {
     }
 
     let mut onevpl_production_chroma_set = BTreeSet::new();
-    let onevpl_current_display_route_keys = vpl
-        .current_display_routes
-        .iter()
-        .filter(|route| !route.fourcc.is_empty())
-        .map(|route| {
-            format!(
-                "{}::{:?}::{}::{}",
-                route.fourcc, route.chroma, route.bit_depth, route.profile
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    for route in &vpl.route_candidates {
-        let route_key = format!(
-            "{}::{:?}::{}::{}",
-            route.fourcc, route.chroma, route.bit_depth, route.profile
-        );
-        if route.production_record_supported
-            && onevpl_current_display_route_keys.contains(&route_key)
-        {
+    for route in &vpl.current_display_routes {
+        if !route.fourcc.is_empty() && route.implementation_index != u32::MAX {
             onevpl_production_chroma_set.insert(route.chroma);
         }
     }
 
     let mut nvenc_production_chroma_set = BTreeSet::new();
-    let nvenc_current_display_route_keys = nvenc
-        .current_display_routes
-        .iter()
-        .filter(|route| !route.input_format.is_empty())
-        .map(|route| {
-            format!(
-                "{}::{:?}::{}::{}",
-                route.input_format, route.chroma, route.bit_depth, route.profile
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    for route in &nvenc.route_candidates {
-        let route_key = format!(
-            "{}::{:?}::{}::{}",
-            route.input_format, route.chroma, route.bit_depth, route.profile
-        );
-        if route.production_record_supported
-            && nvenc_current_display_route_keys.contains(&route_key)
-        {
+    for route in &nvenc.current_display_routes {
+        if !route.input_format.is_empty() {
             nvenc_production_chroma_set.insert(route.chroma);
         }
     }
@@ -727,58 +781,82 @@ pub fn probe_all() -> ProbeCaps {
     if desktop_sync_path_available {
         match video_encoder_selection.active {
             Some(VideoEncoderBackend::OneVpl) => {
-                for route in &vpl.route_candidates {
-                    let route_key = format!(
-                        "{}::{:?}::{}::{}",
-                        route.fourcc, route.chroma, route.bit_depth, route.profile
-                    );
-                    if route.production_record_supported
-                        && onevpl_current_display_route_keys.contains(&route_key)
-                    {
-                        rate_map
-                            .entry(route.chroma)
+                for display_route in vpl.current_display_routes.iter().filter(|route| {
+                    !route.fourcc.is_empty() && route.implementation_index != u32::MAX
+                }) {
+                    let Some(route) = vpl
+                        .implementations
+                        .iter()
+                        .find(|implementation| {
+                            implementation.index == display_route.implementation_index
+                        })
+                        .and_then(|implementation| {
+                            implementation.route_candidates.iter().find(|candidate| {
+                                candidate.production_record_supported
+                                    && candidate.fourcc == display_route.fourcc
+                                    && candidate.chroma == display_route.chroma
+                                    && candidate.bit_depth == display_route.bit_depth
+                                    && candidate.profile == display_route.profile
+                            })
+                        })
+                    else {
+                        continue;
+                    };
+                    rate_map
+                        .entry(route.chroma)
+                        .or_default()
+                        .push(route.rate_controls.iter().copied().collect());
+                    let by_method = feature_map.entry(route.chroma).or_default();
+                    for feature in &route.rate_control_features {
+                        by_method
+                            .entry(feature.method)
                             .or_default()
-                            .push(route.rate_controls.iter().copied().collect());
-                        let by_method = feature_map.entry(route.chroma).or_default();
-                        for feature in &route.rate_control_features {
-                            by_method
-                                .entry(feature.method)
-                                .or_default()
-                                .push(RateControlFeatureSupport::from_probe(feature));
-                        }
+                            .push(RateControlFeatureSupport::from_probe(feature));
                     }
                 }
             }
             Some(VideoEncoderBackend::Nvenc) => {
-                for route in &nvenc.route_candidates {
-                    let route_key = format!(
-                        "{}::{:?}::{}::{}",
-                        route.input_format, route.chroma, route.bit_depth, route.profile
-                    );
-                    if route.production_record_supported
-                        && nvenc_current_display_route_keys.contains(&route_key)
-                    {
-                        rate_map
-                            .entry(route.chroma)
-                            .or_default()
-                            .push(route.rate_controls.iter().copied().collect());
-                        let by_method = feature_map.entry(route.chroma).or_default();
-                        for method in &route.rate_controls {
-                            if let Some(feature) = route
-                                .rate_control_features
-                                .iter()
-                                .find(|feature| feature.method == *method)
-                            {
-                                by_method
-                                    .entry(*method)
-                                    .or_default()
-                                    .push(RateControlFeatureSupport::from_nvenc_probe(feature));
-                            } else {
-                                by_method
-                                    .entry(*method)
-                                    .or_default()
-                                    .push(RateControlFeatureSupport::hidden(*method));
-                            }
+                for display_route in nvenc
+                    .current_display_routes
+                    .iter()
+                    .filter(|route| !route.input_format.is_empty())
+                {
+                    let Some(route) = nvenc
+                        .adapters
+                        .iter()
+                        .find(|adapter| adapter.adapter_index == display_route.adapter_index)
+                        .and_then(|adapter| {
+                            adapter.route_candidates.iter().find(|candidate| {
+                                candidate.production_record_supported
+                                    && candidate.input_format == display_route.input_format
+                                    && candidate.chroma == display_route.chroma
+                                    && candidate.bit_depth == display_route.bit_depth
+                                    && candidate.profile == display_route.profile
+                            })
+                        })
+                    else {
+                        continue;
+                    };
+                    rate_map
+                        .entry(route.chroma)
+                        .or_default()
+                        .push(route.rate_controls.iter().copied().collect());
+                    let by_method = feature_map.entry(route.chroma).or_default();
+                    for method in &route.rate_controls {
+                        if let Some(feature) = route
+                            .rate_control_features
+                            .iter()
+                            .find(|feature| feature.method == *method)
+                        {
+                            by_method
+                                .entry(*method)
+                                .or_default()
+                                .push(RateControlFeatureSupport::from_nvenc_probe(feature));
+                        } else {
+                            by_method
+                                .entry(*method)
+                                .or_default()
+                                .push(RateControlFeatureSupport::hidden(*method));
                         }
                     }
                 }
@@ -826,18 +904,27 @@ pub fn probe_all() -> ProbeCaps {
         Some(VideoEncoderBackend::OneVpl)
     ) {
         let route_suggestions = vpl
-            .route_candidates
+            .current_display_routes
             .iter()
-            .filter(|route| {
-                let route_key = format!(
-                    "{}::{:?}::{}::{}",
-                    route.fourcc, route.chroma, route.bit_depth, route.profile
-                );
-                route.production_record_supported
-                    && onevpl_current_display_route_keys.contains(&route_key)
-            })
-            .filter_map(|route| {
-                (route.num_frame_suggested > 0).then_some(route.num_frame_suggested)
+            .filter(|route| !route.fourcc.is_empty() && route.implementation_index != u32::MAX)
+            .filter_map(|display_route| {
+                vpl.implementations
+                    .iter()
+                    .find(|implementation| {
+                        implementation.index == display_route.implementation_index
+                    })
+                    .and_then(|implementation| {
+                        implementation.route_candidates.iter().find(|route| {
+                            route.production_record_supported
+                                && route.fourcc == display_route.fourcc
+                                && route.chroma == display_route.chroma
+                                && route.bit_depth == display_route.bit_depth
+                                && route.profile == display_route.profile
+                        })
+                    })
+                    .and_then(|route| {
+                        (route.num_frame_suggested > 0).then_some(route.num_frame_suggested)
+                    })
             });
         // oneVPL QueryIOSurf 返回的是所请求 AsyncDepth/GOP/route 下建议的 surface 数；
         // 这里向前端暴露一个保守可用值，而不是硬编码常数。实际录制仍会在 Init 前
@@ -920,7 +1007,7 @@ fn select_video_encoder(
         current_display_route_count: vpl
             .current_display_routes
             .iter()
-            .filter(|route| !route.fourcc.is_empty())
+            .filter(|route| !route.fourcc.is_empty() && route.implementation_index != u32::MAX)
             .count(),
         production_ready: onevpl_desktop_sync_ready,
         reason: if onevpl_desktop_sync_ready {
@@ -1046,6 +1133,17 @@ mod tests {
 
         let neither_ready = select_video_encoder(&vpl, &nvenc, false, false);
         assert_eq!(neither_ready.active, None);
+    }
+
+    #[test]
+    fn display_route_priority_prefers_the_output_containing_the_desktop_origin() {
+        let secondary = display_route_priority(3840, 0, 7680, 2160, 0, 0);
+        let primary = display_route_priority(0, 0, 3840, 2160, 1, 2);
+        assert!(primary < secondary);
+        assert_eq!(
+            display_route_priority(0, 0, 1920, 1080, 0, 3),
+            (false, 0, 3)
+        );
     }
 
     #[test]

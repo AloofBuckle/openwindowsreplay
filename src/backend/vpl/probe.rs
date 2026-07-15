@@ -6,6 +6,7 @@ mod discovery;
 mod implementation;
 mod params;
 
+pub(super) use discovery::VplProbeDimensions;
 pub(super) use implementation::*;
 pub(super) use params::*;
 

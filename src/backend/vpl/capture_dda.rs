@@ -4,13 +4,17 @@ use super::*;
 pub(super) enum CaptureMsg {
     Frame(CapturedSnapshot),
     Done(CaptureStats),
-    Error(String),
+    Error(CaptureFailure),
 }
+
+#[cfg(windows)]
+const DDA_RECONFIGURE_PREFIX: &str = "DDA_RECONFIGURE_REQUIRED:";
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_dda_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -31,6 +35,7 @@ pub(super) fn spawn_dda_capture_thread(
         let result = unsafe {
             run_dda_capture_thread(
                 adapter1,
+                output_index,
                 device,
                 context,
                 encoder_device,
@@ -53,7 +58,11 @@ pub(super) fn spawn_dda_capture_thread(
                 let _ = frame_tx.send(CaptureMsg::Done(stats));
             }
             Err(message) => {
-                let _ = frame_tx.send(CaptureMsg::Error(message));
+                let failure = message
+                    .strip_prefix(DDA_RECONFIGURE_PREFIX)
+                    .map(|message| CaptureFailure::Reconfigure(message.trim().to_owned()))
+                    .unwrap_or(CaptureFailure::Fatal(message));
+                let _ = frame_tx.send(CaptureMsg::Error(failure));
             }
         }
     })
@@ -63,6 +72,7 @@ pub(super) fn spawn_dda_capture_thread(
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn run_dda_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -83,13 +93,15 @@ pub(super) unsafe fn run_dda_capture_thread(
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
     use windows::Win32::Graphics::Dxgi::{
-        DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
+        DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+        IDXGIResource,
     };
     use windows::core::Interface;
 
     let _thread_priority = RecordThreadPriorityGuard::raise_capture_thread();
-    let duplication =
-        create_duplication_on_device(&adapter1, &device, route).map_err(|err| err.to_string())?;
+    let duplication = create_duplication_on_device(&adapter1, output_index, &device, route)
+        .map_err(|err| err.to_string())?;
     let mut stats = CaptureStats::new();
     let mut free_slots: VecDeque<CaptureFrameSlot> = VecDeque::new();
     let mut source_desc0: Option<D3D11_TEXTURE2D_DESC> = None;
@@ -101,27 +113,10 @@ pub(super) unsafe fn run_dda_capture_thread(
     let mut timestamp_origin_qpc: Option<i64> = None;
     let mut last_timestamp_90k: Option<u64> = None;
     let mut last_accepted_present_qpc: Option<i64> = None;
-    let mut encoder_warmup_pending = false;
-    let mut encoder_warmup_done = false;
-    let dda_pipeline_warmup_frames = 4u32;
-    // Keep only a short frame-count warmup after encoder warmup. The official
-    // timeline starts from DDA LastPresentTime and does not require a fixed
-    // refresh-rate interval to become "stable".
-    let dda_pipeline_warmup_stable_intervals_required = 0u32;
-    let mut dda_pipeline_warmup_remaining = 0u32;
-    let dda_pipeline_warmup_stable_intervals = 0u32;
     let max_end_at = end_at + std::time::Duration::from_secs(3);
 
     while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < max_end_at {
         while let Ok(slot) = free_rx.try_recv() {
-            if encoder_warmup_pending {
-                encoder_warmup_pending = false;
-                encoder_warmup_done = true;
-                dda_pipeline_warmup_remaining = dda_pipeline_warmup_frames;
-                timestamp_origin_qpc = None;
-                last_timestamp_90k = None;
-                last_accepted_present_qpc = None;
-            }
             let slot_matches = match &slot {
                 CaptureFrameSlot::Shared(shared) => snapshot_desc0
                     .as_ref()
@@ -140,6 +135,19 @@ pub(super) unsafe fn run_dda_capture_thread(
             Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 stats.dda_timeouts += 1;
                 continue;
+            }
+            Err(err)
+                if matches!(
+                    err.code(),
+                    DXGI_ERROR_ACCESS_LOST
+                        | DXGI_ERROR_DEVICE_REMOVED
+                        | DXGI_ERROR_DEVICE_RESET
+                        | DXGI_ERROR_SESSION_DISCONNECTED
+                ) =>
+            {
+                return Err(format!(
+                    "{DDA_RECONFIGURE_PREFIX} IDXGIOutputDuplication 失效 ({err})；桌面会话、显示模式、设备或输出所有权已变化"
+                ));
             }
             Err(err) => {
                 return Err(format!(
@@ -187,7 +195,6 @@ pub(super) unsafe fn run_dda_capture_thread(
                     || first.Format.0 != source_desc.Format.0
             });
             if source_changed {
-                let first_source = source_desc0.is_none();
                 if !route.accepts_unconverted_capture_format(source_desc.Format) {
                     return Err(format!(
                         "DDA DuplicateOutput1 returned DXGI_FORMAT({}) for {}; the route requires FP16 source data and refuses an 8-bit HDR downgrade",
@@ -235,21 +242,9 @@ pub(super) unsafe fn run_dda_capture_thread(
                             .map_err(|err| err.to_string())?;
                     free_slots.push_back(CaptureFrameSlot::Shared(slot));
                 }
-                if first_source {
-                    stats.dropped_warmup += 1;
-                    return Ok(());
-                }
             }
             let snapshot_desc =
                 snapshot_desc0.ok_or_else(|| "DDA route snapshot desc missing".to_owned())?;
-
-            if encoder_warmup_pending {
-                if frame_info.LastPresentTime > 0 {
-                    last_accepted_present_qpc = Some(frame_info.LastPresentTime);
-                }
-                stats.dropped_warmup += 1;
-                return Ok(());
-            }
 
             let Some(slot) = free_slots.pop_front() else {
                 stats.dropped_no_slot += 1;
@@ -299,55 +294,6 @@ pub(super) unsafe fn run_dda_capture_thread(
             stats.copied += 1;
             if frame_info.LastPresentTime > 0 {
                 last_accepted_present_qpc = Some(frame_info.LastPresentTime);
-            }
-            if !encoder_warmup_done {
-                let captured = CapturedSnapshot {
-                    slot,
-                    source_desc: snapshot_desc,
-                    move_rect_bytes: frame_metadata.move_rect_bytes,
-                    dirty_rects: frame_metadata.dirty_rects,
-                    timestamp_90k: 0,
-                    timestamp_100ns: qpc_counter_to_100ns(
-                        frame_info.LastPresentTime,
-                        qpc_frequency,
-                    ),
-                    capture_index,
-                    accumulated_frames: frame_info.AccumulatedFrames,
-                    warmup: true,
-                };
-                encoder_warmup_pending = true;
-                stats.dropped_warmup += 1;
-                if frame_tx.send(CaptureMsg::Frame(captured)).is_err() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            let pipeline_warmup_frame = dda_pipeline_warmup_remaining > 0
-                || dda_pipeline_warmup_stable_intervals
-                    < dda_pipeline_warmup_stable_intervals_required;
-            if pipeline_warmup_frame {
-                dda_pipeline_warmup_remaining = dda_pipeline_warmup_remaining.saturating_sub(1);
-                stats.dropped_warmup += 1;
-                timestamp_origin_qpc = None;
-                last_timestamp_90k = None;
-                let captured = CapturedSnapshot {
-                    slot,
-                    source_desc: snapshot_desc,
-                    move_rect_bytes: frame_metadata.move_rect_bytes,
-                    dirty_rects: frame_metadata.dirty_rects,
-                    timestamp_90k: 0,
-                    timestamp_100ns: qpc_counter_to_100ns(
-                        frame_info.LastPresentTime,
-                        qpc_frequency,
-                    ),
-                    capture_index,
-                    accumulated_frames: frame_info.AccumulatedFrames,
-                    warmup: true,
-                };
-                if frame_tx.send(CaptureMsg::Frame(captured)).is_err() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-                return Ok(());
             }
             let previous_timestamp_90k = last_timestamp_90k;
             let mut timestamp_90k = dda_relative_timestamp_90k(

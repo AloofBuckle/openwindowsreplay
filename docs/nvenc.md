@@ -72,7 +72,7 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 cargo test --locked --target x86_64-pc-windows-msvc
 ```
 
-通过：69 passed，11 ignored（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
+通过：88 passed，11 ignored（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
 
 ## NVENC 码控暴露与测试范围
 
@@ -89,6 +89,8 @@ cargo test --locked --target x86_64-pc-windows-msvc
 - WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
 - DDA 保持独立 capture device。捕获线程把 route 输出写入 keyed shared snapshot，编码线程再执行一次 GPU `CopyResource` 到普通 NVENC registered input；这是当前 NVIDIA 驱动拒绝 keyed shared texture 直接注册后的兼容路线。
 - NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
+- oneVPL implementation 同样通过 dispatcher 的 `mfxExtendedDeviceId.DeviceLUID` 与 DXGI adapter 精确绑定；同厂商多 GPU 不再只按 vendor ID 猜测。
+- 所有 adapter/output 都参与 route 探测，优先包含桌面原点的主显示器；rotation、desktop rect、DXGI color space 和 bits-per-color 会被验证并周期复核。
 - 当前 production-ready 范围：
   - SDR/8-bit current-display route -> NV12 / HEVC Main
   - HDR PQ 或 10-bit current-display route -> P010 / HEVC Main10
@@ -155,6 +157,7 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 - encoded ring 分离音视频有序队列，支持乱序音频裁剪、按时间戳合并快照、codec epoch 清空和真实关键帧起点校验。
 - MP4 mux 不再强制把首样本标为 sync；非 IDR/CRA 起始的视频会被拒绝。
 - 磁盘 writer 改为容量 3 的有界队列；队列满或 writer 失败会终止会话。分段、sidecar 和最终 replay 输出均通过 `.part` 事务写入。
+- 磁盘开放分段和已完成分段共用源时间保存游标；跨分段重复保存从下一处真实关键帧继续。
 
 ## 明确边界 / 后续可选增强
 
@@ -163,9 +166,9 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 3. NVENC caps 报告 async=true，但当前编码器采用同步 registered-resource 提交；捕获 snapshot pool 与编码线程已解耦，本机 240 Hz 实录 `encode_submit` 平均约 2.2 ms。后续如引入 completion event + 多 bitstream buffer，需要保持现有 VFR 时间戳与停止语义。
 4. WGC 使用 500 us polling 获取 `TryGetNextFrame`，同时保留 WGC `SystemRelativeTime` 的 VFR 时间戳。短测已稳定，仍应在目标硬件上做长时间 4K/高刷新性能验证。
 5. DDA 的 keyed shared snapshot 不能直接注册为 NVENC input，当前保留一次同 GPU `CopyResource`。该路径不做 CPU readback，也不伪装成零拷贝。
-6. adapter/output 选择目前仍主要使用索引 0；多 GPU、非主输出和旋转显示器需要单独补齐选择与坐标验证。
-7. capture slot 固定为 32。正常 WGC/DDA 冒烟没有耗尽，但尚未按分辨率、刷新率和显存预算动态调整。
-8. 用户主动停止在底层仍通过 `BackendError` 表达；上层已有停止状态规避误报，但后续应引入独立的正常退出类型。
+6. 旋转输出当前明确不支持；多 GPU/非主输出已进入探测和 LUID 绑定，但仍需在更多真实拓扑上做生产验证。
+7. 4K capture slot 保持 32；8K 和跨设备分配已按显存预算收紧，后续仍可按刷新率和实测 backlog 自适应。
+8. 用户取消已有独立错误类型；完整 `RecordExit::{Stopped, Completed, Failed}` 状态枚举仍可作为后续 API 整理项。
 
 ## 约束不变
 

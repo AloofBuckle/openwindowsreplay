@@ -32,8 +32,8 @@ pub(crate) use types::{
     HevcPreparedSample, Mp4SampleFileRange,
 };
 pub(crate) use writer::{
-    hevc_annex_b_parameter_set_access_unit, write_hevc_aac_mp4_with_index,
-    write_prepared_hevc_aac_mp4,
+    hevc_annex_b_has_random_access_nal, hevc_annex_b_parameter_set_access_unit,
+    write_hevc_aac_mp4_with_index, write_prepared_hevc_aac_mp4,
 };
 #[allow(unused_imports)]
 pub use writer::{write_hevc_aac_mp4, write_hevc_mp4};

@@ -3,6 +3,8 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct DiskSegmentMeta {
     pub(super) index: u64,
+    pub(super) source_start_ns: u64,
+    pub(super) source_end_ns: u64,
     pub(super) mp4_path: PathBuf,
     pub(super) sidecar_path: PathBuf,
     pub(super) duration_90k: u64,
@@ -146,13 +148,16 @@ impl DiskReplayStore {
     pub(super) fn snapshot_recent_tracks_after(
         &self,
         duration: Duration,
-        after_segment: Option<u64>,
+        not_before_source_ns: Option<u64>,
     ) -> Result<Option<(DiskPreparedReplaySnapshot, u64)>, BackendError> {
-        let selected = self.select_recent_segments_after(duration, after_segment);
+        let selected = self.select_recent_segments_after(duration, not_before_source_ns);
         if selected.is_empty() {
             return Ok(None);
         }
-        let last_segment = selected.last().map(|segment| segment.index).unwrap_or(0);
+        let last_source_end_ns = selected
+            .last()
+            .map(|segment| segment.source_end_ns)
+            .unwrap_or(0);
         let mut segments = Vec::with_capacity(selected.len());
         for meta in selected {
             segments.push(DiskSegmentIndexedTracks {
@@ -161,7 +166,16 @@ impl DiskReplayStore {
                 lease: meta.lease.clone(),
             });
         }
-        Ok(concat_disk_indexed_segments(&segments)?.map(|tracks| (tracks, last_segment)))
+        let latest = segments.last().expect("selected segments are non-empty");
+        validate_disk_segment_compatibility(latest, latest)?;
+        let mut epoch_start = segments.len() - 1;
+        while epoch_start > 0
+            && validate_disk_segment_compatibility(latest, &segments[epoch_start - 1]).is_ok()
+        {
+            epoch_start -= 1;
+        }
+        Ok(concat_disk_indexed_segments(&segments[epoch_start..])?
+            .map(|tracks| (tracks, last_source_end_ns)))
     }
 
     pub(super) fn select_recent_segments(&self, duration: Duration) -> Vec<DiskSegmentMeta> {
@@ -171,17 +185,14 @@ impl DiskReplayStore {
     pub(super) fn select_recent_segments_after(
         &self,
         duration: Duration,
-        after_segment: Option<u64>,
+        not_before_source_ns: Option<u64>,
     ) -> Vec<DiskSegmentMeta> {
         let target_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
         let mut selected = VecDeque::new();
         let mut accumulated_ns = 0u64;
-        for segment in self
-            .segments
-            .iter()
-            .rev()
-            .filter(|segment| after_segment.is_none_or(|after| segment.index > after))
-        {
+        for segment in self.segments.iter().rev().filter(|segment| {
+            not_before_source_ns.is_none_or(|not_before| segment.source_start_ns >= not_before)
+        }) {
             selected.push_front(segment.clone());
             accumulated_ns = accumulated_ns.saturating_add(scale_90k_to_ns(segment.duration_90k));
             if accumulated_ns >= target_ns {
@@ -217,21 +228,37 @@ impl DiskReplayStore {
 
     pub(super) fn clear_segments(&mut self) -> Result<(), BackendError> {
         let segments = self.segments.drain(..).collect::<Vec<_>>();
+        let mut retained = VecDeque::new();
+        let mut failures = Vec::new();
         for segment in segments {
+            if Arc::strong_count(&segment.lease) > 1 {
+                retained.push_back(segment);
+                continue;
+            }
+            let mut deleted = true;
             for path in [&segment.mp4_path, &segment.sidecar_path] {
                 match fs::remove_file(path) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(err) => {
-                        return Err(BackendError::Io(format!(
-                            "删除磁盘循环缓存 {} 失败：{err}",
-                            path.display()
-                        )));
+                        deleted = false;
+                        failures.push(format!("{}: {err}", path.display()));
                     }
                 }
             }
+            if !deleted {
+                retained.push_back(segment);
+            }
         }
-        Ok(())
+        self.segments = retained;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::Io(format!(
+                "删除磁盘循环缓存失败，已保留元数据供后续重试：{}",
+                failures.join(" | ")
+            )))
+        }
     }
 }
 
@@ -253,6 +280,7 @@ pub(super) struct DiskSegmentWriteReport {
 pub(super) struct DiskSegmentWriter {
     pub(super) sender: Option<SyncSender<DiskSegmentWriteJob>>,
     pub(super) handle: Option<JoinHandle<()>>,
+    pub(super) shutdown: Arc<AtomicBool>,
 }
 
 impl DiskSegmentWriter {
@@ -262,9 +290,14 @@ impl DiskSegmentWriter {
         stop: Arc<AtomicBool>,
     ) -> Self {
         let (sender, rx) = mpsc::sync_channel::<DiskSegmentWriteJob>(DISK_WRITER_QUEUE_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
         let handle = thread::spawn(move || {
             lower_current_disk_writer_priority();
             while let Ok(job) = rx.recv() {
+                if thread_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 let run_index = job.run_index;
                 match write_disk_segment_job(&store, job) {
                     Ok(report) => {
@@ -298,6 +331,7 @@ impl DiskSegmentWriter {
         Self {
             sender: Some(sender),
             handle: Some(handle),
+            shutdown,
         }
     }
 
@@ -306,6 +340,7 @@ impl DiskSegmentWriter {
     }
 
     pub(super) fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
         self.sender.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -315,6 +350,7 @@ impl DiskSegmentWriter {
 
 impl Drop for DiskSegmentWriter {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
         self.sender.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -355,6 +391,8 @@ pub(super) fn write_disk_segment_job(
             .unwrap_or(0);
     let meta = DiskSegmentMeta {
         index: transaction.reservation.index,
+        source_start_ns: scale_90k_to_ns(job.segment.source_start_90k),
+        source_end_ns: scale_90k_to_ns(job.segment.source_end_90k),
         mp4_path: transaction.reservation.mp4_path.clone(),
         sidecar_path: transaction.reservation.sidecar_path.clone(),
         duration_90k: index.video_track.duration_90k,

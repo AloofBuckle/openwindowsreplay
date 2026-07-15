@@ -29,6 +29,7 @@ fn ffi_struct_sizes_match_onevpl_headers() {
     assert_eq!(std::mem::size_of::<MfxExtVideoSignalInfo>(), 20);
     assert_eq!(std::mem::size_of::<MfxExtCodingOption2>(), 68);
     assert_eq!(std::mem::size_of::<MfxExtCodingOption3>(), 512);
+    assert_eq!(std::mem::size_of::<MfxExtendedDeviceId>(), 196);
     assert_eq!(std::mem::offset_of!(MfxEncodeCtrl, FrameType), 32);
     assert_eq!(std::mem::offset_of!(MfxEncodeCtrl, ExtParam), 40);
     assert_eq!(std::mem::offset_of!(MfxExtCodingOption2, MaxFrameSize), 16);
@@ -138,6 +139,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
     #[derive(Default)]
     struct SmokeStatusSink {
         video: Vec<crate::backend::mp4_mux::HevcAccessUnit>,
+        audio: Vec<crate::backend::mp4_mux::AacAccessUnit>,
     }
     impl VplOneCopyRecordSink for SmokeStatusSink {
         fn status(&mut self, message: &str) {
@@ -148,7 +150,9 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
         fn hevc_access_unit(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit) {
             self.video.push(sample.clone());
         }
-        fn aac_access_unit(&mut self, _sample: &crate::backend::mp4_mux::AacAccessUnit) {}
+        fn aac_access_unit(&mut self, sample: &crate::backend::mp4_mux::AacAccessUnit) {
+            self.audio.push(sample.clone());
+        }
     }
 
     unsafe {
@@ -258,6 +262,29 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
     {
         recorded.video_track.samples = std::mem::take(&mut sink.video);
     }
+    if recorded
+        .audio_track
+        .as_ref()
+        .is_some_and(|track| track.samples.is_empty())
+        && !sink.audio.is_empty()
+    {
+        let duration_ticks = sink
+            .audio
+            .iter()
+            .map(|sample| {
+                sample
+                    .timestamp_ticks
+                    .saturating_add(u64::from(sample.duration_ticks))
+            })
+            .max()
+            .unwrap_or(1);
+        recorded.audio_track = Some(crate::backend::mp4_mux::AacLcMp4Track {
+            sample_rate: crate::backend::audio::TARGET_SAMPLE_RATE,
+            channel_count: crate::backend::audio::TARGET_CHANNELS,
+            duration_ticks,
+            samples: std::mem::take(&mut sink.audio),
+        });
+    }
     crate::backend::mp4_mux::write_hevc_aac_mp4(
         &path,
         &recorded.video_track,
@@ -289,6 +316,72 @@ fn local_nvenc_wgc_d3d11_record_smoke() {
         run_local_nvenc_d3d11_record_smoke(RecordCaptureSource::Wgc);
         println!("NVENC WGC repeat {}/{} done", repeat + 1, repeats);
     }
+}
+
+#[test]
+fn replay_idr_requests_are_bounded_by_source_pts_not_frame_count() {
+    assert!(should_force_source_timed_idr(None, 0));
+    assert!(!should_force_source_timed_idr(
+        Some(0),
+        REPLAY_IDR_INTERVAL_90K - 1
+    ));
+    assert!(should_force_source_timed_idr(
+        Some(0),
+        REPLAY_IDR_INTERVAL_90K
+    ));
+    assert!(!should_force_source_timed_idr(
+        Some(10 * VIDEO_CLOCK_HZ),
+        9 * VIDEO_CLOCK_HZ
+    ));
+}
+
+#[test]
+fn bitstream_capacity_is_derived_from_route_dimensions_and_hrd_buffer() {
+    let mut param: MfxVideoParam = unsafe { std::mem::zeroed() };
+    param.mfx.FrameInfo.CropW = 3_840;
+    param.mfx.FrameInfo.CropH = 2_160;
+    let p010 = initial_bitstream_capacity_bytes(&param, VplRecordRoute::hdr_pq_p010());
+    assert!(p010 >= 11 * 1024 * 1024);
+    assert!(p010 < 16 * 1024 * 1024);
+
+    param.mfx.BufferSizeInKB = 30_000;
+    param.mfx.BRCParamMultiplier = 2;
+    let hrd_limited = initial_bitstream_capacity_bytes(&param, VplRecordRoute::hdr_pq_p010());
+    assert!(hrd_limited >= 60_000 * 1024);
+    assert!(hrd_limited <= VPL_BITSTREAM_INITIAL_MAX_BYTES);
+}
+
+#[test]
+fn bitstream_capacity_has_bounded_initial_allocation_for_large_routes() {
+    let mut param: MfxVideoParam = unsafe { std::mem::zeroed() };
+    param.mfx.FrameInfo.Width = u16::MAX;
+    param.mfx.FrameInfo.Height = u16::MAX;
+    param.mfx.BufferSizeInKB = u16::MAX;
+    param.mfx.BRCParamMultiplier = u16::MAX;
+
+    assert_eq!(
+        initial_bitstream_capacity_bytes(&param, VplRecordRoute::hdr_pq_y410()),
+        VPL_BITSTREAM_INITIAL_MAX_BYTES
+    );
+}
+
+#[test]
+fn capture_pool_preserves_32_slots_for_4k_and_bounds_8k_cross_device_vram() {
+    assert_eq!(
+        capture_pool_size_for_route(3_840, 2_160, VplRecordRoute::hdr_pq_p010(), true),
+        32
+    );
+    assert_eq!(
+        capture_pool_size_for_route(3_840, 2_160, VplRecordRoute::hdr_pq_y410(), true),
+        32
+    );
+    let eight_k_shared =
+        capture_pool_size_for_route(7_680, 4_320, VplRecordRoute::hdr_pq_y410(), true);
+    assert!((8..32).contains(&eight_k_shared));
+    assert!(
+        capture_pool_size_for_route(7_680, 4_320, VplRecordRoute::hdr_pq_y410(), false)
+            > eight_k_shared
+    );
 }
 
 #[test]

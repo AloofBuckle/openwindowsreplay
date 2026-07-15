@@ -12,6 +12,7 @@ pub(super) struct DiskSegmentSink {
     pub(super) pending: VecDeque<DiskSegmentBuilder>,
     pub(super) target_duration_90k: u64,
     pub(super) latest_audio_ticks: u64,
+    pub(super) live_ring: Arc<Mutex<EncodedReplayRing>>,
 }
 
 impl DiskSegmentSink {
@@ -21,6 +22,7 @@ impl DiskSegmentSink {
         run_index: u64,
         replay_duration: Duration,
         stop: Arc<AtomicBool>,
+        live_ring: Arc<Mutex<EncodedReplayRing>>,
     ) -> Self {
         let target_seconds = DISK_SEGMENT_TARGET_SECONDS
             .min((replay_duration.as_secs_f32() / 2.0).max(1.0))
@@ -37,6 +39,7 @@ impl DiskSegmentSink {
             pending: VecDeque::new(),
             target_duration_90k: seconds_to_90k(target_seconds),
             latest_audio_ticks: 0,
+            live_ring,
         }
     }
 
@@ -54,6 +57,15 @@ impl DiskSegmentSink {
             .map(|track| track.duration_ticks)
             .unwrap_or(self.latest_audio_ticks);
         self.latest_audio_ticks = self.latest_audio_ticks.max(final_audio_ticks);
+        if let Ok(mut ring) = self.live_ring.lock() {
+            ring.finish_segment_with_audio_duration(
+                recorded.video_track.duration_90k,
+                recorded
+                    .audio_track
+                    .as_ref()
+                    .map(|track| (track.duration_ticks, track.sample_rate)),
+            );
+        }
         self.flush_ready_pending();
         while let Some(segment) = self.pending.pop_front() {
             self.write_completed_segment(segment);
@@ -65,14 +77,18 @@ impl DiskSegmentSink {
     }
 
     pub(super) fn video_track_started(&mut self, info: super::vpl::VplOutputTrackInfo) {
-        self.metadata = Some(EncodedReplayMetadata {
+        let metadata = EncodedReplayMetadata {
             width: info.width,
             height: info.height,
             color: info.color,
             codec: info.codec,
             audio_sample_rate: crate::backend::audio::TARGET_SAMPLE_RATE,
             audio_channel_count: crate::backend::audio::TARGET_CHANNELS,
-        });
+        };
+        self.metadata = Some(metadata.clone());
+        if let Ok(mut ring) = self.live_ring.lock() {
+            ring.start_segment(metadata);
+        }
         self.send_status("oneVPL 编码器已 Init，磁盘循环分段器已建立。");
     }
 
@@ -82,6 +98,9 @@ impl DiskSegmentSink {
         }
         self.remember_parameter_sets(sample);
         if sample.discard_from_track {
+            if let Ok(mut ring) = self.live_ring.lock() {
+                ring.push_video_au_90k(sample);
+            }
             return;
         }
         let Some(metadata) = self.metadata.clone() else {
@@ -120,18 +139,24 @@ impl DiskSegmentSink {
                 return;
             }
             self.current = Some(DiskSegmentBuilder::new(
-                metadata,
+                metadata.clone(),
                 sample.timestamp_90k,
                 scale_90k_to_ticks(
                     sample.timestamp_90k,
                     crate::backend::audio::TARGET_SAMPLE_RATE,
                 ),
             ));
+            if let Ok(mut ring) = self.live_ring.lock() {
+                ring.restart_timeline(metadata);
+            }
             self.flush_ready_pending();
         }
 
         if let Some(current) = self.current.as_mut() {
             current.push_video(sample);
+        }
+        if let Ok(mut ring) = self.live_ring.lock() {
+            ring.push_video_au_90k(sample);
         }
     }
 
@@ -139,25 +164,26 @@ impl DiskSegmentSink {
         if self.failed {
             return;
         }
-        self.latest_audio_ticks = self.latest_audio_ticks.max(
-            sample
-                .timestamp_ticks
-                .saturating_add(u64::from(sample.duration_ticks)),
-        );
-        self.flush_ready_pending();
         if let Some(segment) = self
             .pending
             .iter_mut()
             .find(|segment| segment.contains_audio_timestamp(sample.timestamp_ticks))
         {
             segment.push_audio(sample);
-            return;
-        }
-        if let Some(current) = self.current.as_mut()
+        } else if let Some(current) = self.current.as_mut()
             && sample.timestamp_ticks >= current.start_audio_ticks
         {
             current.push_audio(sample);
         }
+        self.latest_audio_ticks = self.latest_audio_ticks.max(
+            sample
+                .timestamp_ticks
+                .saturating_add(u64::from(sample.duration_ticks)),
+        );
+        if let Ok(mut ring) = self.live_ring.lock() {
+            ring.push_audio_au_ticks(sample, crate::backend::audio::TARGET_SAMPLE_RATE);
+        }
+        self.flush_ready_pending();
     }
 
     pub(super) fn remember_parameter_sets(&mut self, sample: &HevcAccessUnit) {
@@ -343,6 +369,8 @@ impl DiskSegmentBuilder {
             })
         };
         Some(DiskSegmentTracks {
+            source_start_90k: self.start_90k,
+            source_end_90k: end_90k,
             video_track: HevcMp4Track {
                 width: self.metadata.width,
                 height: self.metadata.height,
@@ -358,6 +386,8 @@ impl DiskSegmentBuilder {
 
 #[derive(Debug, Clone)]
 pub(super) struct DiskSegmentTracks {
+    pub(super) source_start_90k: u64,
+    pub(super) source_end_90k: u64,
     pub(super) video_track: HevcMp4Track,
     pub(super) audio_track: Option<AacLcMp4Track>,
 }
@@ -462,7 +492,7 @@ pub(super) fn concat_disk_indexed_segments(
     }))
 }
 
-fn validate_disk_segment_compatibility(
+pub(super) fn validate_disk_segment_compatibility(
     expected: &DiskSegmentIndexedTracks,
     actual: &DiskSegmentIndexedTracks,
 ) -> Result<(), BackendError> {

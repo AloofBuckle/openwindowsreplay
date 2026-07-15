@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) const MFX_ERR_NONE: i32 = 0;
+pub(super) const MFX_ERR_NOT_ENOUGH_BUFFER: i32 = -5;
 pub(super) const MFX_ERR_NOT_FOUND: i32 = -9;
 pub(super) const MFX_ERR_MORE_DATA: i32 = -10;
 pub(super) const MFX_ERR_MORE_SURFACE: i32 = -11;
@@ -9,6 +10,7 @@ pub(super) const MFX_WRN_IN_EXECUTION: i32 = 1;
 pub(super) const MFX_WRN_DEVICE_BUSY: i32 = 2;
 pub(super) const MFX_WRN_PARTIAL_ACCELERATION: i32 = 4;
 pub(super) const MFX_IMPLCAPS_IMPLDESCSTRUCTURE: u32 = 1;
+pub(super) const MFX_IMPLCAPS_DEVICE_ID_EXTENDED: u32 = 4;
 pub(super) const MFX_IMPL_TYPE_HARDWARE: u32 = 0x0002;
 pub(super) const MFX_ACCEL_MODE_VIA_D3D11: u32 = 0x0300;
 pub(super) const MFX_RESOURCE_DX11_TEXTURE: u32 = 5;
@@ -16,9 +18,12 @@ pub(super) const MFX_IOPATTERN_IN_VIDEO_MEMORY: u16 = 0x01;
 pub(super) const MFX_PICSTRUCT_PROGRESSIVE: u16 = 0x01;
 pub(super) const MFX_HANDLE_D3D11_DEVICE: u32 = 3;
 pub(super) const VIDEO_CLOCK_HZ: u64 = 90_000;
+pub(super) const REPLAY_IDR_INTERVAL_90K: u64 = 5 * VIDEO_CLOCK_HZ;
 pub(super) const VPL_RECORD_ASYNC_DEPTH: u16 = 16;
 pub(super) const VPL_RECORD_MAX_IN_FLIGHT: usize = 64;
-pub(super) const VPL_BITSTREAM_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const VPL_BITSTREAM_MIN_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const VPL_BITSTREAM_INITIAL_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const VPL_BITSTREAM_GROWTH_MAX_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const WGC_GPU_THREAD_PRIORITY: i32 = 0;
 pub(super) const MFX_CODINGOPTION_ON: u16 = 0x10;
 pub(super) const MFX_CODINGOPTION_OFF: u16 = 0x20;
@@ -597,6 +602,7 @@ pub(super) fn nvenc_input_format_from_route(
 pub(super) fn validate_current_display_route_plan(
     plan: &VplCurrentDisplayRouteInfo,
     adapter_index: u32,
+    output_index: u32,
     output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
     output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
     requested_chroma: ChromaSampling,
@@ -616,16 +622,28 @@ pub(super) fn validate_current_display_route_plan(
             "能力探测没有当前色度的可录制 route，请重新探测能力",
         ));
     }
-    if plan.adapter_index != adapter_index || plan.output_index != 0 {
+    if plan.adapter_index != adapter_index || plan.output_index != output_index {
         return Err(BackendError::unsupported(
             "录制 RoutePlan",
             format!(
-                "plan adapter/output={}/{} current adapter/output={}/0",
-                plan.adapter_index, plan.output_index, adapter_index
+                "plan adapter/output={}/{} current adapter/output={}/{}",
+                plan.adapter_index, plan.output_index, adapter_index, output_index
             ),
             "显示输出已变化，请重新探测能力",
         ));
     }
+    if plan.implementation_index == u32::MAX {
+        return Err(BackendError::unsupported(
+            "录制 RoutePlan",
+            "oneVPL implementation",
+            "能力探测没有确认与当前 DXGI adapter 同设备的 oneVPL 硬件 implementation",
+        ));
+    }
+    validate_output_rotation(
+        "录制 RoutePlan",
+        plan.rotation,
+        output_desc.Rotation.0 as u32,
+    )?;
     let rect = output_desc.DesktopCoordinates;
     if plan.desktop_left != rect.left
         || plan.desktop_top != rect.top
@@ -678,6 +696,7 @@ pub(super) fn validate_current_display_route_plan(
 pub(super) fn validate_current_nvenc_route_plan(
     plan: &crate::backend::nvenc::NvencCurrentDisplayRouteInfo,
     adapter_index: u32,
+    output_index: u32,
     output_desc: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
     output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
     requested_chroma: ChromaSampling,
@@ -714,16 +733,21 @@ pub(super) fn validate_current_nvenc_route_plan(
             "当前 NVENC 生产路径只接入 NV12/P010/AYUV；其他格式仍为 probe-only",
         ));
     }
-    if plan.adapter_index != adapter_index || plan.output_index != 0 {
+    if plan.adapter_index != adapter_index || plan.output_index != output_index {
         return Err(BackendError::unsupported(
             "NVENC 录制 RoutePlan",
             format!(
-                "plan adapter/output={}/{} current adapter/output={}/0",
-                plan.adapter_index, plan.output_index, adapter_index
+                "plan adapter/output={}/{} current adapter/output={}/{}",
+                plan.adapter_index, plan.output_index, adapter_index, output_index
             ),
             "显示输出已变化，请重新探测能力",
         ));
     }
+    validate_output_rotation(
+        "NVENC 录制 RoutePlan",
+        plan.rotation,
+        output_desc.Rotation.0 as u32,
+    )?;
     let rect = output_desc.DesktopCoordinates;
     if plan.desktop_left != rect.left
         || plan.desktop_top != rect.top
@@ -767,6 +791,38 @@ pub(super) fn validate_current_nvenc_route_plan(
                 plan.color_space, plan.bits_per_color, desc1.ColorSpace.0, desc1.BitsPerColor
             ),
             "显示色彩状态已变化，请重新探测能力",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_output_rotation(
+    context: &'static str,
+    planned_rotation: u32,
+    current_rotation: u32,
+) -> Result<(), BackendError> {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
+    };
+
+    if planned_rotation != current_rotation {
+        return Err(BackendError::unsupported(
+            context,
+            format!(
+                "plan rotation={} current rotation={}",
+                planned_rotation, current_rotation
+            ),
+            "显示输出旋转状态已变化，请重新探测能力",
+        ));
+    }
+    if current_rotation != DXGI_MODE_ROTATION_UNSPECIFIED.0 as u32
+        && current_rotation != DXGI_MODE_ROTATION_IDENTITY.0 as u32
+    {
+        return Err(BackendError::unsupported(
+            context,
+            format!("DXGI output rotation={current_rotation}"),
+            "不支持的桌面模式",
         ));
     }
     Ok(())

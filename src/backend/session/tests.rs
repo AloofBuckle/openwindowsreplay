@@ -87,6 +87,8 @@ fn disk_store_selects_whole_recent_segments() {
     for index in 0..5 {
         store.segments.push_back(DiskSegmentMeta {
             index,
+            source_start_ns: index * 10_000_000_000,
+            source_end_ns: (index + 1) * 10_000_000_000,
             mp4_path: PathBuf::from(format!("{index}.mp4")),
             sidecar_path: PathBuf::from(format!("{index}.rrseg")),
             duration_90k: 10 * VIDEO_CLOCK_HZ,
@@ -106,7 +108,8 @@ fn disk_store_selects_whole_recent_segments() {
         vec![2, 3, 4]
     );
 
-    let selected = store.select_recent_segments_after(Duration::from_secs(25), Some(3));
+    let selected =
+        store.select_recent_segments_after(Duration::from_secs(25), Some(35_000_000_000));
     assert_eq!(
         selected
             .iter()
@@ -114,6 +117,89 @@ fn disk_store_selects_whole_recent_segments() {
             .collect::<Vec<_>>(),
         vec![4]
     );
+}
+
+#[test]
+fn disk_store_source_cursor_resumes_at_the_next_segment_keyframe() {
+    let mut store = DiskReplayStore::new(
+        unique_temp_dir("source_cursor"),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    );
+    for (index, start_ns) in [0, 5_000_000_000, 10_000_000_000].into_iter().enumerate() {
+        store.segments.push_back(DiskSegmentMeta {
+            index: index as u64,
+            source_start_ns: start_ns,
+            source_end_ns: start_ns + 5_000_000_000,
+            mp4_path: PathBuf::from(format!("{index}.mp4")),
+            sidecar_path: PathBuf::from(format!("{index}.rrseg")),
+            duration_90k: 5 * VIDEO_CLOCK_HZ,
+            audio_access_units: 1,
+            bytes: 1,
+            lease: Arc::new(()),
+        });
+    }
+
+    let selected = store.select_recent_segments_after(Duration::from_secs(30), Some(3_000_000_000));
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn disk_store_snapshot_uses_only_the_latest_compatible_codec_epoch() {
+    let dir = unique_temp_dir("latest_epoch");
+    fs::create_dir_all(&dir).unwrap();
+    let mut old_tracks = segment(0, 90_000, 0, 48_000);
+    old_tracks.video_track.width = 32;
+    let old = write_indexed_segment(&dir, "old", &old_tracks);
+    let current_a = write_indexed_segment(&dir, "current_a", &segment(0, 90_000, 0, 48_000));
+    let current_b = write_indexed_segment(&dir, "current_b", &segment(0, 90_000, 0, 48_000));
+    let mut store = DiskReplayStore::new(
+        dir.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    );
+    for (index, segment) in [old, current_a, current_b].into_iter().enumerate() {
+        store.segments.push_back(DiskSegmentMeta {
+            index: index as u64,
+            source_start_ns: index as u64 * 1_000_000_000,
+            source_end_ns: (index as u64 + 1) * 1_000_000_000,
+            sidecar_path: indexed_sidecar(
+                &dir,
+                match index {
+                    0 => "old",
+                    1 => "current_a",
+                    _ => "current_b",
+                },
+            ),
+            mp4_path: segment.mp4_path,
+            duration_90k: segment.index.video_track.duration_90k,
+            audio_access_units: segment
+                .index
+                .audio_track
+                .as_ref()
+                .map(|track| track.samples.len())
+                .unwrap_or(0),
+            bytes: 1,
+            lease: segment.lease,
+        });
+    }
+
+    let snapshot = store
+        .snapshot_recent_tracks(Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(snapshot.video_track.width, 16);
+    assert_eq!(snapshot.video_track.duration_90k, 180_000);
+    assert_eq!(snapshot.video_track.samples.len(), 2);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -163,6 +249,7 @@ fn disk_segment_sink_fails_instead_of_blocking_when_writer_queue_is_full() {
         0,
         Duration::from_secs(60),
         stop.clone(),
+        Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(65)))),
     );
     let mut builder = DiskSegmentBuilder::new(metadata(), 0, 0);
     builder.end_90k = Some(90_000);
@@ -177,6 +264,104 @@ fn disk_segment_sink_fails_instead_of_blocking_when_writer_queue_is_full() {
 
     assert!(stop.load(Ordering::Relaxed));
     assert!(matches!(event_rx.recv().unwrap(), ReplayEvent::Error(_)));
+}
+
+#[test]
+fn disk_segment_assigns_cross_boundary_aac_before_flushing_the_old_segment() {
+    let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+    let (event_tx, _event_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(2),
+        stop,
+        Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(7)))),
+    );
+    sink.video_track_started(super::vpl::VplOutputTrackInfo {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 90_000,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+
+    sink.aac_access_unit(&AacAccessUnit {
+        timestamp_ticks: 47_500,
+        duration_ticks: 1_024,
+        data: vec![0x21, 0x10].into(),
+    });
+
+    let job = writer_rx.try_recv().unwrap();
+    let audio = job.segment.audio_track.unwrap();
+    assert_eq!(audio.samples.len(), 1);
+    assert_eq!(audio.samples[0].timestamp_ticks, 47_500);
+}
+
+#[test]
+fn disk_open_segment_ring_can_save_a_static_first_idr_before_any_rotation() {
+    let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+    let (event_tx, _event_rx) = mpsc::channel();
+    let live_ring = Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(65))));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(60),
+        Arc::new(AtomicBool::new(false)),
+        live_ring.clone(),
+    );
+    sink.video_track_started(super::vpl::VplOutputTrackInfo {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_parameter_sets().into(),
+        is_sync: false,
+        discard_from_track: true,
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+    sink.aac_access_unit(&AacAccessUnit {
+        timestamp_ticks: 0,
+        duration_ticks: 1_024,
+        data: vec![0x21, 0x10].into(),
+    });
+
+    let snapshot = live_ring
+        .lock()
+        .unwrap()
+        .snapshot_recent_tracks(Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .video_track
+            .samples
+            .iter()
+            .filter(|sample| !sample.discard_from_track)
+            .count(),
+        1
+    );
+    assert_eq!(snapshot.audio_track.unwrap().samples.len(), 1);
 }
 
 #[test]
@@ -195,6 +380,44 @@ fn disk_store_prepare_directory_removes_only_replay_artifacts() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[test]
+fn disk_store_clear_defers_leased_segments_and_retries_after_release() {
+    let dir = unique_temp_dir("clear_leased");
+    fs::create_dir_all(&dir).unwrap();
+    let mp4_path = dir.join("leased.mp4");
+    let sidecar_path = dir.join("leased.rrseg");
+    fs::write(&mp4_path, b"mp4").unwrap();
+    fs::write(&sidecar_path, b"sidecar").unwrap();
+    let lease = Arc::new(());
+    let held = lease.clone();
+    let mut store = DiskReplayStore::new(
+        dir.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    );
+    store.segments.push_back(DiskSegmentMeta {
+        index: 0,
+        source_start_ns: 0,
+        source_end_ns: 1_000_000_000,
+        mp4_path: mp4_path.clone(),
+        sidecar_path: sidecar_path.clone(),
+        duration_90k: 90_000,
+        audio_access_units: 1,
+        bytes: 7,
+        lease,
+    });
+
+    store.clear_segments().unwrap();
+    assert_eq!(store.segments.len(), 1);
+    assert!(mp4_path.exists());
+    drop(held);
+    store.clear_segments().unwrap();
+    assert!(store.segments.is_empty());
+    assert!(!mp4_path.exists());
+    assert!(!sidecar_path.exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
 fn segment(
     video_start_90k: u64,
     duration_90k: u64,
@@ -202,6 +425,8 @@ fn segment(
     audio_duration_ticks: u64,
 ) -> DiskSegmentTracks {
     DiskSegmentTracks {
+        source_start_90k: video_start_90k,
+        source_end_90k: video_start_90k.saturating_add(duration_90k),
         video_track: HevcMp4Track {
             width: 16,
             height: 16,

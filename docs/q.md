@@ -29,6 +29,21 @@
    - 失败会 rollback；启动只清理 RustReplay 自己的旧分段产物，停止会清空当前磁盘缓存。
    - segment lease 防止保存读取期间被 prune 删除。
 
+7. **正常停止与并发错误混淆**
+   - 用户取消使用独立取消错误；worker 只把该错误视作正常停止，不再因为 stop flag 已置位而吞掉同时发生的真实后端错误。
+
+8. **adapter/output 与跨 GPU 误配**
+   - 所有 DXGI adapter/output 都参与探测，并优先包含桌面原点的主显示器。
+   - oneVPL implementation 使用 `mfxExtendedDeviceId.DeviceLUID` 精确匹配 DXGI adapter；旧 dispatcher 无 LUID 时只允许同厂商唯一 adapter 的无歧义兼容路径。
+   - 非 identity rotation 明确返回“`不支持的桌面模式`”；显示 rect/rotation/HDR 指纹变化会触发重新探测。
+
+9. **无界 bitstream/surface 显存占用**
+   - oneVPL bitstream 按分辨率、route 与 HRD 推导初始容量，仅在 `MFX_ERR_NOT_ENOUGH_BUFFER` 时复用并增长。
+   - capture slot 在 4K 保留 32 个，8K/跨设备路径按显存预算收紧。
+
+10. **磁盘开放分段与完成分段保存游标分裂**
+    - 两者改为共用源时间游标；游标落在分段中间时从下一段可独立解码关键帧继续，不会因保存过开放分段而永久跳过后来落盘的片段。
+
 ## 部分关闭
 
 1. **资源释放故障覆盖**
@@ -45,19 +60,18 @@
 
 ## 未关闭
 
-1. 用户主动停止仍由 `BackendError` 表达，尚未引入 `RecordExit::{Stopped, Completed, Failed}`。
-2. adapter/output 基本仍固定索引 0；混合 GPU、output 1+ 和旋转显示器未生产验证。
-3. oneVPL bitstream pool 最坏约为 `64 MiB * async depth 16`，需要按能力和码率收紧上限。
-4. GPU capture slot 固定为 32，尚未按显存预算动态配置。
-5. 通配符导入、长参数列表和局部 lint 抑制仍存在，需在不改变热路径行为的前提下渐进清理。
-6. WGC 500 us polling 已通过短时 4K/170 Hz 测试，但仍缺少多小时长跑与功耗审计。
+1. 通配符导入、长参数列表和局部 lint 抑制仍存在，需在不改变热路径行为的前提下渐进清理。
+2. oneVPL/D3D11 FFI 的完整句柄 RAII 和逐操作 `SAFETY` 说明尚未全部完成。
+3. WGC 持久捕获服务与两种后端仍缺少多小时长跑、睡眠/唤醒和显示器热插拔自动化。
+4. 系统化 failpoint、磁盘空间耗尽、权限变化、writer panic 等故障测试仍未全部自动化。
 
 ## 本次合并验证
 
 - `cargo fmt --check`
-- `cargo test --locked --target x86_64-pc-windows-msvc`：69 passed，11 ignored
+- `cargo test --locked --target x86_64-pc-windows-msvc`：88 passed，11 ignored
+- `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`
 - `cargo build --release --locked --target x86_64-pc-windows-msvc`
-- NVENC WGC：4K/170 Hz/HDR PQ/P010，连续 5 次 3 秒录制通过，每次 511 个视频 AU，无 slot/queue drop
-- NVENC DDA：4K/170 Hz/HDR PQ/P010，3 秒录制和 MP4 封装通过
+- NVENC WGC：4K/170 Hz/HDR PQ/P010，真实录制、MP4 封装及五次重复启停通过
+- NVENC DDA：4K/170 Hz/HDR PQ/P010，真实录制、MP4 封装及五次重复启停通过
 - `ffprobe`：HEVC Main10、yuv420p10le、BT.2020/PQ/full-range、AAC LC
 - ffmpeg rawvideo 完整解码：WGC/DDA 均无 HEVC 解码错误

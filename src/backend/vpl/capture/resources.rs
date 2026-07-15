@@ -103,6 +103,7 @@ unsafe fn duplicate_output1_with_retry(
 #[cfg(windows)]
 pub(in super::super) unsafe fn create_duplication_on_device(
     adapter1: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
     route: VplRecordRoute,
 ) -> Result<windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication, BackendError> {
@@ -114,9 +115,9 @@ pub(in super::super) unsafe fn create_duplication_on_device(
     use windows::core::Interface;
 
     let output = adapter1
-        .EnumOutputs(0)
+        .EnumOutputs(output_index)
         .map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIAdapter1::EnumOutputs(0)",
+            func: "IDXGIAdapter1::EnumOutputs(DDA target)",
             message: err.to_string(),
         })?;
     let output1: IDXGIOutput1 = output.cast().map_err(|err| BackendError::WindowsApi {

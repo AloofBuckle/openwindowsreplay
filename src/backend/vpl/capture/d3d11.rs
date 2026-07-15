@@ -166,9 +166,16 @@ pub(in super::super) unsafe fn copy_texture_subresource_region(
 }
 
 #[cfg(windows)]
+pub(in super::super) struct CachedFallbackShaderResourceView {
+    texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+}
+
+#[cfg(windows)]
 pub(in super::super) struct ShaderResourceViewCache {
     pub(in super::super) direct:
         HashMap<usize, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>,
+    pub(in super::super) fallback: HashMap<usize, CachedFallbackShaderResourceView>,
     pub(in super::super) retain_views: bool,
 }
 
@@ -177,6 +184,7 @@ impl ShaderResourceViewCache {
     pub(in super::super) fn retained() -> Self {
         Self {
             direct: HashMap::new(),
+            fallback: HashMap::new(),
             retain_views: true,
         }
     }
@@ -184,6 +192,7 @@ impl ShaderResourceViewCache {
     pub(in super::super) fn transient() -> Self {
         Self {
             direct: HashMap::new(),
+            fallback: HashMap::new(),
             retain_views: false,
         }
     }
@@ -204,14 +213,32 @@ impl ShaderResourceViewCache {
         if let Some(srv) = self.direct.get(&key) {
             return Ok(srv.clone());
         }
+        if let Some(cached) = self.fallback.get(&key) {
+            copy_texture_resource(context, source, &cached.texture)?;
+            return Ok(cached.srv.clone());
+        }
         if let Ok(srv) = create_direct_shader_resource_view(device, source, label) {
-            if self.direct.len() >= 64 {
+            if self.direct.len() + self.fallback.len() >= 64 {
                 self.direct.clear();
+                self.fallback.clear();
             }
             self.direct.insert(key, srv.clone());
             return Ok(srv);
         }
-        create_shader_resource_view_with_gpu_copy_fallback(device, context, source, label)
+        let (texture, srv) =
+            create_gpu_copy_fallback_shader_resource_view(device, context, source, label)?;
+        if self.direct.len() + self.fallback.len() >= 64 {
+            self.direct.clear();
+            self.fallback.clear();
+        }
+        self.fallback.insert(
+            key,
+            CachedFallbackShaderResourceView {
+                texture,
+                srv: srv.clone(),
+            },
+        );
+        Ok(srv)
     }
 }
 
@@ -295,6 +322,27 @@ pub(in super::super) unsafe fn create_shader_resource_view_with_gpu_copy_fallbac
     source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     label: &'static str,
 ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, BackendError> {
+    if let Ok(srv) = create_direct_shader_resource_view(device, source, label) {
+        return Ok(srv);
+    }
+
+    create_gpu_copy_fallback_shader_resource_view(device, context, source, label)
+        .map(|(_, srv)| srv)
+}
+
+#[cfg(windows)]
+unsafe fn create_gpu_copy_fallback_shader_resource_view(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    label: &'static str,
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    ),
+    BackendError,
+> {
     use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC,
@@ -302,10 +350,6 @@ pub(in super::super) unsafe fn create_shader_resource_view_with_gpu_copy_fallbac
         D3D11_USAGE_DEFAULT, ID3D11Resource,
     };
     use windows::core::Interface;
-
-    if let Ok(srv) = create_direct_shader_resource_view(device, source, label) {
-        return Ok(srv);
-    }
 
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     source.GetDesc(&mut desc);
@@ -360,10 +404,11 @@ pub(in super::super) unsafe fn create_shader_resource_view_with_gpu_copy_fallbac
                 desc.Format.0, desc.BindFlags, copy_desc.Format.0
             ),
         })?;
-    fallback_srv.ok_or_else(|| BackendError::WindowsApi {
+    let fallback_srv = fallback_srv.ok_or_else(|| BackendError::WindowsApi {
         func: label,
         message: "fallback 返回空 SRV".to_owned(),
-    })
+    })?;
+    Ok((shader_readable, fallback_srv))
 }
 
 #[cfg(windows)]

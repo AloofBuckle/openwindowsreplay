@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[cfg(windows)]
+pub(super) enum CaptureFailure {
+    Fatal(String),
+    Reconfigure(String),
+}
+
 mod d3d11;
 mod resources;
 mod slots;
@@ -26,16 +32,30 @@ impl CaptureThreadGuard {
         }
     }
 
-    pub(super) fn stop_and_join(&mut self) {
+    pub(super) fn stop_and_join(&mut self) -> Result<(), BackendError> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.join().map_err(|payload| BackendError::WindowsApi {
+                func: "capture thread join",
+                message: panic_payload_message(payload),
+            })?;
         }
+        Ok(())
     }
 }
 
 impl Drop for CaptureThreadGuard {
     fn drop(&mut self) {
-        self.stop_and_join();
+        let _ = self.stop_and_join();
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "capture thread panicked with a non-string payload".to_owned()
     }
 }

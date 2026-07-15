@@ -153,11 +153,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         ),
     );
     if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(BackendError::unsupported(
-            "NVENC 录制后端初始化",
-            "用户停止请求",
-            "停止请求发生在 NVENC/D3D11 初始化前，已中止当前片段",
-        ));
+        return Err(BackendError::cancelled("NVENC/D3D11 初始化前"));
     }
 
     let mut notes = vec![
@@ -199,23 +195,35 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             "{:08X}:{:08X}",
             desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
         );
-        let output0 = adapter1
-            .EnumOutputs(0)
+        let selected_output_index = route_plan.map(|plan| plan.output_index).unwrap_or(0);
+        let selected_output = adapter1.EnumOutputs(selected_output_index).map_err(|err| {
+            BackendError::WindowsApi {
+                func: "IDXGIAdapter1::EnumOutputs(NVENC record target)",
+                message: err.to_string(),
+            }
+        })?;
+        let output_desc = selected_output
+            .GetDesc()
             .map_err(|err| BackendError::WindowsApi {
-                func: "IDXGIAdapter1::EnumOutputs(0 NVENC record)",
+                func: "IDXGIOutput::GetDesc(NVENC record)",
                 message: err.to_string(),
             })?;
-        let output_desc = output0.GetDesc().map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIOutput::GetDesc(NVENC record)",
-            message: err.to_string(),
-        })?;
         let (capture_width, capture_height, capture_dimensions_note) =
             capture_dimensions_from_output(&output_desc);
-        let aligned_width = align16(capture_width);
-        let aligned_height = align16(capture_height);
+        if requested_chroma == ChromaSampling::Yuv420
+            && (capture_width % 2 != 0 || capture_height % 2 != 0)
+        {
+            return Err(BackendError::unsupported(
+                "NVENC 录制尺寸",
+                format!("{}x{} 4:2:0", capture_width, capture_height),
+                "不支持的桌面模式",
+            ));
+        }
+        let encode_width = u32::from(capture_width);
+        let encode_height = u32::from(capture_height);
         notes.push(format!(
-            "NVENC direct-input dimensions: {capture_dimensions_note}; aligned={}x{}",
-            aligned_width, aligned_height
+            "NVENC direct-input dimensions: {capture_dimensions_note}; encode={}x{} (no implicit padding)",
+            encode_width, encode_height
         ));
         let (encoder_frame_rate_n, encoder_frame_rate_d, encoder_frame_rate_note) =
             encoder_frame_rate_hint_from_output(&output_desc);
@@ -234,8 +242,9 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         validate_current_nvenc_route_plan(
             plan,
             adapter_index,
+            selected_output_index,
             &output_desc,
-            &output0,
+            &selected_output,
             requested_chroma,
         )?;
         let record_route = record_route_from_nvenc_display_plan(plan)?;
@@ -257,8 +266,8 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let init_started = Instant::now();
         let mut nvenc_encoder = crate::backend::nvenc::NvencD3d11Encoder::open_with_rate_control(
             adapter_index,
-            aligned_width as u32,
-            aligned_height as u32,
+            encode_width,
+            encode_height,
             nvenc_input_format,
             record_route.mp4_color,
             rate_control,
@@ -305,8 +314,8 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
 
         let record_route_dxgi_format = record_route.try_dxgi_format()?;
         let target_desc = D3D11_TEXTURE2D_DESC {
-            Width: aligned_width as u32,
-            Height: aligned_height as u32,
+            Width: encode_width,
+            Height: encode_height,
             MipLevels: 1,
             ArraySize: 1,
             Format: record_route_dxgi_format,
@@ -374,6 +383,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let mut first_sample_timestamp_90k: Option<u64> = None;
         let mut first_video_timestamp_100ns: Option<i64> = None;
         let mut last_submitted_sample_timestamp_90k: Option<u64> = None;
+        let mut last_forced_idr_timestamp_90k: Option<u64> = None;
         let capture_duration = Duration::from_secs_f32(duration_seconds.max(0.1));
         let requested_duration_90k =
             (duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64;
@@ -382,8 +392,11 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let end_at = start + capture_duration;
         let qpc_frequency = query_performance_frequency().unwrap_or(0);
         let audio_started = Instant::now();
-        let mut audio_capture =
-            RecordAudioCapture::start(capture_duration + Duration::from_secs(5), &mut notes);
+        let mut audio_capture = RecordAudioCapture::start(
+            capture_duration + Duration::from_secs(5),
+            retain_output_samples,
+            &mut notes,
+        );
         sink_status(
             &mut encoded_sink,
             format!(
@@ -395,7 +408,12 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         );
 
         {
-            let capture_pool_size = 32usize;
+            let capture_pool_size = capture_pool_size_for_route(
+                target_desc.Width,
+                target_desc.Height,
+                record_route,
+                matches!(capture_source, RecordCaptureSource::Dda),
+            );
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
             let (free_tx, free_rx) = std::sync::mpsc::channel::<CaptureFrameSlot>();
@@ -408,6 +426,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                         create_d3d11_device_for_adapter(&adapter1)?;
                     spawn_dda_capture_thread(
                         adapter1.clone(),
+                        selected_output_index,
                         capture_device,
                         capture_context,
                         encoder_device.clone(),
@@ -427,6 +446,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                 }
                 RecordCaptureSource::Wgc => spawn_wgc_capture_thread(
                     adapter1.clone(),
+                    selected_output_index,
                     encoder_device.clone(),
                     start,
                     end_at,
@@ -456,13 +476,31 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             ));
 
             let mut capture_stats: Option<CaptureStats> = None;
-            let mut capture_error: Option<String> = None;
+            let mut capture_error: Option<CaptureFailure> = None;
             let mut active_source_desc: Option<D3D11_TEXTURE2D_DESC> = None;
+            let mut next_route_validation = Instant::now() + Duration::from_secs(1);
 
             loop {
                 if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
+                }
+                if Instant::now() >= next_route_validation {
+                    let current_desc = selected_output.GetDesc().map_err(|err| {
+                        BackendError::reconfigure_required(format!(
+                            "读取当前 NVENC 输出状态失败：{err}"
+                        ))
+                    })?;
+                    validate_current_nvenc_route_plan(
+                        plan,
+                        adapter_index,
+                        selected_output_index,
+                        &current_desc,
+                        &selected_output,
+                        requested_chroma,
+                    )
+                    .map_err(|err| BackendError::reconfigure_required(err.to_string()))?;
+                    next_route_validation = Instant::now() + Duration::from_secs(1);
                 }
                 let msg = match frame_rx.recv_timeout(Duration::from_millis(2)) {
                     Ok(msg) => msg,
@@ -473,7 +511,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                 last_submitted_sample_timestamp_90k,
                                 &mut encoded_sink,
                                 &mut notes,
-                            );
+                            )?;
                         }
                         continue;
                     }
@@ -602,7 +640,15 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                     *first_sample_timestamp_90k.get_or_insert(timestamp_90k);
                                 let sample_ts90 = timestamp_90k.saturating_sub(first_ts);
                                 last_submitted_sample_timestamp_90k = Some(sample_ts90);
-                                (sample_ts90, captured_frames == 0, false)
+                                let idr_reference = encoded_stats
+                                    .last_sync_timestamp_90k
+                                    .or(last_forced_idr_timestamp_90k);
+                                let force_idr =
+                                    should_force_source_timed_idr(idr_reference, sample_ts90);
+                                if force_idr {
+                                    last_forced_idr_timestamp_90k = Some(sample_ts90);
+                                }
+                                (sample_ts90, force_idr, false)
                             };
 
                             let submit_started = Instant::now();
@@ -645,14 +691,14 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                     last_submitted_sample_timestamp_90k,
                                     &mut encoded_sink,
                                     &mut notes,
-                                );
+                                )?;
                             }
                             perf.frame.add(frame_started.elapsed());
                             Ok(())
                         })();
                         if let Err(err) = frame_result {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            capture_thread.stop_and_join();
+                            let _ = capture_thread.stop_and_join();
                             return Err(err);
                         }
                     }
@@ -668,13 +714,20 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             }
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            capture_thread.stop_and_join();
-            if let Some(message) = capture_error {
-                return Err(BackendError::unsupported(
-                    format!("{} capture thread", capture_source.label()),
-                    "Acquire/CopyResource",
-                    message,
-                ));
+            capture_thread.stop_and_join()?;
+            if let Some(failure) = capture_error {
+                match failure {
+                    CaptureFailure::Reconfigure(reason) => {
+                        return Err(BackendError::reconfigure_required(reason));
+                    }
+                    CaptureFailure::Fatal(message) => {
+                        return Err(BackendError::unsupported(
+                            format!("{} capture thread", capture_source.label()),
+                            "Acquire/CopyResource",
+                            message,
+                        ));
+                    }
+                }
             }
             if let Some(stats) = capture_stats {
                 dda_timeouts = stats.dda_timeouts.min(u64::from(u32::MAX)) as u32;
@@ -704,11 +757,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                     record_started.elapsed().as_secs_f64() * 1000.0
                 ),
             );
-            return Err(BackendError::unsupported(
-                "停止即时回放",
-                "用户停止请求",
-                "已快速中止当前 NVENC 录制片段",
-            ));
+            return Err(BackendError::cancelled("NVENC 录制循环"));
         }
 
         let duration_90k = encoded_timeline_duration_90k(
@@ -732,35 +781,51 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                 ),
             ));
         }
-        let audio_track = if let Some(capture) = audio_capture.as_mut() {
-            capture.finish_live_aac(&mut encoded_sink, &mut notes);
-            let sink_push_from_ticks = capture.live_pushed_until_ticks();
-            let audio_frames = capture.finish(&mut notes);
-            build_record_aac_track(
-                audio_frames,
-                first_video_timestamp_100ns,
-                duration_90k,
-                &mut notes,
-                &mut encoded_sink,
-                sink_push_from_ticks,
-            )?
-        } else {
-            None
-        };
-        let audio_access_units = audio_track
-            .as_ref()
-            .map(|track| track.samples.len().min(u32::MAX as usize) as u32)
-            .unwrap_or(0);
-        let audio_encoded_bytes = audio_track
-            .as_ref()
-            .map(|track| {
-                track
-                    .samples
-                    .iter()
-                    .map(|sample| sample.data.len() as u64)
-                    .sum()
-            })
-            .unwrap_or(0);
+        let (audio_track, audio_access_units, audio_encoded_bytes) =
+            if let Some(capture) = audio_capture.as_mut() {
+                if retain_output_samples {
+                    capture.finish_live_aac(&mut encoded_sink, &mut notes)?;
+                    let sink_push_from_ticks = capture.live_pushed_until_ticks();
+                    let audio_frames = capture.finish(&mut notes);
+                    let track = build_record_aac_track(
+                        audio_frames,
+                        first_video_timestamp_100ns,
+                        duration_90k,
+                        &mut notes,
+                        &mut encoded_sink,
+                        sink_push_from_ticks,
+                    )?;
+                    let access_units = track
+                        .as_ref()
+                        .map(|track| track.samples.len().min(u32::MAX as usize) as u32)
+                        .unwrap_or(0);
+                    let encoded_bytes = track
+                        .as_ref()
+                        .map(|track| {
+                            track
+                                .samples
+                                .iter()
+                                .map(|sample| sample.data.len() as u64)
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    (track, access_units, encoded_bytes)
+                } else {
+                    let track = capture.finish_streaming(
+                        first_video_timestamp_100ns,
+                        duration_90k,
+                        &mut encoded_sink,
+                        &mut notes,
+                    )?;
+                    (
+                        track,
+                        capture.live_access_units(),
+                        capture.live_encoded_bytes(),
+                    )
+                }
+            } else {
+                (None, 0, 0)
+            };
         let video_track = HevcMp4Track {
             width: capture_width,
             height: capture_height,
@@ -819,6 +884,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
 
         let report = VplOneCopyRecordReport {
             adapter_index,
+            output_index: selected_output_index,
             adapter_luid,
             output_path: output.display().to_string(),
             width: capture_width,

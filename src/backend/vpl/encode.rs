@@ -118,6 +118,14 @@ pub(super) struct AsyncEncode {
     pub(super) discard: bool,
 }
 
+pub(super) struct AsyncEncodeRequest {
+    pub(super) surface: *mut MfxFrameSurface1,
+    pub(super) timestamp_90k: u64,
+    pub(super) is_sync: bool,
+    pub(super) storage: Vec<u8>,
+    pub(super) discard: bool,
+}
+
 pub(super) enum TrySyncResult {
     Ready(Option<crate::backend::mp4_mux::HevcAccessUnit>),
     NotReady,
@@ -182,6 +190,7 @@ pub(super) struct RecordHevcStats {
     pub(super) encoded_bytes: u64,
     pub(super) discarded_header_units: u32,
     pub(super) last_timestamp_90k: Option<u64>,
+    pub(super) last_sync_timestamp_90k: Option<u64>,
 }
 
 impl RecordHevcStats {
@@ -192,6 +201,9 @@ impl RecordHevcStats {
             self.encoded_samples = self.encoded_samples.saturating_add(1);
             self.encoded_bytes = self.encoded_bytes.saturating_add(sample.data.len() as u64);
             self.last_timestamp_90k = Some(sample.timestamp_90k);
+            if sample.is_sync {
+                self.last_sync_timestamp_90k = Some(sample.timestamp_90k);
+            }
         }
     }
 }
@@ -216,18 +228,65 @@ pub(super) fn mfx_frame_type_is_sync(frame_type: u16) -> bool {
     frame_type & (MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_I) != 0
 }
 
+pub(super) fn initial_bitstream_capacity_bytes(
+    param: &MfxVideoParam,
+    route: VplRecordRoute,
+) -> usize {
+    let width = u128::from(param.mfx.FrameInfo.CropW.max(param.mfx.FrameInfo.Width));
+    let height = u128::from(param.mfx.FrameInfo.CropH.max(param.mfx.FrameInfo.Height));
+    let component_bytes = if route.bit_depth > 8 { 2u128 } else { 1u128 };
+    let raw_bytes = match route.chroma {
+        1 => {
+            width
+                .saturating_mul(height)
+                .saturating_mul(3)
+                .saturating_mul(component_bytes)
+                / 2
+        }
+        2 => width
+            .saturating_mul(height)
+            .saturating_mul(2)
+            .saturating_mul(component_bytes),
+        _ => width.saturating_mul(height).saturating_mul(4),
+    };
+    let frame_estimate = raw_bytes.div_ceil(2);
+    let hrd_bytes = u128::from(param.mfx.BufferSizeInKB)
+        .saturating_mul(u128::from(param.mfx.BRCParamMultiplier.max(1)))
+        .saturating_mul(1024);
+    let requested = frame_estimate
+        .max(hrd_bytes)
+        .max(VPL_BITSTREAM_MIN_BYTES as u128)
+        .min(VPL_BITSTREAM_INITIAL_MAX_BYTES as u128);
+    let aligned = requested.div_ceil(64 * 1024) * (64 * 1024);
+    aligned.min(usize::MAX as u128) as usize
+}
+
+unsafe fn refresh_async_bitstream_storage(flight: &mut AsyncEncode) {
+    let usable = flight.storage.len().saturating_sub(31);
+    let aligned_offset = (32 - (flight.storage.as_ptr() as usize & 31)) & 31;
+    flight.bitstream.Data = flight.storage.as_mut_ptr().add(aligned_offset);
+    flight.bitstream.MaxLength = usable.min(u32::MAX as usize) as u32;
+    flight.bitstream.DataLength = 0;
+    flight.bitstream.DataOffset = 0;
+    flight.syncp = ptr::null_mut();
+}
+
 pub(super) unsafe fn submit_encode_async(
     api: &VplApi,
     session: MfxSession,
-    surface: *mut MfxFrameSurface1,
-    timestamp_90k: u64,
-    is_sync: bool,
-    mut storage: Vec<u8>,
-    discard: bool,
+    request: AsyncEncodeRequest,
+    bitstream_pool: &mut Vec<Vec<u8>>,
 ) -> Result<Option<Box<AsyncEncode>>, BackendError> {
-    storage.resize(VPL_BITSTREAM_BYTES + 31, 0);
-    let aligned_offset = (32 - (storage.as_ptr() as usize & 31)) & 31;
-    let aligned = storage.as_mut_ptr().add(aligned_offset);
+    let AsyncEncodeRequest {
+        surface,
+        timestamp_90k,
+        is_sync,
+        mut storage,
+        discard,
+    } = request;
+    if storage.len() < VPL_BITSTREAM_MIN_BYTES + 31 {
+        storage.resize(VPL_BITSTREAM_MIN_BYTES + 31, 0);
+    }
     let mut ctrl = if is_sync {
         Some(Box::new(MfxEncodeCtrl {
             FrameType: MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF | MFX_FRAMETYPE_IDR,
@@ -243,8 +302,6 @@ pub(super) unsafe fn submit_encode_async(
     let mut flight = Box::new(AsyncEncode {
         bitstream: MfxBitstream {
             CodecId: MFX_CODEC_HEVC,
-            Data: aligned,
-            MaxLength: VPL_BITSTREAM_BYTES as u32,
             TimeStamp: timestamp_90k,
             ..std::mem::zeroed()
         },
@@ -255,36 +312,53 @@ pub(super) unsafe fn submit_encode_async(
         is_sync,
         discard,
     });
+    refresh_async_bitstream_storage(&mut flight);
 
-    let mut status = (api.mfx_video_encode_frame_async)(
-        session,
-        ctrl_ptr,
-        surface,
-        &mut flight.bitstream,
-        &mut flight.syncp,
-    );
-    let mut busy_retries = 0u32;
-    while status == MFX_WRN_DEVICE_BUSY && busy_retries < 10 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        flight.syncp = ptr::null_mut();
-        flight.bitstream.DataLength = 0;
-        flight.bitstream.DataOffset = 0;
-        let ctrl_ptr = flight
-            ._ctrl
-            .as_deref_mut()
-            .map(|ctrl| ctrl as *mut MfxEncodeCtrl as *mut c_void)
-            .unwrap_or(ptr::null_mut());
-        status = (api.mfx_video_encode_frame_async)(
+    let status = loop {
+        let mut status = (api.mfx_video_encode_frame_async)(
             session,
             ctrl_ptr,
             surface,
             &mut flight.bitstream,
             &mut flight.syncp,
         );
-        busy_retries += 1;
-    }
+        let mut busy_retries = 0u32;
+        while status == MFX_WRN_DEVICE_BUSY && busy_retries < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            refresh_async_bitstream_storage(&mut flight);
+            let ctrl_ptr = flight
+                ._ctrl
+                .as_deref_mut()
+                .map(|ctrl| ctrl as *mut MfxEncodeCtrl as *mut c_void)
+                .unwrap_or(ptr::null_mut());
+            status = (api.mfx_video_encode_frame_async)(
+                session,
+                ctrl_ptr,
+                surface,
+                &mut flight.bitstream,
+                &mut flight.syncp,
+            );
+            busy_retries += 1;
+        }
+        if status != MFX_ERR_NOT_ENOUGH_BUFFER {
+            break status;
+        }
+        let current = flight.storage.len().saturating_sub(31);
+        let next = current
+            .saturating_mul(2)
+            .min(VPL_BITSTREAM_GROWTH_MAX_BYTES);
+        if next <= current {
+            return Err(BackendError::VplStatus {
+                func: "MFXVideoENCODE_EncodeFrameAsync(bitstream growth limit)",
+                status,
+            });
+        }
+        flight.storage.resize(next + 31, 0);
+        refresh_async_bitstream_storage(&mut flight);
+    };
 
     if matches!(status, MFX_ERR_MORE_DATA | MFX_ERR_MORE_SURFACE) {
+        bitstream_pool.push(flight.storage);
         return Ok(None);
     }
     if status < MFX_ERR_NONE {
@@ -294,6 +368,7 @@ pub(super) unsafe fn submit_encode_async(
         });
     }
     if flight.syncp.is_null() {
+        bitstream_pool.push(flight.storage);
         return Ok(None);
     }
     Ok(Some(flight))
@@ -305,7 +380,7 @@ pub(super) unsafe fn sync_one_async_encode(
     in_flight: &mut VecDeque<Box<AsyncEncode>>,
     bitstream_pool: &mut Vec<Vec<u8>>,
 ) -> Result<Option<crate::backend::mp4_mux::HevcAccessUnit>, BackendError> {
-    let Some(flight) = in_flight.pop_front() else {
+    let Some(flight) = in_flight.front() else {
         return Ok(None);
     };
     let sync_status = (api.mfx_video_core_sync_operation)(session, flight.syncp, 60_000);
@@ -315,6 +390,9 @@ pub(super) unsafe fn sync_one_async_encode(
             status: sync_status,
         });
     }
+    let flight = in_flight
+        .pop_front()
+        .expect("front existed before successful sync");
     finish_synced_async_encode(*flight, bitstream_pool)
 }
 
@@ -386,7 +464,9 @@ pub(super) unsafe fn finish_synced_async_encode(
         .Data
         .add(flight.bitstream.DataOffset as usize);
     let data = std::slice::from_raw_parts(start, len).to_vec();
-    let is_sync = flight.is_sync || mfx_frame_type_is_sync(flight.bitstream.FrameType);
+    let sync_candidate = flight.is_sync || mfx_frame_type_is_sync(flight.bitstream.FrameType);
+    let is_sync =
+        sync_candidate && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&data);
     bitstream_pool.push(flight.storage);
     Ok(Some(crate::backend::mp4_mux::HevcAccessUnit {
         timestamp_90k: flight.timestamp_90k,
@@ -401,47 +481,60 @@ pub(super) unsafe fn encode_surface_bytes(
     session: MfxSession,
     surface: *mut MfxFrameSurface1,
 ) -> Result<EncodedSurfaceBytes, BackendError> {
-    encode_surface_or_flush_bytes(api, session, surface)
+    let mut storage = vec![0u8; VPL_BITSTREAM_MIN_BYTES + 31];
+    encode_surface_or_flush_bytes(api, session, surface, &mut storage)
 }
 
 pub(super) unsafe fn encode_surface_or_flush_bytes(
     api: &VplApi,
     session: MfxSession,
     surface: *mut MfxFrameSurface1,
+    storage: &mut Vec<u8>,
 ) -> Result<EncodedSurfaceBytes, BackendError> {
-    const BITSTREAM_BYTES: usize = 128 * 1024 * 1024;
-
-    let mut storage = vec![0u8; BITSTREAM_BYTES + 31];
-    let aligned_offset = (32 - (storage.as_ptr() as usize & 31)) & 31;
-    let aligned = storage.as_mut_ptr().add(aligned_offset);
     let mut bitstream: MfxBitstream = std::mem::zeroed();
     bitstream.CodecId = MFX_CODEC_HEVC;
-    bitstream.Data = aligned;
-    bitstream.MaxLength = BITSTREAM_BYTES as u32;
+    refresh_bitstream_storage(storage, &mut bitstream);
 
     let mut syncp: MfxSyncPoint = ptr::null_mut();
-    let mut encode_status = (api.mfx_video_encode_frame_async)(
-        session,
-        ptr::null_mut(),
-        surface,
-        &mut bitstream,
-        &mut syncp,
-    );
-    let mut busy_retries = 0u32;
-    while encode_status == MFX_WRN_DEVICE_BUSY && busy_retries < 50 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        syncp = ptr::null_mut();
-        bitstream.DataLength = 0;
-        bitstream.DataOffset = 0;
-        encode_status = (api.mfx_video_encode_frame_async)(
+    let encode_status = loop {
+        let mut status = (api.mfx_video_encode_frame_async)(
             session,
             ptr::null_mut(),
             surface,
             &mut bitstream,
             &mut syncp,
         );
-        busy_retries += 1;
-    }
+        let mut busy_retries = 0u32;
+        while status == MFX_WRN_DEVICE_BUSY && busy_retries < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            syncp = ptr::null_mut();
+            refresh_bitstream_storage(storage, &mut bitstream);
+            status = (api.mfx_video_encode_frame_async)(
+                session,
+                ptr::null_mut(),
+                surface,
+                &mut bitstream,
+                &mut syncp,
+            );
+            busy_retries += 1;
+        }
+        if status != MFX_ERR_NOT_ENOUGH_BUFFER {
+            break status;
+        }
+        let current = storage.len().saturating_sub(31);
+        let next = current
+            .saturating_mul(2)
+            .min(VPL_BITSTREAM_GROWTH_MAX_BYTES);
+        if next <= current {
+            return Err(BackendError::VplStatus {
+                func: "MFXVideoENCODE_EncodeFrameAsync(flush growth limit)",
+                status,
+            });
+        }
+        storage.resize(next + 31, 0);
+        syncp = ptr::null_mut();
+        refresh_bitstream_storage(storage, &mut bitstream);
+    };
 
     if matches!(encode_status, MFX_ERR_MORE_DATA | MFX_ERR_MORE_SURFACE) {
         return Ok(EncodedSurfaceBytes {
@@ -487,6 +580,18 @@ pub(super) unsafe fn encode_surface_or_flush_bytes(
     })
 }
 
+unsafe fn refresh_bitstream_storage(storage: &mut Vec<u8>, bitstream: &mut MfxBitstream) {
+    if storage.len() < VPL_BITSTREAM_MIN_BYTES + 31 {
+        storage.resize(VPL_BITSTREAM_MIN_BYTES + 31, 0);
+    }
+    let usable = storage.len().saturating_sub(31);
+    let aligned_offset = (32 - (storage.as_ptr() as usize & 31)) & 31;
+    bitstream.Data = storage.as_mut_ptr().add(aligned_offset);
+    bitstream.MaxLength = usable.min(u32::MAX as usize) as u32;
+    bitstream.DataLength = 0;
+    bitstream.DataOffset = 0;
+}
+
 pub(super) unsafe fn flush_encoder(
     api: &VplApi,
     session: MfxSession,
@@ -494,44 +599,54 @@ pub(super) unsafe fn flush_encoder(
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     retain_output_samples: bool,
     stats: &mut RecordHevcStats,
+    bitstream_pool: &mut Vec<Vec<u8>>,
 ) -> Result<u32, BackendError> {
-    let mut skipped_non_monotonic = 0u32;
-    loop {
-        let encoded = encode_surface_or_flush_bytes(api, session, ptr::null_mut())?;
-        if encoded.encode_status == MFX_ERR_MORE_DATA {
-            break;
-        }
-        if !encoded.bytes.is_empty() {
-            let last_timestamp = samples.last().map(|sample| sample.timestamp_90k);
-            let last_timestamp = stats
-                .last_timestamp_90k
-                .or_else(|| last_track_timestamp_90k(samples))
-                .or(last_timestamp);
-            let timestamp_90k = encoded.timestamp_90k;
-            if let Some(last) = last_timestamp
-                && timestamp_90k <= last
-            {
-                skipped_non_monotonic = skipped_non_monotonic.saturating_add(1);
-                continue;
+    let mut storage = bitstream_pool
+        .pop()
+        .unwrap_or_else(|| vec![0u8; VPL_BITSTREAM_MIN_BYTES + 31]);
+    let result = (|| -> Result<u32, BackendError> {
+        let mut skipped_non_monotonic = 0u32;
+        loop {
+            let encoded =
+                encode_surface_or_flush_bytes(api, session, ptr::null_mut(), &mut storage)?;
+            if encoded.encode_status == MFX_ERR_MORE_DATA {
+                break;
             }
-            let is_sync = mfx_frame_type_is_sync(encoded.frame_type);
-            push_record_hevc_sample(
-                samples,
-                crate::backend::mp4_mux::HevcAccessUnit {
-                    timestamp_90k,
-                    data: encoded.bytes.into(),
-                    is_sync,
-                    discard_from_track: false,
-                },
-                encoded_sink,
-                retain_output_samples,
-                stats,
-            );
-        } else {
-            break;
+            if !encoded.bytes.is_empty() {
+                let last_timestamp = samples.last().map(|sample| sample.timestamp_90k);
+                let last_timestamp = stats
+                    .last_timestamp_90k
+                    .or_else(|| last_track_timestamp_90k(samples))
+                    .or(last_timestamp);
+                let timestamp_90k = encoded.timestamp_90k;
+                if let Some(last) = last_timestamp
+                    && timestamp_90k <= last
+                {
+                    skipped_non_monotonic = skipped_non_monotonic.saturating_add(1);
+                    continue;
+                }
+                let is_sync = mfx_frame_type_is_sync(encoded.frame_type)
+                    && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&encoded.bytes);
+                push_record_hevc_sample(
+                    samples,
+                    crate::backend::mp4_mux::HevcAccessUnit {
+                        timestamp_90k,
+                        data: encoded.bytes.into(),
+                        is_sync,
+                        discard_from_track: false,
+                    },
+                    encoded_sink,
+                    retain_output_samples,
+                    stats,
+                );
+            } else {
+                break;
+            }
         }
-    }
-    Ok(skipped_non_monotonic)
+        Ok(skipped_non_monotonic)
+    })();
+    bitstream_pool.push(storage);
+    result
 }
 
 pub(super) fn last_track_timestamp_90k(

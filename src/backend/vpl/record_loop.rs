@@ -27,13 +27,16 @@ impl<'a> VplRecordRuntime<'a> {
         self.encoder_open = true;
     }
 
-    unsafe fn shutdown(&mut self) -> (i32, i32) {
-        let encoder_status = if self.encoder_open && !self.session.is_null() {
+    unsafe fn close_encoder(&mut self) -> i32 {
+        if self.encoder_open && !self.session.is_null() {
             self.encoder_open = false;
             (self.api.mfx_video_encode_close)(self.session)
         } else {
             MFX_ERR_NONE
-        };
+        }
+    }
+
+    unsafe fn close_session_and_loader(&mut self) -> i32 {
         let session_status = if !self.session.is_null() {
             let session = std::mem::replace(&mut self.session, ptr::null_mut());
             (self.api.mfx_close)(session)
@@ -44,6 +47,12 @@ impl<'a> VplRecordRuntime<'a> {
             let loader = std::mem::replace(&mut self.loader, ptr::null_mut());
             (self.api.mfx_unload)(loader);
         }
+        session_status
+    }
+
+    unsafe fn shutdown(&mut self) -> (i32, i32) {
+        let encoder_status = self.close_encoder();
+        let session_status = self.close_session_and_loader();
         (encoder_status, session_status)
     }
 }
@@ -104,6 +113,44 @@ impl Drop for MfxSurfaceGuard {
 }
 
 #[cfg(windows)]
+struct VplEncodeCleanupGuard<'a> {
+    runtime: *mut VplRecordRuntime<'a>,
+    pending_surface: *mut Option<*mut MfxFrameSurface1>,
+}
+
+#[cfg(windows)]
+impl<'a> VplEncodeCleanupGuard<'a> {
+    fn new(
+        runtime: &mut VplRecordRuntime<'a>,
+        pending_surface: &mut Option<*mut MfxFrameSurface1>,
+    ) -> Self {
+        Self {
+            runtime,
+            pending_surface,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VplEncodeCleanupGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let runtime = &mut *self.runtime;
+            let _ = runtime.close_encoder();
+            if let Some(surface) = (&mut *self.pending_surface).take()
+                && !surface.is_null()
+            {
+                let interface = (*surface).FrameInterface;
+                if !interface.is_null() {
+                    let _ = ((*interface).Release)(surface);
+                }
+            }
+            let _ = runtime.close_session_and_loader();
+        }
+    }
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_d3d11_onecopy_mp4_impl(
     adapter_index: u32,
@@ -141,11 +188,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         ),
     );
     if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(BackendError::unsupported(
-            "录制后端初始化",
-            "用户停止请求",
-            "停止请求发生在 oneVPL/D3D11 初始化前，已中止当前片段",
-        ));
+        return Err(BackendError::cancelled("oneVPL/D3D11 初始化前"));
     }
 
     let phase_started = Instant::now();
@@ -190,24 +233,31 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             "{:08X}:{:08X}",
             desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
         );
-        let output0 = adapter1
-            .EnumOutputs(0)
+        let selected_output_index = route_plan.map(|plan| plan.output_index).unwrap_or(0);
+        let selected_output = adapter1.EnumOutputs(selected_output_index).map_err(|err| {
+            BackendError::WindowsApi {
+                func: "IDXGIAdapter1::EnumOutputs(record target)",
+                message: err.to_string(),
+            }
+        })?;
+        let output_desc = selected_output
+            .GetDesc()
             .map_err(|err| BackendError::WindowsApi {
-                func: "IDXGIAdapter1::EnumOutputs(0)",
+                func: "IDXGIOutput::GetDesc",
                 message: err.to_string(),
             })?;
-        let output_desc = output0.GetDesc().map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIOutput::GetDesc",
-            message: err.to_string(),
-        })?;
-        let capture_width = (output_desc.DesktopCoordinates.right
-            - output_desc.DesktopCoordinates.left)
-            .max(1) as u16;
-        let capture_height = (output_desc.DesktopCoordinates.bottom
-            - output_desc.DesktopCoordinates.top)
-            .max(1) as u16;
+        let (capture_width, capture_height, capture_dimensions_note) =
+            capture_dimensions_from_output(&output_desc);
         let aligned_width = align16(capture_width);
         let aligned_height = align16(capture_height);
+        notes.push(format!(
+            "oneVPL capture target: adapter={} output={} {}; aligned={}x{}",
+            adapter_index,
+            selected_output_index,
+            capture_dimensions_note,
+            aligned_width,
+            aligned_height
+        ));
         let (encoder_frame_rate_n, encoder_frame_rate_d, encoder_frame_rate_note) =
             encoder_frame_rate_hint_from_output(&output_desc);
         notes.push(format!(
@@ -222,8 +272,9 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             validate_current_display_route_plan(
                 plan,
                 adapter_index,
+                selected_output_index,
                 &output_desc,
-                &output0,
+                &selected_output,
                 requested_chroma,
             )?;
             let route = record_route_from_display_plan(plan)?;
@@ -245,7 +296,11 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 "record RoutePlan missing; falling back to startup-time display route probing"
                     .to_owned(),
             );
-            select_record_route_candidates_for_output(&output0, requested_chroma, &mut notes)?
+            select_record_route_candidates_for_output(
+                &selected_output,
+                requested_chroma,
+                &mut notes,
+            )?
         };
         sink_status(
             &mut encoded_sink,
@@ -277,15 +332,19 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         }
         let mut runtime = VplRecordRuntime::new(&api, loader);
         if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(BackendError::unsupported(
-                "录制后端初始化",
-                "用户停止请求",
-                "停止请求发生在 oneVPL loader 创建后，已中止当前片段",
-            ));
+            return Err(BackendError::cancelled("oneVPL loader 创建后"));
         }
         let session_started = Instant::now();
+        let implementation_index = route_plan
+            .map(|plan| plan.implementation_index)
+            .filter(|index| *index != u32::MAX)
+            .unwrap_or(0);
+        notes.push(format!(
+            "oneVPL implementation target from capability probe: {}",
+            implementation_index
+        ));
         let mut session: MfxSession = ptr::null_mut();
-        let create_status = (api.mfx_create_session)(loader, 0, &mut session);
+        let create_status = (api.mfx_create_session)(loader, implementation_index, &mut session);
         runtime.set_session(session);
         if create_status != MFX_ERR_NONE || session.is_null() {
             return Err(BackendError::VplStatus {
@@ -314,7 +373,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let record_gop_pic_size = std::env::var("RUST_REPLAY_VPL_GOP_PIC_SIZE")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(60)
+            .unwrap_or(u16::MAX)
             .clamp(1, u16::MAX);
         let record_gop_ref_dist = std::env::var("RUST_REPLAY_VPL_GOP_REF_DIST")
             .ok()
@@ -475,11 +534,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         param.mfx.LowPower = MFX_CODINGOPTION_ON;
         param.mfx.TargetUsage = 7;
         if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(BackendError::unsupported(
-                "录制后端初始化",
-                "用户停止请求",
-                "停止请求发生在 MFXVideoENCODE_Init 前，已中止当前片段",
-            ));
+            return Err(BackendError::cancelled("MFXVideoENCODE_Init 前"));
         }
         let init_started = Instant::now();
         let init_status = (api.mfx_video_encode_init)(session, &mut param);
@@ -678,10 +733,18 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let mut pending_surface = Some(first_surface_guard.into_raw());
         let mut in_flight: VecDeque<Box<AsyncEncode>> =
             VecDeque::with_capacity(record_async_depth as usize);
+        let bitstream_capacity_bytes = initial_bitstream_capacity_bytes(&param, record_route);
         let mut bitstream_pool: Vec<Vec<u8>> = Vec::with_capacity(record_async_depth as usize);
         for _ in 0..record_async_depth {
-            bitstream_pool.push(vec![0u8; VPL_BITSTREAM_BYTES + 31]);
+            bitstream_pool.push(vec![0u8; bitstream_capacity_bytes + 31]);
         }
+        let _encode_cleanup_guard = VplEncodeCleanupGuard::new(&mut runtime, &mut pending_surface);
+        notes.push(format!(
+            "oneVPL bitstream pool：initial_per_buffer={} bytes async_depth={} total={} bytes；仅在 MFX_ERR_NOT_ENOUGH_BUFFER 时按需倍增并复用",
+            bitstream_capacity_bytes,
+            record_async_depth,
+            bitstream_capacity_bytes.saturating_mul(record_async_depth as usize)
+        ));
         let async_depth = record_async_depth as usize;
         let mut perf = RecordPerf::default();
         let mut dirty_metadata_frames = 0u32;
@@ -692,6 +755,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let mut first_sample_timestamp_90k: Option<u64> = None;
         let mut first_video_timestamp_100ns: Option<i64> = None;
         let mut last_submitted_sample_timestamp_90k: Option<u64> = None;
+        let mut last_forced_idr_timestamp_90k: Option<u64> = None;
         let capture_duration = Duration::from_secs_f32(duration_seconds.max(0.1));
         let requested_duration_90k =
             (duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64;
@@ -703,8 +767,11 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let end_at = start + capture_duration;
         let qpc_frequency = query_performance_frequency().unwrap_or(0);
         let audio_started = Instant::now();
-        let mut audio_capture =
-            RecordAudioCapture::start(capture_duration + Duration::from_secs(5), &mut notes);
+        let mut audio_capture = RecordAudioCapture::start(
+            capture_duration + Duration::from_secs(5),
+            retain_output_samples,
+            &mut notes,
+        );
         sink_status(
             &mut encoded_sink,
             format!(
@@ -716,7 +783,12 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         );
 
         {
-            let capture_pool_size = 32usize;
+            let capture_pool_size = capture_pool_size_for_route(
+                target_desc.Width,
+                target_desc.Height,
+                record_route,
+                matches!(capture_source, RecordCaptureSource::Dda),
+            );
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
             let (free_tx, free_rx) = std::sync::mpsc::channel::<CaptureFrameSlot>();
@@ -729,6 +801,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                         create_d3d11_device_for_adapter(&adapter1)?;
                     spawn_dda_capture_thread(
                         adapter1.clone(),
+                        selected_output_index,
                         capture_device,
                         capture_context,
                         vpl_device.clone(),
@@ -748,6 +821,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 }
                 RecordCaptureSource::Wgc => spawn_wgc_capture_thread(
                     adapter1.clone(),
+                    selected_output_index,
                     vpl_device.clone(),
                     start,
                     end_at,
@@ -784,14 +858,34 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             });
 
             let mut capture_stats: Option<CaptureStats> = None;
-            let mut capture_error: Option<String> = None;
+            let mut capture_error: Option<CaptureFailure> = None;
             let mut active_source_desc: Option<D3D11_TEXTURE2D_DESC> = None;
             let mut pending_free_slots: Vec<CaptureFrameSlot> = Vec::new();
+            let mut next_route_validation = Instant::now() + Duration::from_secs(1);
 
             loop {
                 if record_stop.load(std::sync::atomic::Ordering::Relaxed) {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
+                }
+                if Instant::now() >= next_route_validation {
+                    if let Some(plan) = route_plan {
+                        let current_desc = selected_output.GetDesc().map_err(|err| {
+                            BackendError::reconfigure_required(format!(
+                                "读取当前输出状态失败：{err}"
+                            ))
+                        })?;
+                        validate_current_display_route_plan(
+                            plan,
+                            adapter_index,
+                            selected_output_index,
+                            &current_desc,
+                            &selected_output,
+                            requested_chroma,
+                        )
+                        .map_err(|err| BackendError::reconfigure_required(err.to_string()))?;
+                    }
+                    next_route_validation = Instant::now() + Duration::from_secs(1);
                 }
                 return_ready_snapshot_slots(&mut pending_free_slots, &immediate, &free_tx, false)?;
                 let msg = match frame_rx.recv_timeout(Duration::from_millis(2)) {
@@ -829,7 +923,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 last_submitted_sample_timestamp_90k,
                                 &mut encoded_sink,
                                 &mut notes,
-                            );
+                            )?;
                         }
                         perf.sync.add(sync_started.elapsed());
                         continue;
@@ -1087,20 +1181,24 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                         }
                                     }
                                 }
+                                let bitstream_storage = bitstream_pool.pop().ok_or_else(|| {
+                                    BackendError::unsupported(
+                                        "oneVPL record",
+                                        "bitstream pool",
+                                        "没有可用于 warmup encode 的 bitstream 缓冲",
+                                    )
+                                })?;
                                 let submitted = submit_encode_async(
                                     &api,
                                     session,
-                                    surface,
-                                    warmup_ts90,
-                                    warmup_encoded_frames == 1,
-                                    bitstream_pool.pop().ok_or_else(|| {
-                                        BackendError::unsupported(
-                                            "oneVPL record",
-                                            "bitstream pool",
-                                            "没有可用于 warmup encode 的 bitstream 缓冲",
-                                        )
-                                    })?,
-                                    true,
+                                    AsyncEncodeRequest {
+                                        surface,
+                                        timestamp_90k: warmup_ts90,
+                                        is_sync: warmup_encoded_frames == 1,
+                                        storage: bitstream_storage,
+                                        discard: true,
+                                    },
+                                    &mut bitstream_pool,
                                 )?;
                                 perf.submit.add(warmup_submit_started.elapsed());
                                 surface_guard
@@ -1168,6 +1266,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                             let first_ts = *first_sample_timestamp_90k.get_or_insert(timestamp_90k);
                             let sample_ts90 = timestamp_90k.saturating_sub(first_ts);
                             last_submitted_sample_timestamp_90k = Some(sample_ts90);
+                            let idr_reference = encoded_stats
+                                .last_sync_timestamp_90k
+                                .or(last_forced_idr_timestamp_90k);
+                            let force_idr =
+                                should_force_source_timed_idr(idr_reference, sample_ts90);
+                            if force_idr {
+                                last_forced_idr_timestamp_90k = Some(sample_ts90);
+                            }
                             (*surface).Data.TimeStamp = sample_ts90;
                             (*surface).Data.FrameOrder = captured_frames;
                             let submit_started = Instant::now();
@@ -1189,20 +1295,24 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     }
                                 }
                             }
+                            let bitstream_storage = bitstream_pool.pop().ok_or_else(|| {
+                                BackendError::unsupported(
+                                    "oneVPL record",
+                                    "bitstream pool",
+                                    "没有可用 bitstream 缓冲，且无可同步的 in-flight encode",
+                                )
+                            })?;
                             let submitted = submit_encode_async(
                                 &api,
                                 session,
-                                surface,
-                                sample_ts90,
-                                captured_frames == 0,
-                                bitstream_pool.pop().ok_or_else(|| {
-                                    BackendError::unsupported(
-                                        "oneVPL record",
-                                        "bitstream pool",
-                                        "没有可用 bitstream 缓冲，且无可同步的 in-flight encode",
-                                    )
-                                })?,
-                                false,
+                                AsyncEncodeRequest {
+                                    surface,
+                                    timestamp_90k: sample_ts90,
+                                    is_sync: force_idr,
+                                    storage: bitstream_storage,
+                                    discard: false,
+                                },
+                                &mut bitstream_pool,
                             )?;
                             perf.submit.add(submit_started.elapsed());
                             surface_guard.release("mfxFrameSurfaceInterface::Release")?;
@@ -1254,14 +1364,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     last_submitted_sample_timestamp_90k,
                                     &mut encoded_sink,
                                     &mut notes,
-                                );
+                                )?;
                             }
                             perf.frame.add(frame_started.elapsed());
                             Ok(())
                         })();
                         if let Err(err) = frame_result {
                             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            capture_thread.stop_and_join();
+                            let _ = capture_thread.stop_and_join();
                             return Err(err);
                         }
                     }
@@ -1278,13 +1388,20 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             return_ready_snapshot_slots(&mut pending_free_slots, &immediate, &free_tx, true)?;
-            capture_thread.stop_and_join();
-            if let Some(message) = capture_error {
-                return Err(BackendError::unsupported(
-                    "DDA capture thread",
-                    "Acquire/CopyResource",
-                    message,
-                ));
+            capture_thread.stop_and_join()?;
+            if let Some(failure) = capture_error {
+                match failure {
+                    CaptureFailure::Reconfigure(reason) => {
+                        return Err(BackendError::reconfigure_required(reason));
+                    }
+                    CaptureFailure::Fatal(message) => {
+                        return Err(BackendError::unsupported(
+                            format!("{} capture thread", capture_source.label()),
+                            "Acquire/CopyResource",
+                            message,
+                        ));
+                    }
+                }
             }
             if let Some(stats) = capture_stats {
                 dda_timeouts = stats.dda_timeouts.min(u64::from(u32::MAX)) as u32;
@@ -1345,11 +1462,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     record_started.elapsed().as_secs_f64() * 1000.0
                 ),
             );
-            return Err(BackendError::unsupported(
-                "停止即时回放",
-                "用户停止请求",
-                "已快速中止当前录制片段；停止路径不再等待正常段结束的 flush/AAC 完整重建",
-            ));
+            return Err(BackendError::cancelled("oneVPL 录制循环"));
         }
 
         if let Some(surface) = pending_surface.take() {
@@ -1380,6 +1493,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             &mut encoded_sink,
             retain_output_samples,
             &mut encoded_stats,
+            &mut bitstream_pool,
         )?;
         let duration_90k = encoded_timeline_duration_90k(
             &samples,
@@ -1411,35 +1525,51 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                 ),
             ));
         }
-        let audio_track = if let Some(capture) = audio_capture.as_mut() {
-            capture.finish_live_aac(&mut encoded_sink, &mut notes);
-            let sink_push_from_ticks = capture.live_pushed_until_ticks();
-            let audio_frames = capture.finish(&mut notes);
-            build_record_aac_track(
-                audio_frames,
-                first_video_timestamp_100ns,
-                duration_90k,
-                &mut notes,
-                &mut encoded_sink,
-                sink_push_from_ticks,
-            )?
-        } else {
-            None
-        };
-        let audio_access_units = audio_track
-            .as_ref()
-            .map(|track| track.samples.len().min(u32::MAX as usize) as u32)
-            .unwrap_or(0);
-        let audio_encoded_bytes = audio_track
-            .as_ref()
-            .map(|track| {
-                track
-                    .samples
-                    .iter()
-                    .map(|sample| sample.data.len() as u64)
-                    .sum()
-            })
-            .unwrap_or(0);
+        let (audio_track, audio_access_units, audio_encoded_bytes) =
+            if let Some(capture) = audio_capture.as_mut() {
+                if retain_output_samples {
+                    capture.finish_live_aac(&mut encoded_sink, &mut notes)?;
+                    let sink_push_from_ticks = capture.live_pushed_until_ticks();
+                    let audio_frames = capture.finish(&mut notes);
+                    let track = build_record_aac_track(
+                        audio_frames,
+                        first_video_timestamp_100ns,
+                        duration_90k,
+                        &mut notes,
+                        &mut encoded_sink,
+                        sink_push_from_ticks,
+                    )?;
+                    let access_units = track
+                        .as_ref()
+                        .map(|track| track.samples.len().min(u32::MAX as usize) as u32)
+                        .unwrap_or(0);
+                    let encoded_bytes = track
+                        .as_ref()
+                        .map(|track| {
+                            track
+                                .samples
+                                .iter()
+                                .map(|sample| sample.data.len() as u64)
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    (track, access_units, encoded_bytes)
+                } else {
+                    let track = capture.finish_streaming(
+                        first_video_timestamp_100ns,
+                        duration_90k,
+                        &mut encoded_sink,
+                        &mut notes,
+                    )?;
+                    (
+                        track,
+                        capture.live_access_units(),
+                        capture.live_encoded_bytes(),
+                    )
+                }
+            } else {
+                (None, 0, 0)
+            };
         let video_track = HevcMp4Track {
             width: capture_width,
             height: capture_height,
@@ -1509,6 +1639,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
 
         let report = VplOneCopyRecordReport {
             adapter_index,
+            output_index: selected_output_index,
             adapter_luid,
             output_path: output.display().to_string(),
             width: capture_width,

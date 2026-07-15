@@ -3,6 +3,7 @@ use super::*;
 #[cfg(windows)]
 struct WgcCaptureJob {
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     start: std::time::Instant,
     end_at: std::time::Instant,
@@ -24,28 +25,29 @@ std::thread_local! {
 }
 
 #[cfg(windows)]
-fn wgc_capture_service() -> &'static std::sync::mpsc::Sender<WgcCaptureJob> {
-    static SERVICE: std::sync::OnceLock<std::sync::mpsc::Sender<WgcCaptureJob>> =
-        std::sync::OnceLock::new();
-    SERVICE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<WgcCaptureJob>();
-        std::thread::Builder::new()
-            .name("rustreplay-wgc-mta".to_owned())
-            .spawn(move || unsafe {
-                use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-                use windows::Win32::System::WinRT::{
-                    RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
-                };
+fn spawn_wgc_capture_service() -> Result<std::sync::mpsc::Sender<WgcCaptureJob>, std::io::Error> {
+    let (tx, rx) = std::sync::mpsc::channel::<WgcCaptureJob>();
+    std::thread::Builder::new()
+        .name("rustreplay-wgc-mta".to_owned())
+        .spawn(move || {
+            use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+            use windows::Win32::System::WinRT::{
+                RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
+            };
 
-                let initialized = match RoInitialize(RO_INIT_MULTITHREADED) {
+            let initialized = unsafe {
+                match RoInitialize(RO_INIT_MULTITHREADED) {
                     Ok(()) => Ok(true),
                     Err(err) if err.code() == RPC_E_CHANGED_MODE => Ok(false),
                     Err(err) => Err(format!("RoInitialize(WGC service): {err}")),
-                };
-                while let Ok(job) = rx.recv() {
-                    let result = match &initialized {
-                        Ok(_) => run_wgc_capture_thread(
+                }
+            };
+            while let Ok(job) = rx.recv() {
+                let result = match &initialized {
+                    Ok(_) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                        run_wgc_capture_thread(
                             job.adapter1,
+                            job.output_index,
                             job.encoder_device,
                             job.start,
                             job.end_at,
@@ -57,24 +59,53 @@ fn wgc_capture_service() -> &'static std::sync::mpsc::Sender<WgcCaptureJob> {
                             job.stop,
                             job.frame_tx,
                             job.free_rx,
-                        ),
-                        Err(message) => Err(message.clone()),
-                    };
-                    let _ = job.result_tx.send(result);
-                }
-                if matches!(initialized, Ok(true)) {
-                    RoUninitialize();
-                }
-            })
-            .expect("failed to spawn persistent WGC MTA service thread");
-        tx
-    })
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("persistent WGC capture job panicked".to_owned())),
+                    Err(message) => Err(message.clone()),
+                };
+                let _ = job.result_tx.send(result);
+            }
+            if matches!(initialized, Ok(true)) {
+                unsafe { RoUninitialize() };
+            }
+        })?;
+    Ok(tx)
+}
+
+#[cfg(windows)]
+fn dispatch_wgc_capture_job(mut job: WgcCaptureJob) -> Result<(), String> {
+    static SERVICE: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::mpsc::Sender<WgcCaptureJob>>>,
+    > = std::sync::OnceLock::new();
+    let service = SERVICE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut service = service
+        .lock()
+        .map_err(|_| "persistent WGC service mutex poisoned".to_owned())?;
+    for _ in 0..2 {
+        if service.is_none() {
+            *service = Some(
+                spawn_wgc_capture_service()
+                    .map_err(|err| format!("spawn persistent WGC service: {err}"))?,
+            );
+        }
+        let sender = service.as_ref().expect("initialized above").clone();
+        match sender.send(job) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                job = err.0;
+                *service = None;
+            }
+        }
+    }
+    Err("persistent WGC capture service is unavailable after restart".to_owned())
 }
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_wgc_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     start: std::time::Instant,
     end_at: std::time::Instant,
@@ -87,10 +118,10 @@ pub(super) fn spawn_wgc_capture_thread(
     frame_tx: std::sync::mpsc::Sender<CaptureMsg>,
     free_rx: std::sync::mpsc::Receiver<CaptureFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
-    let service = wgc_capture_service().clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let job = WgcCaptureJob {
         adapter1,
+        output_index,
         encoder_device,
         start,
         end_at,
@@ -105,8 +136,8 @@ pub(super) fn spawn_wgc_capture_thread(
         result_tx,
     };
     std::thread::spawn(move || {
-        let result = if service.send(job).is_err() {
-            Err("persistent WGC capture service is unavailable".to_owned())
+        let result = if let Err(err) = dispatch_wgc_capture_job(job) {
+            Err(err)
         } else {
             result_rx
                 .recv()
@@ -117,7 +148,16 @@ pub(super) fn spawn_wgc_capture_thread(
                 let _ = frame_tx.send(CaptureMsg::Done(stats));
             }
             Err(message) => {
-                let _ = frame_tx.send(CaptureMsg::Error(message));
+                let failure = if message.contains("device was removed")
+                    || message.contains("DXGI_ERROR_DEVICE_REMOVED")
+                    || message.contains("DXGI_ERROR_DEVICE_RESET")
+                    || message.contains("RO_E_CLOSED")
+                {
+                    CaptureFailure::Reconfigure(message)
+                } else {
+                    CaptureFailure::Fatal(message)
+                };
+                let _ = frame_tx.send(CaptureMsg::Error(failure));
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -128,6 +168,7 @@ pub(super) fn spawn_wgc_capture_thread(
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn run_wgc_capture_thread(
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    output_index: u32,
     encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     start: std::time::Instant,
     end_at: std::time::Instant,
@@ -242,7 +283,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         let _ = mt.SetMultithreadProtected(true);
     }
     let output = adapter1
-        .EnumOutputs(0)
+        .EnumOutputs(output_index)
         .map_err(|err| win_err("IDXGIAdapter1::EnumOutputs(WGC record)", err))?;
     let output_desc = output
         .GetDesc()
@@ -254,10 +295,18 @@ pub(super) unsafe fn run_wgc_capture_thread(
     let wgc_coalesce_window_100ns = display_refresh_hz
         .map(wgc_coalesce_window_100ns_for_refresh)
         .unwrap_or(0);
+    let device_key = device.as_raw() as usize;
+    if let Err(err) = device.GetDeviceRemovedReason() {
+        WGC_WINRT_DEVICE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&device_key);
+        });
+        return Err(format!(
+            "WGC D3D11 device was removed before capture start: {err}"
+        ));
+    }
     let dxgi_device: IDXGIDevice = device
         .cast()
         .map_err(|err| win_err("ID3D11Device::cast<IDXGIDevice>(WGC record)", err))?;
-    let device_key = device.as_raw() as usize;
     let winrt_device = WGC_WINRT_DEVICE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(device) = cache.get(&device_key) {
@@ -268,6 +317,9 @@ pub(super) unsafe fn run_wgc_capture_thread(
         let device: IDirect3DDevice = inspectable
             .cast()
             .map_err(|err| win_err("IInspectable::cast<IDirect3DDevice>(WGC record)", err))?;
+        if cache.len() >= 8 {
+            cache.clear();
+        }
         cache.insert(device_key, device.clone());
         Ok::<_, String>(device)
     })?;

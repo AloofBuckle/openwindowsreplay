@@ -3,6 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VplOneCopyRecordReport {
     pub adapter_index: u32,
+    pub output_index: u32,
     pub adapter_luid: String,
     pub output_path: String,
     pub width: u16,
@@ -94,6 +95,28 @@ pub fn record_d3d11_onecopy_mp4_output_cancelable(
     requested_chroma: ChromaSampling,
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
+    record_d3d11_onecopy_mp4_output_with_route_cancelable(
+        adapter_index,
+        output,
+        duration_seconds,
+        rate_control,
+        requested_chroma,
+        external_stop,
+        None,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_d3d11_onecopy_mp4_output_with_route_cancelable(
+    adapter_index: u32,
+    output: &Path,
+    duration_seconds: f32,
+    rate_control: &RateControlConfig,
+    requested_chroma: ChromaSampling,
+    external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    route_plan: Option<&VplCurrentDisplayRouteInfo>,
+) -> Result<VplOneCopyRecordOutput, BackendError> {
     record_d3d11_onecopy_mp4_impl(
         adapter_index,
         output,
@@ -104,7 +127,7 @@ pub fn record_d3d11_onecopy_mp4_output_cancelable(
         external_stop,
         true,
         None,
-        None,
+        route_plan,
     )
 }
 
@@ -202,6 +225,28 @@ pub fn record_wgc_d3d11_onecopy_mp4_output_cancelable(
     requested_chroma: ChromaSampling,
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
+    record_wgc_d3d11_onecopy_mp4_output_with_route_cancelable(
+        adapter_index,
+        output,
+        duration_seconds,
+        rate_control,
+        requested_chroma,
+        external_stop,
+        None,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_wgc_d3d11_onecopy_mp4_output_with_route_cancelable(
+    adapter_index: u32,
+    output: &Path,
+    duration_seconds: f32,
+    rate_control: &RateControlConfig,
+    requested_chroma: ChromaSampling,
+    external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    route_plan: Option<&VplCurrentDisplayRouteInfo>,
+) -> Result<VplOneCopyRecordOutput, BackendError> {
     record_d3d11_onecopy_mp4_impl(
         adapter_index,
         output,
@@ -212,7 +257,7 @@ pub fn record_wgc_d3d11_onecopy_mp4_output_cancelable(
         external_stop,
         true,
         None,
-        None,
+        route_plan,
     )
 }
 
@@ -304,14 +349,22 @@ pub(super) struct RecordAudioCapture {
     pub(super) live_submitted_until_ticks: u64,
     pub(super) live_pushed_until_ticks: u64,
     pub(super) live_failed: bool,
+    pub(super) retain_full_pcm: bool,
+    pub(super) live_access_units: u32,
+    pub(super) live_encoded_bytes: u64,
     pub(super) audio_end_abs_100ns: Option<i64>,
 }
 
 #[cfg(windows)]
 impl RecordAudioCapture {
     pub(super) const LIVE_SAFETY_100NS: i64 = 1_000_000; // 100ms，避免麦克风/loopback 较晚 packet 改写已推送 AAC。
+    const PRE_VIDEO_PCM_100NS: i64 = 50_000_000; // 首个正式视频帧之前只需保留最近 5 秒音频。
 
-    pub(super) fn start(duration: std::time::Duration, notes: &mut Vec<String>) -> Option<Self> {
+    pub(super) fn start(
+        duration: std::time::Duration,
+        retain_full_pcm: bool,
+        notes: &mut Vec<String>,
+    ) -> Option<Self> {
         if std::env::var("RUST_REPLAY_AUDIO")
             .ok()
             .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
@@ -353,6 +406,9 @@ impl RecordAudioCapture {
             live_submitted_until_ticks: 0,
             live_pushed_until_ticks: 0,
             live_failed: false,
+            retain_full_pcm,
+            live_access_units: 0,
+            live_encoded_bytes: 0,
             audio_end_abs_100ns: None,
         })
     }
@@ -367,43 +423,45 @@ impl RecordAudioCapture {
             );
             self.frames.push(frame);
         }
+        if !self.retain_full_pcm && self.live_submitted_until_ticks == 0 {
+            let keep_from = self
+                .audio_end_abs_100ns
+                .unwrap_or(0)
+                .saturating_sub(Self::PRE_VIDEO_PCM_100NS);
+            self.frames
+                .retain(|frame| frame.end_time_100ns() >= keep_from);
+        }
     }
 
     pub(super) fn poll_live_aac(
         &mut self,
         first_video_timestamp_100ns: Option<i64>,
-        current_video_timestamp_90k: Option<u64>,
+        _current_video_timestamp_90k: Option<u64>,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
-        notes: &mut Vec<String>,
-    ) {
+        _notes: &mut Vec<String>,
+    ) -> Result<(), BackendError> {
         self.drain_incoming();
-        if encoded_sink.is_none() || self.live_failed {
-            return;
+        if encoded_sink.is_none() {
+            return Ok(());
         }
-        if let Err(err) = self.poll_live_aac_inner(
-            first_video_timestamp_100ns,
-            current_video_timestamp_90k,
-            encoded_sink,
-        ) {
-            self.live_failed = true;
-            notes.push(format!(
-                "实时 AAC ring 推送不可用：{err}；最终 MP4 音轨仍在段结束时由完整 WASAPI PCM 重新编码"
+        if self.live_failed {
+            return Err(BackendError::unsupported(
+                "实时 AAC",
+                "encoded replay sink",
+                "此前 AAC 编码已失败，已阻止继续积累未编码 PCM",
             ));
         }
+        let result = self.poll_live_aac_inner(first_video_timestamp_100ns, encoded_sink);
+        self.live_failed = result.is_err();
+        result
     }
 
     pub(super) fn poll_live_aac_inner(
         &mut self,
         first_video_timestamp_100ns: Option<i64>,
-        current_video_timestamp_90k: Option<u64>,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     ) -> Result<(), BackendError> {
-        use crate::backend::audio::{AAC_LC_FRAME_SAMPLES, mix_window_samples_to_stereo_48k};
-
         let Some(video_start_100ns) = first_video_timestamp_100ns else {
-            return Ok(());
-        };
-        let Some(video_timestamp_90k) = current_video_timestamp_90k else {
             return Ok(());
         };
         let Some(audio_end_abs_100ns) = self.audio_end_abs_100ns else {
@@ -413,57 +471,92 @@ impl RecordAudioCapture {
             .saturating_sub(video_start_100ns)
             .saturating_sub(Self::LIVE_SAFETY_100NS)
             .max(0);
-        let video_ready_100ns = video_90k_to_100ns(video_timestamp_90k).max(0);
-        let ready_100ns = audio_ready_100ns.min(video_ready_100ns);
-        let ready_ticks = audio_100ns_to_ticks(ready_100ns);
-        let encode_until_ticks =
-            (ready_ticks / AAC_LC_FRAME_SAMPLES as u64) * AAC_LC_FRAME_SAMPLES as u64;
+        let ready_ticks = audio_100ns_to_ticks(audio_ready_100ns);
+        let frame_ticks = crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64;
+        let encode_until_ticks = (ready_ticks / frame_ticks) * frame_ticks;
+        self.encode_live_until_ticks(video_start_100ns, encode_until_ticks, encoded_sink)?;
+        self.prune_live_pcm_frames(video_start_100ns);
+        Ok(())
+    }
+
+    fn encode_live_until_ticks(
+        &mut self,
+        video_start_100ns: i64,
+        encode_until_ticks: u64,
+        encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    ) -> Result<(), BackendError> {
+        use crate::backend::audio::{
+            AAC_LC_FRAME_SAMPLES, TARGET_SAMPLE_RATE, mix_window_samples_to_stereo_48k,
+        };
+
         if encode_until_ticks <= self.live_submitted_until_ticks {
             return Ok(());
         }
-
-        let from_ticks = self.live_submitted_until_ticks;
-        let window_ticks = encode_until_ticks.saturating_sub(from_ticks);
-        if window_ticks == 0 {
-            return Ok(());
-        }
-        let window_start_offset_100ns = audio_ticks_to_100ns(from_ticks);
-        let window_start_abs_100ns = video_start_100ns.saturating_add(window_start_offset_100ns);
-        let mut mixed = mix_window_samples_to_stereo_48k(
-            &self.frames,
-            window_start_abs_100ns,
-            window_ticks as usize,
-        )?;
-        mixed.start_time_100ns = window_start_offset_100ns;
-        let blocks = self.live_blocker.push(&mixed);
         if self.live_encoder.is_none() {
             self.live_encoder = Some(crate::backend::aac_mf::MfAacLcEncoder::new()?);
         }
-        let encoder = self.live_encoder.as_mut().expect("created above");
-        let mut submitted_until_ticks = self.live_submitted_until_ticks;
-        for block in &blocks {
-            if block.timestamp_ticks < submitted_until_ticks
-                || block.timestamp_ticks >= encode_until_ticks
-            {
-                continue;
-            }
-            for sample in encoder.encode_block(block)? {
-                if let Some(sink) = encoded_sink.as_deref_mut() {
-                    sink.aac_access_unit(&sample);
+        let chunk_ticks = u64::from(TARGET_SAMPLE_RATE);
+        while self.live_submitted_until_ticks < encode_until_ticks {
+            let from_ticks = self.live_submitted_until_ticks;
+            let until_ticks = from_ticks
+                .saturating_add(chunk_ticks)
+                .min(encode_until_ticks);
+            let window_ticks = until_ticks.saturating_sub(from_ticks);
+            let window_start_offset_100ns = audio_ticks_to_100ns(from_ticks);
+            let window_start_abs_100ns =
+                video_start_100ns.saturating_add(window_start_offset_100ns);
+            let mut mixed = mix_window_samples_to_stereo_48k(
+                &self.frames,
+                window_start_abs_100ns,
+                window_ticks as usize,
+            )?;
+            mixed.start_time_100ns = window_start_offset_100ns;
+            let blocks = self.live_blocker.push(&mixed);
+            let encoder = self.live_encoder.as_mut().expect("created above");
+            let mut submitted_until_ticks = from_ticks;
+            for block in &blocks {
+                if block.timestamp_ticks < submitted_until_ticks
+                    || block.timestamp_ticks >= until_ticks
+                {
+                    continue;
                 }
-                self.live_pushed_until_ticks = self.live_pushed_until_ticks.max(
-                    sample
-                        .timestamp_ticks
-                        .saturating_add(u64::from(sample.duration_ticks)),
-                );
+                let samples = encoder.encode_block(block)?;
+                for sample in samples {
+                    Self::push_live_aac_sample(
+                        &mut self.live_pushed_until_ticks,
+                        &mut self.live_access_units,
+                        &mut self.live_encoded_bytes,
+                        sample,
+                        encoded_sink,
+                    );
+                }
+                submitted_until_ticks = block
+                    .timestamp_ticks
+                    .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
             }
-            submitted_until_ticks = block
-                .timestamp_ticks
-                .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
+            self.live_submitted_until_ticks = submitted_until_ticks.max(until_ticks);
+            self.prune_live_pcm_frames(video_start_100ns);
         }
-        self.live_submitted_until_ticks = submitted_until_ticks;
-        self.prune_live_pcm_frames(video_start_100ns);
         Ok(())
+    }
+
+    fn push_live_aac_sample(
+        pushed_until_ticks: &mut u64,
+        access_units: &mut u32,
+        encoded_bytes: &mut u64,
+        sample: crate::backend::mp4_mux::AacAccessUnit,
+        encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    ) {
+        if let Some(sink) = encoded_sink.as_deref_mut() {
+            sink.aac_access_unit(&sample);
+        }
+        *pushed_until_ticks = (*pushed_until_ticks).max(
+            sample
+                .timestamp_ticks
+                .saturating_add(u64::from(sample.duration_ticks)),
+        );
+        *access_units = access_units.saturating_add(1);
+        *encoded_bytes = encoded_bytes.saturating_add(sample.data.len() as u64);
     }
 
     pub(super) fn prune_live_pcm_frames(&mut self, video_start_100ns: i64) {
@@ -480,80 +573,116 @@ impl RecordAudioCapture {
         &mut self,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
         notes: &mut Vec<String>,
-    ) {
+    ) -> Result<(), BackendError> {
         if let Some(encoder) = self.live_encoder.as_mut()
             && let Some(block) = self.live_blocker.flush_padded()
         {
-            match encoder.encode_block(&block) {
-                Ok(samples) => {
-                    for sample in samples {
-                        if let Some(sink) = encoded_sink.as_deref_mut() {
-                            sink.aac_access_unit(&sample);
-                        }
-                        self.live_pushed_until_ticks = self.live_pushed_until_ticks.max(
-                            sample
-                                .timestamp_ticks
-                                .saturating_add(u64::from(sample.duration_ticks)),
-                        );
-                    }
-                }
-                Err(err) => notes.push(format!("实时 AAC ring 尾块编码失败：{err}")),
+            let samples = encoder.encode_block(&block)?;
+            for sample in samples {
+                Self::push_live_aac_sample(
+                    &mut self.live_pushed_until_ticks,
+                    &mut self.live_access_units,
+                    &mut self.live_encoded_bytes,
+                    sample,
+                    encoded_sink,
+                );
             }
         }
         if let Some(encoder) = self.live_encoder.take() {
-            match encoder.finish() {
-                Ok(samples) => {
-                    let mut pushed = 0usize;
-                    for sample in samples {
-                        if let Some(sink) = encoded_sink.as_deref_mut() {
-                            sink.aac_access_unit(&sample);
-                        }
-                        self.live_pushed_until_ticks = self.live_pushed_until_ticks.max(
-                            sample
-                                .timestamp_ticks
-                                .saturating_add(u64::from(sample.duration_ticks)),
-                        );
-                        pushed += 1;
-                    }
-                    if pushed > 0 {
-                        notes.push(format!(
-                            "实时 AAC ring flush 推送 access_units={} pushed_until_ticks={}",
-                            pushed, self.live_pushed_until_ticks
-                        ));
-                    }
-                }
-                Err(err) => notes.push(format!("实时 AAC ring flush 失败：{err}")),
+            let samples = encoder.finish()?;
+            let pushed = samples.len();
+            for sample in samples {
+                Self::push_live_aac_sample(
+                    &mut self.live_pushed_until_ticks,
+                    &mut self.live_access_units,
+                    &mut self.live_encoded_bytes,
+                    sample,
+                    encoded_sink,
+                );
+            }
+            if pushed > 0 {
+                notes.push(format!(
+                    "实时 AAC ring flush 推送 access_units={} pushed_until_ticks={}",
+                    pushed, self.live_pushed_until_ticks
+                ));
             }
         }
+        Ok(())
     }
 
     pub(super) fn live_pushed_until_ticks(&self) -> u64 {
         self.live_pushed_until_ticks
     }
 
+    pub(super) fn live_access_units(&self) -> u32 {
+        self.live_access_units
+    }
+
+    pub(super) fn live_encoded_bytes(&self) -> u64 {
+        self.live_encoded_bytes
+    }
+
+    pub(super) fn finish_streaming(
+        &mut self,
+        first_video_timestamp_100ns: Option<i64>,
+        video_duration_90k: u64,
+        encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<crate::backend::mp4_mux::AacLcMp4Track>, BackendError> {
+        self.stop_and_join(notes, "流式结束");
+        let Some(video_start_100ns) = first_video_timestamp_100ns else {
+            self.frames.clear();
+            notes.push("流式 AAC 结束跳过：没有首个正式视频绝对时间戳".to_owned());
+            return Ok(None);
+        };
+        let target_ticks = video_90k_to_audio_ticks(video_duration_90k).max(1);
+        self.encode_live_until_ticks(video_start_100ns, target_ticks, encoded_sink)?;
+        self.finish_live_aac(encoded_sink, notes)?;
+        self.frames.clear();
+        if self.live_access_units == 0 {
+            notes.push("流式 AAC 结束跳过：编码器没有输出 access unit".to_owned());
+            return Ok(None);
+        }
+        let duration_ticks = self.live_pushed_until_ticks.max(target_ticks).max(1);
+        notes.push(format!(
+            "流式 AAC 完成：access_units={} encoded_bytes={} duration_ticks={}，未保留整段 PCM/AU 副本",
+            self.live_access_units, self.live_encoded_bytes, duration_ticks
+        ));
+        Ok(Some(crate::backend::mp4_mux::AacLcMp4Track {
+            sample_rate: crate::backend::audio::TARGET_SAMPLE_RATE,
+            channel_count: crate::backend::audio::TARGET_CHANNELS,
+            duration_ticks,
+            samples: Vec::new(),
+        }))
+    }
+
     pub(super) fn finish(
         &mut self,
         notes: &mut Vec<String>,
     ) -> Vec<crate::backend::audio::PcmFrame> {
+        self.stop_and_join(notes, "捕获结束");
+        std::mem::take(&mut self.frames)
+    }
+
+    fn stop_and_join(&mut self, notes: &mut Vec<String>, phase: &str) {
         self.drain_incoming();
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         while let Some(handle) = self.handles.pop() {
             match handle.join() {
                 Ok((source, Ok(stats))) => {
                     notes.push(format!(
-                        "WASAPI {:?} 捕获 packet={} pcm_frames={}",
-                        source, stats.packet_count, stats.pcm_frames
+                        "WASAPI {:?} {}：packet={} pcm_frames={}",
+                        source, phase, stats.packet_count, stats.pcm_frames
                     ));
                 }
                 Ok((source, Err(err))) => {
-                    notes.push(format!("WASAPI {:?} 捕获不可用：{err}", source));
+                    notes.push(format!("WASAPI {:?} {}不可用：{err}", source, phase));
                 }
-                Err(_) => notes.push("WASAPI 捕获线程 panic；该音源被跳过".to_owned()),
+                Err(_) => notes.push(format!("WASAPI {phase}线程 panic；该音源被跳过")),
             }
             self.drain_incoming();
         }
         self.drain_incoming();
-        std::mem::take(&mut self.frames)
     }
 
     pub(super) fn stop_without_reencode(&mut self, notes: &mut Vec<String>) {
@@ -784,6 +913,41 @@ pub(super) fn minimum_source_interval_90k_for_refresh(refresh_hz: u32) -> u64 {
     } else {
         (VIDEO_CLOCK_HZ / (u64::from(refresh_hz) * 2)).max(1)
     }
+}
+
+pub(super) fn should_force_source_timed_idr(
+    last_sync_or_request_90k: Option<u64>,
+    current_timestamp_90k: u64,
+) -> bool {
+    last_sync_or_request_90k
+        .is_none_or(|last| current_timestamp_90k.saturating_sub(last) >= REPLAY_IDR_INTERVAL_90K)
+}
+
+pub(super) fn capture_pool_size_for_route(
+    width: u32,
+    height: u32,
+    route: VplRecordRoute,
+    shared_cross_device: bool,
+) -> usize {
+    const MAX_SLOTS: usize = 32;
+    const MIN_SLOTS: usize = 8;
+    const SLOT_BUDGET_BYTES: u128 = 3 * 1024 * 1024 * 1024;
+
+    let pixels = u128::from(width.max(1)).saturating_mul(u128::from(height.max(1)));
+    let texture_bytes = match route.fourcc {
+        MFX_FOURCC_NV12 => pixels.saturating_mul(3) / 2,
+        MFX_FOURCC_P010 => pixels.saturating_mul(3),
+        MFX_FOURCC_YUY2 => pixels.saturating_mul(2),
+        MFX_FOURCC_Y210 => pixels.saturating_mul(4),
+        MFX_FOURCC_AYUV | MFX_FOURCC_Y410 | MFX_FOURCC_RGB4 => pixels.saturating_mul(4),
+        _ => pixels.saturating_mul(4),
+    };
+    let per_slot = texture_bytes.saturating_mul(if shared_cross_device { 2 } else { 1 });
+    if per_slot == 0 {
+        return MAX_SLOTS;
+    }
+    let budget_slots = (SLOT_BUDGET_BYTES / per_slot).min(usize::MAX as u128) as usize;
+    budget_slots.clamp(MIN_SLOTS, MAX_SLOTS)
 }
 
 pub(super) fn wgc_coalesce_window_100ns_for_refresh(refresh_hz: u32) -> i64 {

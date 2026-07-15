@@ -77,7 +77,7 @@ pub(in super::super) fn make_query_param(
     param.mfx.CodecProfile = profile;
     param.mfx.LowPower = MFX_CODINGOPTION_ON;
     param.mfx.TargetUsage = 7;
-    param.mfx.GopPicSize = 60;
+    param.mfx.GopPicSize = u16::MAX;
     param.mfx.GopRefDist = 1;
     param.mfx.IdrInterval = 1;
     apply_rate_control_config_to_param(&mut param, rate_control);

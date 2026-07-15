@@ -8,6 +8,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
 pub enum BackendError {
+    #[error("操作已取消: 阶段={stage}")]
+    Cancelled { stage: String },
+
+    #[error("录制环境需要重新探测: {reason}")]
+    ReconfigureRequired { reason: String },
+
     #[error("UnsupportedGpuPath: 阶段={stage} 请求={requested} 原因={reason}")]
     UnsupportedGpuPath {
         stage: String,
@@ -29,6 +35,26 @@ pub enum BackendError {
 }
 
 impl BackendError {
+    pub fn cancelled(stage: impl Into<String>) -> Self {
+        Self::Cancelled {
+            stage: stage.into(),
+        }
+    }
+
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+
+    pub const fn is_reconfigure_required(&self) -> bool {
+        matches!(self, Self::ReconfigureRequired { .. })
+    }
+
+    pub fn reconfigure_required(reason: impl Into<String>) -> Self {
+        Self::ReconfigureRequired {
+            reason: reason.into(),
+        }
+    }
+
     pub fn unsupported(
         stage: impl Into<String>,
         requested: impl Into<String>,

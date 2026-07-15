@@ -53,9 +53,11 @@ pub use record::{
     record_d3d11_onecopy_memory_output_cancelable,
     record_d3d11_onecopy_memory_output_with_sink_cancelable, record_d3d11_onecopy_mp4,
     record_d3d11_onecopy_mp4_cancelable, record_d3d11_onecopy_mp4_output_cancelable,
+    record_d3d11_onecopy_mp4_output_with_route_cancelable,
     record_wgc_d3d11_onecopy_memory_output_cancelable,
     record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable, record_wgc_d3d11_onecopy_mp4,
     record_wgc_d3d11_onecopy_mp4_cancelable, record_wgc_d3d11_onecopy_mp4_output_cancelable,
+    record_wgc_d3d11_onecopy_mp4_output_with_route_cancelable,
 };
 pub use record_nvenc::{
     record_nvenc_d3d11_onecopy_memory_output_with_sink_cancelable,

@@ -797,3 +797,23 @@ pub(super) struct MfxImplDescription {
     pub(super) NumExtParam: u32,
     pub(super) ExtParam: *const c_void,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MfxExtendedDeviceId {
+    pub(super) Version: MfxStructVersion,
+    pub(super) VendorID: u16,
+    pub(super) DeviceID: u16,
+    pub(super) PCIDomain: u32,
+    pub(super) PCIBus: u32,
+    pub(super) PCIDevice: u32,
+    pub(super) PCIFunction: u32,
+    pub(super) DeviceLUID: [u8; 8],
+    pub(super) LUIDDeviceNodeMask: u32,
+    pub(super) LUIDValid: u32,
+    pub(super) DRMRenderNodeNum: u32,
+    pub(super) DRMPrimaryNodeNum: u32,
+    pub(super) RevisionID: u16,
+    pub(super) reserved1: [u8; 18],
+    pub(super) DeviceName: [c_char; 128],
+}

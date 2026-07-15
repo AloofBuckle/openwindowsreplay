@@ -3,7 +3,7 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_recording_worker(
     request: pipeline::RecordingRequest,
-    caps: ProbeCaps,
+    mut caps: ProbeCaps,
     save_dir: PathBuf,
     cache_dir: Option<PathBuf>,
     replay_duration: Duration,
@@ -12,6 +12,7 @@ pub(super) fn run_recording_worker(
     tx: Sender<ReplayEvent>,
     encoded_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
     disk_store: Option<Arc<Mutex<DiskReplayStore>>>,
+    disk_live_ring: Option<Arc<Mutex<EncodedReplayRing>>>,
 ) {
     let start_path = cache_dir.clone().unwrap_or_else(|| save_dir.clone());
     let _ = tx.send(ReplayEvent::RecordingStarted {
@@ -21,8 +22,23 @@ pub(super) fn run_recording_worker(
     let mut disk_writer = disk_store
         .clone()
         .map(|store| DiskSegmentWriter::spawn(store, tx.clone(), stop_flag.clone()));
+    let requested_chroma = request.chroma_writer.chroma();
     let mut run_index = 0u64;
     while !stop_flag.load(Ordering::Relaxed) {
+        let Some(record_target) = caps.record_target_for_chroma(requested_chroma) else {
+            let _ = tx.send(ReplayEvent::Error(format!(
+                "能力探测没有为 active 编码后端选出 {} 的 adapter/output 录制目标",
+                requested_chroma.doc_label()
+            )));
+            return;
+        };
+        let _ = tx.send(ReplayEvent::BackendStatus {
+            index: run_index,
+            message: format!(
+                "录制目标来自能力探测：adapter={} output={}",
+                record_target.adapter_index, record_target.output_index
+            ),
+        });
         let output_dir = cache_dir.as_ref().unwrap_or(&save_dir);
         let output = output_dir.join(format!(
             "rustreplay_live_{}_{}.mp4",
@@ -54,12 +70,19 @@ pub(super) fn run_recording_worker(
                         ));
                         return;
                     };
+                    let Some(live_ring) = disk_live_ring.clone() else {
+                        let _ = tx.send(ReplayEvent::Error(
+                            "磁盘循环模式缺少开放分段 encoded ring".to_owned(),
+                        ));
+                        return;
+                    };
                     ReplayRecordSink::Disk(Box::new(DiskSegmentSink::new(
                         writer_tx,
                         tx.clone(),
                         run_index,
                         replay_duration,
                         stop_flag.clone(),
+                        live_ring,
                     )))
                 }
             };
@@ -68,7 +91,7 @@ pub(super) fn run_recording_worker(
                 &caps,
                 &output,
                 LIVE_RECORD_SECONDS,
-                0,
+                record_target.adapter_index,
                 Some(stop_flag.clone()),
                 Some(&mut sink),
             );
@@ -114,8 +137,26 @@ pub(super) fn run_recording_worker(
                 }
             }
             Err(err) => {
-                if stop_flag.load(Ordering::Relaxed) {
+                if err.is_cancelled() {
                     break;
+                }
+                if err.is_reconfigure_required() {
+                    let _ = tx.send(ReplayEvent::BackendStatus {
+                        index: run_index,
+                        message: format!("显示环境变化，重新执行能力探测后重启录制段：{err}"),
+                    });
+                    for _ in 0..20 {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    caps = crate::backend::probe_all();
+                    run_index = run_index.saturating_add(1);
+                    continue;
                 }
                 drop(sink);
                 if let Some(writer) = disk_writer.take() {

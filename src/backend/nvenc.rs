@@ -309,6 +309,7 @@ pub struct NvencRateControlFeatureProbe {
 pub struct NvencCurrentDisplayRouteInfo {
     pub adapter_index: u32,
     pub output_index: u32,
+    pub rotation: u32,
     pub color_space: u32,
     pub bits_per_color: u32,
     pub desktop_left: i32,
@@ -583,7 +584,7 @@ impl NvencD3d11Encoder {
                 verify_hevc_vui_matches(&bytes, self.expected_color)?;
                 self.vui_verified = true;
             }
-            let is_sync = force_idr || self.frame_idx == 0 || hevc_annex_b_has_sync_nal(&bytes);
+            let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&bytes);
             self.frame_idx = self.frame_idx.wrapping_add(1);
             Ok(HevcAccessUnit {
                 timestamp_90k,
@@ -650,7 +651,11 @@ impl NvencProbeInfo {
 fn probe_current_display_routes_for_adapter(
     adapter: &crate::backend::dxgi::DxgiAdapterInfo,
     route_candidates: &[NvencRouteProbe],
+    caps: &NvencCapsInfo,
 ) -> Result<Vec<NvencCurrentDisplayRouteInfo>, BackendError> {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
+    };
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1, IDXGIOutput6,
     };
@@ -669,99 +674,247 @@ fn probe_current_display_routes_for_adapter(
                     func: "IDXGIFactory1::EnumAdapters1(NVENC current display route)",
                     message: err.to_string(),
                 })?;
-        let output = match adapter1.EnumOutputs(0) {
-            Ok(output) => output,
-            Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(BackendError::WindowsApi {
-                    func: "IDXGIAdapter1::EnumOutputs(0 NVENC current display route)",
-                    message: err.to_string(),
-                });
-            }
-        };
-        let desc = output.GetDesc().map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIOutput::GetDesc(NVENC current display route)",
-            message: err.to_string(),
-        })?;
-        let output6 = output.cast::<IDXGIOutput6>().map_err(|_| {
-            BackendError::unsupported(
-                "NVENC 当前显示器 route",
-                "IDXGIOutput6::GetDesc1",
-                "不支持的桌面模式",
-            )
-        })?;
-        let desc1 = output6.GetDesc1().map_err(|err| BackendError::WindowsApi {
-            func: "IDXGIOutput6::GetDesc1(NVENC current display route)",
-            message: err.to_string(),
-        })?;
-        let display = nvenc_display_route_color(desc1.ColorSpace.0 as u32, desc1.BitsPerColor)?;
-        let rect = desc.DesktopCoordinates;
         let mut routes = Vec::new();
-        for chroma in ChromaSampling::all() {
-            let matched = nvenc_display_route_choices(chroma, display)
-                .into_iter()
-                .find_map(|(input_format, bit_depth, profile)| {
-                    route_candidates
-                        .iter()
-                        .find(|route| {
-                            route.input_format == input_format
-                                && route.chroma == chroma
-                                && route.bit_depth == bit_depth
-                                && route.profile == profile
-                        })
-                        .map(|route| (input_format, bit_depth, profile, route.note.clone()))
-                });
-            if let Some((input_format, bit_depth, profile, route_note)) = matched {
-                routes.push(NvencCurrentDisplayRouteInfo {
-                    adapter_index: adapter.index,
-                    output_index: 0,
-                    color_space: desc1.ColorSpace.0 as u32,
-                    bits_per_color: desc1.BitsPerColor,
-                    desktop_left: rect.left,
-                    desktop_top: rect.top,
-                    desktop_right: rect.right,
-                    desktop_bottom: rect.bottom,
-                    chroma,
-                    input_format: input_format.to_owned(),
-                    bit_depth,
-                    profile: profile.to_owned(),
-                    nclx_colour_primaries: display.mp4_color.colour_primaries,
-                    nclx_transfer_characteristics: display.mp4_color.transfer_characteristics,
-                    nclx_matrix_coefficients: display.mp4_color.matrix_coefficients,
-                    nclx_full_range: display.mp4_color.full_range,
-                    route_summary: format!(
-                        "NVENC current display: {} -> {} {}-bit {}",
-                        display.note, input_format, bit_depth, profile
-                    ),
-                    note: route_note,
-                });
-            } else {
-                routes.push(NvencCurrentDisplayRouteInfo {
-                    adapter_index: adapter.index,
-                    output_index: 0,
-                    color_space: desc1.ColorSpace.0 as u32,
-                    bits_per_color: desc1.BitsPerColor,
-                    desktop_left: rect.left,
-                    desktop_top: rect.top,
-                    desktop_right: rect.right,
-                    desktop_bottom: rect.bottom,
-                    chroma,
-                    input_format: String::new(),
-                    bit_depth: display.bit_depth,
-                    profile: String::new(),
-                    nclx_colour_primaries: display.mp4_color.colour_primaries,
-                    nclx_transfer_characteristics: display.mp4_color.transfer_characteristics,
-                    nclx_matrix_coefficients: display.mp4_color.matrix_coefficients,
-                    nclx_full_range: display.mp4_color.full_range,
-                    route_summary: String::new(),
-                    note: format!(
-                        "当前显示器状态 {} 下没有匹配 NVENC {} route 或 profile/input format",
-                        display.note,
-                        chroma.doc_label()
-                    ),
-                });
+        let mut output_index = 0u32;
+        loop {
+            let output = match adapter1.EnumOutputs(output_index) {
+                Ok(output) => output,
+                Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(err) => {
+                    return Err(BackendError::WindowsApi {
+                        func: "IDXGIAdapter1::EnumOutputs(NVENC current display route)",
+                        message: err.to_string(),
+                    });
+                }
+            };
+            let desc = output.GetDesc().map_err(|err| BackendError::WindowsApi {
+                func: "IDXGIOutput::GetDesc(NVENC current display route)",
+                message: err.to_string(),
+            })?;
+            if !desc.AttachedToDesktop.as_bool() {
+                output_index = output_index.saturating_add(1);
+                continue;
             }
+            let rect = desc.DesktopCoordinates;
+            let rotation = desc.Rotation.0 as u32;
+            if rotation != DXGI_MODE_ROTATION_UNSPECIFIED.0 as u32
+                && rotation != DXGI_MODE_ROTATION_IDENTITY.0 as u32
+            {
+                for chroma in ChromaSampling::all() {
+                    routes.push(NvencCurrentDisplayRouteInfo {
+                        adapter_index: adapter.index,
+                        output_index,
+                        rotation,
+                        color_space: 0,
+                        bits_per_color: 0,
+                        desktop_left: rect.left,
+                        desktop_top: rect.top,
+                        desktop_right: rect.right,
+                        desktop_bottom: rect.bottom,
+                        chroma,
+                        input_format: String::new(),
+                        bit_depth: 0,
+                        profile: String::new(),
+                        nclx_colour_primaries: 0,
+                        nclx_transfer_characteristics: 0,
+                        nclx_matrix_coefficients: 0,
+                        nclx_full_range: false,
+                        route_summary: String::new(),
+                        note: format!(
+                            "adapter={} output={} rotation={}：不支持的桌面模式",
+                            adapter.index, output_index, rotation
+                        ),
+                    });
+                }
+                output_index = output_index.saturating_add(1);
+                continue;
+            }
+            let width = (rect.right - rect.left).max(1) as u32;
+            let height = (rect.bottom - rect.top).max(1) as u32;
+            let resolution_supported = caps
+                .max_width
+                .is_none_or(|max| max > 0 && width <= max as u32)
+                && caps
+                    .max_height
+                    .is_none_or(|max| max > 0 && height <= max as u32);
+            if !resolution_supported {
+                for chroma in ChromaSampling::all() {
+                    routes.push(NvencCurrentDisplayRouteInfo {
+                        adapter_index: adapter.index,
+                        output_index,
+                        rotation,
+                        color_space: 0,
+                        bits_per_color: 0,
+                        desktop_left: rect.left,
+                        desktop_top: rect.top,
+                        desktop_right: rect.right,
+                        desktop_bottom: rect.bottom,
+                        chroma,
+                        input_format: String::new(),
+                        bit_depth: 0,
+                        profile: String::new(),
+                        nclx_colour_primaries: 0,
+                        nclx_transfer_characteristics: 0,
+                        nclx_matrix_coefficients: 0,
+                        nclx_full_range: false,
+                        route_summary: String::new(),
+                        note: format!(
+                            "当前输出 {}x{} 超过 NVENC caps max={}x{}",
+                            width,
+                            height,
+                            caps.max_width.unwrap_or(-1),
+                            caps.max_height.unwrap_or(-1)
+                        ),
+                    });
+                }
+                output_index = output_index.saturating_add(1);
+                continue;
+            }
+            let display = output
+                .cast::<IDXGIOutput6>()
+                .map_err(|_| {
+                    BackendError::unsupported(
+                        "NVENC 当前显示器 route",
+                        format!(
+                            "adapter={} output={} IDXGIOutput6::GetDesc1",
+                            adapter.index, output_index
+                        ),
+                        "不支持的桌面模式",
+                    )
+                })
+                .and_then(|output6| {
+                    let desc1 = output6.GetDesc1().map_err(|err| BackendError::WindowsApi {
+                        func: "IDXGIOutput6::GetDesc1(NVENC current display route)",
+                        message: err.to_string(),
+                    })?;
+                    let display =
+                        nvenc_display_route_color(desc1.ColorSpace.0 as u32, desc1.BitsPerColor)?;
+                    Ok((desc1, display))
+                });
+            match display {
+                Ok((desc1, display)) => {
+                    for chroma in ChromaSampling::all() {
+                        let chroma_alignment_supported = chroma != ChromaSampling::Yuv420
+                            || (width.is_multiple_of(2) && height.is_multiple_of(2));
+                        let matched = chroma_alignment_supported
+                            .then(|| {
+                                nvenc_display_route_choices(chroma, display)
+                                    .into_iter()
+                                    .find_map(|(input_format, bit_depth, profile)| {
+                                        route_candidates
+                                            .iter()
+                                            .find(|route| {
+                                                route.production_record_supported
+                                                    && route.input_format == input_format
+                                                    && route.chroma == chroma
+                                                    && route.bit_depth == bit_depth
+                                                    && route.profile == profile
+                                            })
+                                            .map(|route| {
+                                                (
+                                                    input_format,
+                                                    bit_depth,
+                                                    profile,
+                                                    route.note.clone(),
+                                                )
+                                            })
+                                    })
+                            })
+                            .flatten();
+                        let (input_format, bit_depth, profile, route_summary, note) = if let Some(
+                            (input_format, bit_depth, profile, route_note),
+                        ) = matched
+                        {
+                            (
+                                input_format.to_owned(),
+                                bit_depth,
+                                profile.to_owned(),
+                                format!(
+                                    "NVENC current display: {} -> {} {}-bit {}",
+                                    display.note, input_format, bit_depth, profile
+                                ),
+                                route_note,
+                            )
+                        } else {
+                            (
+                                String::new(),
+                                display.bit_depth,
+                                String::new(),
+                                String::new(),
+                                if chroma_alignment_supported {
+                                    format!(
+                                        "当前显示器状态 {} 下没有匹配 NVENC {} route 或 profile/input format",
+                                        display.note,
+                                        chroma.doc_label()
+                                    )
+                                } else {
+                                    format!(
+                                        "当前输出 {}x{} 不满足 NV12/P010 4:2:0 偶数尺寸要求",
+                                        width, height
+                                    )
+                                },
+                            )
+                        };
+                        routes.push(NvencCurrentDisplayRouteInfo {
+                            adapter_index: adapter.index,
+                            output_index,
+                            rotation,
+                            color_space: desc1.ColorSpace.0 as u32,
+                            bits_per_color: desc1.BitsPerColor,
+                            desktop_left: rect.left,
+                            desktop_top: rect.top,
+                            desktop_right: rect.right,
+                            desktop_bottom: rect.bottom,
+                            chroma,
+                            input_format,
+                            bit_depth,
+                            profile,
+                            nclx_colour_primaries: display.mp4_color.colour_primaries,
+                            nclx_transfer_characteristics: display
+                                .mp4_color
+                                .transfer_characteristics,
+                            nclx_matrix_coefficients: display.mp4_color.matrix_coefficients,
+                            nclx_full_range: display.mp4_color.full_range,
+                            route_summary,
+                            note,
+                        });
+                    }
+                }
+                Err(err) => {
+                    for chroma in ChromaSampling::all() {
+                        routes.push(NvencCurrentDisplayRouteInfo {
+                            adapter_index: adapter.index,
+                            output_index,
+                            rotation,
+                            color_space: 0,
+                            bits_per_color: 0,
+                            desktop_left: rect.left,
+                            desktop_top: rect.top,
+                            desktop_right: rect.right,
+                            desktop_bottom: rect.bottom,
+                            chroma,
+                            input_format: String::new(),
+                            bit_depth: 0,
+                            profile: String::new(),
+                            nclx_colour_primaries: 0,
+                            nclx_transfer_characteristics: 0,
+                            nclx_matrix_coefficients: 0,
+                            nclx_full_range: false,
+                            route_summary: String::new(),
+                            note: err.to_string(),
+                        });
+                    }
+                }
+            }
+            output_index = output_index.saturating_add(1);
         }
+        routes.sort_by_key(|route| {
+            let primary = route.desktop_left <= 0
+                && route.desktop_right > 0
+                && route.desktop_top <= 0
+                && route.desktop_bottom > 0;
+            (!primary, route.output_index, route.chroma)
+        });
         Ok(routes)
     }
 }
@@ -1136,7 +1289,7 @@ unsafe fn probe_adapter(
             .map(rate_controls_from_mask)
             .unwrap_or_default();
         routes = build_route_candidates(&input_formats, &profiles, &caps, &rate_controls);
-        match probe_current_display_routes_for_adapter(adapter, &routes) {
+        match probe_current_display_routes_for_adapter(adapter, &routes, &caps) {
             Ok(display_routes) => current_display_routes = display_routes,
             Err(err) => warnings.push(format!("当前显示器 NVENC route 探测失败：{err}")),
         }
@@ -1576,9 +1729,15 @@ unsafe fn open_d3d11_session_for_adapter(
             func: "NVENC D3D11 device cache",
             message: "device cache mutex poisoned".to_owned(),
         })?;
-        if let Some((device, context)) = cache.get(&adapter_key) {
-            (device.clone(), context.clone())
+        let cached = cache
+            .get(&adapter_key)
+            .map(|(device, context)| (device.clone(), context.clone()));
+        if let Some((device, context)) = cached
+            && device.GetDeviceRemovedReason().is_ok()
+        {
+            (device, context)
         } else {
+            cache.remove(&adapter_key);
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
             let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
@@ -1813,7 +1972,7 @@ unsafe fn make_low_latency_hevc_config_from_base(
     };
     config.write_u32(0, NV_ENC_CONFIG_VER);
     config.write_guid(NV_ENC_CONFIG_PROFILE_GUID_OFFSET, profile);
-    config.write_u32(NV_ENC_CONFIG_GOP_LENGTH_OFFSET, 60);
+    config.write_u32(NV_ENC_CONFIG_GOP_LENGTH_OFFSET, u32::MAX);
     // 1 = IPP... (no B frames), matching low-latency/VFR replay needs.
     config.write_i32(NV_ENC_CONFIG_FRAME_INTERVAL_P_OFFSET, 1);
     config.write_u32(
@@ -1828,7 +1987,7 @@ unsafe fn make_low_latency_hevc_config_from_base(
     hevc_flags &= !(0b11 << 9);
     hevc_flags |= chroma_format_idc << 9;
     config.write_u32(NV_ENC_CONFIG_HEVC_FLAGS_OFFSET, hevc_flags);
-    config.write_u32(NV_ENC_CONFIG_HEVC_IDR_PERIOD_OFFSET, 60);
+    config.write_u32(NV_ENC_CONFIG_HEVC_IDR_PERIOD_OFFSET, u32::MAX);
     config.write_u32(NV_ENC_CONFIG_HEVC_VUI_VIDEO_SIGNAL_PRESENT_OFFSET, 1);
     config.write_u32(
         NV_ENC_CONFIG_HEVC_VUI_VIDEO_FORMAT_OFFSET,
@@ -2128,6 +2287,7 @@ unsafe fn register_d3d11_input_texture(
         encoder,
         resource: params.registeredResource,
         unregister: api.functions.nvEncUnregisterResource,
+        _texture: texture.clone(),
     })
 }
 
@@ -2304,6 +2464,8 @@ struct NvencRegisteredResource {
     encoder: *mut c_void,
     resource: *mut c_void,
     unregister: Option<unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32>,
+    // NVENC requires the external D3D11 resource to outlive unregister.
+    _texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
 }
 
 #[cfg(windows)]
@@ -2760,29 +2922,6 @@ fn compiled_api_version_string() -> String {
 fn nvenc_driver_version_string(value: u32) -> String {
     // NvEncodeAPIGetMaxSupportedVersion returns (major << 4) | minor.
     format!("{}.{}", value >> 4, value & 0x0f)
-}
-
-fn hevc_annex_b_has_sync_nal(data: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 5 < data.len() {
-        let start_code_len = if data[i..].starts_with(&[0, 0, 1]) {
-            3
-        } else if data[i..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else {
-            i += 1;
-            continue;
-        };
-        let nal_start = i + start_code_len;
-        if nal_start < data.len() {
-            let nal_type = (data[nal_start] >> 1) & 0x3f;
-            if (16..=21).contains(&nal_type) {
-                return true;
-            }
-        }
-        i = nal_start.saturating_add(1);
-    }
-    false
 }
 
 fn verify_hevc_vui_matches(

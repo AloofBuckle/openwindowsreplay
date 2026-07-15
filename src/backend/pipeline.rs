@@ -179,10 +179,9 @@ pub fn record_once_gpu_only_output_cancelable(
     let requested_chroma = request.chroma_writer.chroma();
     match caps.video_encoder_selection.active {
         Some(super::VideoEncoderBackend::Nvenc) => {
-            let route_plan =
-                caps.nvenc.current_display_routes.iter().find(|route| {
-                    route.chroma == requested_chroma && !route.input_format.is_empty()
-                });
+            let route_plan = caps
+                .preferred_nvenc_route_for_chroma(requested_chroma)
+                .filter(|route| route.adapter_index == adapter_index);
             match request.capture_backend {
                 CaptureBackendKind::Dda => {
                     super::vpl::record_nvenc_d3d11_onecopy_mp4_output_cancelable(
@@ -208,24 +207,35 @@ pub fn record_once_gpu_only_output_cancelable(
                 }
             }
         }
-        Some(super::VideoEncoderBackend::OneVpl) => match request.capture_backend {
-            CaptureBackendKind::Dda => super::vpl::record_d3d11_onecopy_mp4_output_cancelable(
-                adapter_index,
-                output,
-                duration_seconds,
-                &request.rate_control,
-                requested_chroma,
-                external_stop,
-            ),
-            CaptureBackendKind::Wgc => super::vpl::record_wgc_d3d11_onecopy_mp4_output_cancelable(
-                adapter_index,
-                output,
-                duration_seconds,
-                &request.rate_control,
-                requested_chroma,
-                external_stop,
-            ),
-        },
+        Some(super::VideoEncoderBackend::OneVpl) => {
+            let route_plan = caps
+                .preferred_vpl_route_for_chroma(requested_chroma)
+                .filter(|route| route.adapter_index == adapter_index);
+            match request.capture_backend {
+                CaptureBackendKind::Dda => {
+                    super::vpl::record_d3d11_onecopy_mp4_output_with_route_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        route_plan,
+                    )
+                }
+                CaptureBackendKind::Wgc => {
+                    super::vpl::record_wgc_d3d11_onecopy_mp4_output_with_route_cancelable(
+                        adapter_index,
+                        output,
+                        duration_seconds,
+                        &request.rate_control,
+                        requested_chroma,
+                        external_stop,
+                        route_plan,
+                    )
+                }
+            }
+        }
         None => Err(BackendError::unsupported(
             "录制流水线",
             "视频编码器自动选择",
@@ -268,10 +278,9 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
     let requested_chroma = request.chroma_writer.chroma();
     match caps.video_encoder_selection.active {
         Some(super::VideoEncoderBackend::Nvenc) => {
-            let route_plan =
-                caps.nvenc.current_display_routes.iter().find(|route| {
-                    route.chroma == requested_chroma && !route.input_format.is_empty()
-                });
+            let route_plan = caps
+                .preferred_nvenc_route_for_chroma(requested_chroma)
+                .filter(|route| route.adapter_index == adapter_index);
             match request.capture_backend {
                 CaptureBackendKind::Dda => {
                     super::vpl::record_nvenc_d3d11_onecopy_memory_output_with_sink_cancelable(
@@ -301,10 +310,8 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
         }
         Some(super::VideoEncoderBackend::OneVpl) => {
             let route_plan = caps
-                .vpl
-                .current_display_routes
-                .iter()
-                .find(|route| route.chroma == requested_chroma && !route.fourcc.is_empty());
+                .preferred_vpl_route_for_chroma(requested_chroma)
+                .filter(|route| route.adapter_index == adapter_index);
             match request.capture_backend {
                 CaptureBackendKind::Dda => {
                     super::vpl::record_d3d11_onecopy_memory_output_with_sink_cancelable(

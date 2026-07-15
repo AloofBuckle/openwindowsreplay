@@ -268,7 +268,7 @@ pub(super) fn prepare_video_track(
         converted.push(PreparedSample {
             duration_90k,
             data: SamplePayload::Memory(data.into()),
-            is_sync: sample.is_sync || is_sync,
+            is_sync,
         });
     }
     if !converted.first().is_some_and(|sample| sample.is_sync) {
@@ -403,7 +403,7 @@ pub(super) fn hevc_annex_b_to_length_prefixed(
         found = true;
         let nal_type = (nal[0] >> 1) & 0x3f;
         match nal_type {
-            19..=21 => is_sync = true,
+            16..=21 => is_sync = true,
             32 => sets.vps.push(nal.to_vec()),
             33 => sets.sps.push(nal.to_vec()),
             34 => sets.pps.push(nal.to_vec()),
@@ -422,6 +422,24 @@ pub(super) fn hevc_annex_b_to_length_prefixed(
     }
 
     Ok((out, is_sync, sets))
+}
+
+pub(crate) fn hevc_annex_b_has_random_access_nal(data: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while let Some((start, code_len)) = find_start_code(data, pos) {
+        let nal_start = start + code_len;
+        let next = find_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(data.len());
+        pos = next;
+        if nal_start < next {
+            let nal_type = (data[nal_start] >> 1) & 0x3f;
+            if matches!(nal_type, 16..=21) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn hevc_annex_b_parameter_set_access_unit(data: &[u8]) -> Option<Vec<u8>> {

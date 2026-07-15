@@ -6,6 +6,7 @@ pub(in super::super) unsafe fn parse_impl(
     api: &VplApi,
     loader: MfxLoader,
     current_display_route_keys: &BTreeSet<String>,
+    probe_dimensions: VplProbeDimensions,
     warnings: &mut Vec<String>,
 ) -> VplImplementationInfo {
     let mut hevc_supported = false;
@@ -66,6 +67,7 @@ pub(in super::super) unsafe fn parse_impl(
             index,
             &input_fourcc,
             current_display_route_keys,
+            probe_dimensions,
             warnings,
         )
     } else {
@@ -115,6 +117,8 @@ pub(in super::super) unsafe fn parse_impl(
         vendor_id: desc.VendorID,
         vendor_impl_id: desc.VendorImplID,
         device_id: c_char_array_to_string(&desc.Dev.DeviceID),
+        adapter_luid_low: None,
+        adapter_luid_high: None,
         media_adapter_type: desc.Dev.MediaAdapterType,
         hevc_supported,
         hevc_profiles: hevc_profiles.into_iter().collect(),
@@ -125,11 +129,21 @@ pub(in super::super) unsafe fn parse_impl(
     }
 }
 
+fn apply_probe_dimensions(param: &mut MfxVideoParam, dimensions: VplProbeDimensions) {
+    param.mfx.FrameInfo.Width = dimensions.width;
+    param.mfx.FrameInfo.Height = dimensions.height;
+    param.mfx.FrameInfo.CropW = dimensions.crop_width;
+    param.mfx.FrameInfo.CropH = dimensions.crop_height;
+    param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
+    param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
+}
+
 pub(in super::super) unsafe fn query_rate_control_config_supported(
     api: &VplApi,
     session: MfxSession,
     route: VplRecordRoute,
     rate_control: &RateControlConfig,
+    probe_dimensions: VplProbeDimensions,
 ) -> bool {
     let mut input = make_query_param(
         rate_control,
@@ -138,6 +152,7 @@ pub(in super::super) unsafe fn query_rate_control_config_supported(
         route.bit_depth,
         route.profile,
     );
+    apply_probe_dimensions(&mut input, probe_dimensions);
     let mut ext_buffers = VplEncodeExtBuffers::for_route(route, rate_control);
     ext_buffers.attach(&mut input);
     let mut output = input;
@@ -160,6 +175,7 @@ pub(in super::super) unsafe fn smoke_rate_control_surface_available(
     implementation_index: u32,
     route: VplRecordRoute,
     rate_control: &RateControlConfig,
+    probe_dimensions: VplProbeDimensions,
 ) -> bool {
     let mut session: MfxSession = ptr::null_mut();
     let create_status = (api.mfx_create_session)(loader, implementation_index, &mut session);
@@ -173,12 +189,8 @@ pub(in super::super) unsafe fn smoke_rate_control_surface_available(
         route.bit_depth,
         route.profile,
     );
-    // 用生产目标的 4K 桌面尺寸 + WGC async_depth=2 参数做 Query/Init smoke，避免某个
-    // 码控字段在默认低分辨率 Query/Init 通过、实际桌面录制却拿不到 surface。
-    param.mfx.FrameInfo.Width = 3840;
-    param.mfx.FrameInfo.Height = 2160;
-    param.mfx.FrameInfo.CropW = 3840;
-    param.mfx.FrameInfo.CropH = 2160;
+    // Use the probed primary desktop dimensions rather than a fixed 4K mode.
+    apply_probe_dimensions(&mut param, probe_dimensions);
     param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
     param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
     param.mfx.GopRefDist = 1;
@@ -202,13 +214,10 @@ pub(in super::super) unsafe fn smoke_rate_control_surface_available(
     let mut param = queried;
     apply_record_route_to_param(&mut param, route);
     apply_rate_control_config_to_param(&mut param, rate_control);
-    param.mfx.FrameInfo.Width = 3840;
-    param.mfx.FrameInfo.Height = 2160;
-    param.mfx.FrameInfo.CropW = 3840;
-    param.mfx.FrameInfo.CropH = 2160;
+    apply_probe_dimensions(&mut param, probe_dimensions);
     param.mfx.FrameInfo.FrameRateExtN = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_N;
     param.mfx.FrameInfo.FrameRateExtD = VPL_ENCODER_FRAME_RATE_HINT_FALLBACK_D;
-    param.mfx.GopPicSize = 60;
+    param.mfx.GopPicSize = u16::MAX;
     param.mfx.GopRefDist = 1;
     param.mfx.IdrInterval = 1;
     param.mfx.LowPower = MFX_CODINGOPTION_ON;
@@ -310,15 +319,20 @@ pub(in super::super) unsafe fn smoke_rate_control_surface_available(
             if ok {
                 (*first_surface).Data.TimeStamp = 0;
                 (*first_surface).Data.FrameOrder = 1;
-                let mut bitstream_pool = vec![vec![0u8; VPL_BITSTREAM_BYTES + 31]];
+                let capacity = initial_bitstream_capacity_bytes(&param, route);
+                let mut bitstream_pool = Vec::with_capacity(1);
+                let bitstream_storage = vec![0u8; capacity + 31];
                 let submitted = submit_encode_async(
                     api,
                     session,
-                    first_surface,
-                    0,
-                    true,
-                    bitstream_pool.pop().unwrap_or_default(),
-                    true,
+                    AsyncEncodeRequest {
+                        surface: first_surface,
+                        timestamp_90k: 0,
+                        is_sync: true,
+                        storage: bitstream_storage,
+                        discard: true,
+                    },
+                    &mut bitstream_pool,
                 );
                 let release_status = ((*interface).Release)(first_surface);
                 if release_status != MFX_ERR_NONE {
@@ -406,6 +420,7 @@ pub(in super::super) unsafe fn query_rate_control_features_for_route(
     loader: MfxLoader,
     implementation_index: u32,
     route: VplRecordRoute,
+    probe_dimensions: VplProbeDimensions,
 ) -> Vec<VplRateControlFeatureProbe> {
     let mut supported = Vec::new();
     for method in RateControlMethod::all() {
@@ -415,13 +430,20 @@ pub(in super::super) unsafe fn query_rate_control_features_for_route(
         };
         // 外部 BRC 需要 mfxExtBRC 回调结构；能力探测阶段只验证 oneVPL 内建码控模式。
         rate_control.ext_brc = false;
-        if !query_rate_control_config_supported(api, session, route, &rate_control) {
+        if !query_rate_control_config_supported(
+            api,
+            session,
+            route,
+            &rate_control,
+            probe_dimensions,
+        ) {
             continue;
         }
 
         let mut mbbrc_cfg = rate_control.clone();
         mbbrc_cfg.mbbrc = true;
-        let mbbrc = query_rate_control_config_supported(api, session, route, &mbbrc_cfg);
+        let mbbrc =
+            query_rate_control_config_supported(api, session, route, &mbbrc_cfg, probe_dimensions);
 
         let win_brc = if matches!(
             method,
@@ -434,7 +456,7 @@ pub(in super::super) unsafe fn query_rate_control_features_for_route(
             let mut cfg = rate_control.clone();
             cfg.win_brc_max_avg_kbps = cfg.max_kbps.max(cfg.target_kbps).max(1);
             cfg.win_brc_size = 60;
-            query_rate_control_config_supported(api, session, route, &cfg)
+            query_rate_control_config_supported(api, session, route, &cfg, probe_dimensions)
         } else {
             false
         };
@@ -449,7 +471,7 @@ pub(in super::super) unsafe fn query_rate_control_features_for_route(
         ) {
             let mut cfg = rate_control.clone();
             cfg.max_frame_size = 1_048_576;
-            query_rate_control_config_supported(api, session, route, &cfg)
+            query_rate_control_config_supported(api, session, route, &cfg, probe_dimensions)
         } else {
             false
         };
@@ -466,13 +488,14 @@ pub(in super::super) unsafe fn query_rate_control_features_for_route(
             if std::env::var_os("RUST_REPLAY_EXPERIMENTAL_LOW_DELAY_BRC_PROBE").is_some() {
                 let mut cfg = rate_control.clone();
                 cfg.low_delay_brc = true;
-                query_rate_control_config_supported(api, session, route, &cfg)
+                query_rate_control_config_supported(api, session, route, &cfg, probe_dimensions)
                     && smoke_rate_control_surface_available(
                         api,
                         loader,
                         implementation_index,
                         route,
                         &cfg,
+                        probe_dimensions,
                     )
             } else {
                 false
@@ -502,6 +525,7 @@ pub(in super::super) unsafe fn query_encode_route_candidates(
     implementation_index: u32,
     input_fourcc: &BTreeSet<String>,
     current_display_route_keys: &BTreeSet<String>,
+    probe_dimensions: VplProbeDimensions,
     warnings: &mut Vec<String>,
 ) -> Vec<VplRouteProbe> {
     let mut session: MfxSession = ptr::null_mut();
@@ -527,6 +551,7 @@ pub(in super::super) unsafe fn query_encode_route_candidates(
             route.profile,
         );
         let mut ext_buffers = VplEncodeExtBuffers::for_route(route, &cfg);
+        apply_probe_dimensions(&mut input, probe_dimensions);
         ext_buffers.attach(&mut input);
         let mut output = input;
         let status = (api.mfx_video_encode_query)(session, &mut input, &mut output);
@@ -563,7 +588,14 @@ pub(in super::super) unsafe fn query_encode_route_candidates(
             ))
         };
         let rate_control_features = if production_record_supported {
-            query_rate_control_features_for_route(api, session, loader, implementation_index, route)
+            query_rate_control_features_for_route(
+                api,
+                session,
+                loader,
+                implementation_index,
+                route,
+                probe_dimensions,
+            )
         } else {
             Vec::new()
         };

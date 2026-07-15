@@ -98,6 +98,7 @@ fn hevc_annex_b_detects_sync_and_extracts_parameter_sets() {
 
     let (_, is_sync, _) = hevc_annex_b_to_length_prefixed(&au).unwrap();
     assert!(is_sync);
+    assert!(hevc_annex_b_has_random_access_nal(&au));
 
     let sets = hevc_annex_b_parameter_set_access_unit(&au).unwrap();
     assert!(sets.windows(2).any(|window| window == [0, 1]));
@@ -127,6 +128,38 @@ fn video_track_rejects_non_key_first_sample() {
 
     let err = writer::prepare_video_track(&track).unwrap_err();
     assert!(err.to_string().contains("不是 IDR/CRA 关键帧"));
+}
+
+#[test]
+fn video_track_does_not_trust_a_false_sync_flag() {
+    let mut non_key = Vec::new();
+    append_fake_nal(&mut non_key, 32, &[1, 2, 3]);
+    append_fake_nal(&mut non_key, 33, &[4, 5, 6]);
+    append_fake_nal(&mut non_key, 34, &[7, 8, 9]);
+    append_fake_nal(&mut non_key, 1, &[10, 11, 12]);
+    let track = HevcMp4Track {
+        width: 16,
+        height: 16,
+        duration_90k: 90_000,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+        samples: vec![HevcAccessUnit {
+            timestamp_90k: 0,
+            data: non_key.into(),
+            is_sync: true,
+            discard_from_track: false,
+        }],
+    };
+
+    let err = writer::prepare_video_track(&track).unwrap_err();
+    assert!(err.to_string().contains("不是 IDR/CRA 关键帧"));
+}
+
+#[test]
+fn hevc_bla_is_a_random_access_nal() {
+    let mut bla = Vec::new();
+    append_fake_nal(&mut bla, 16, &[1, 2, 3]);
+    assert!(hevc_annex_b_has_random_access_nal(&bla));
 }
 
 #[test]
