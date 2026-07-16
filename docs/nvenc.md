@@ -87,7 +87,7 @@ cargo test --locked --target x86_64-pc-windows-msvc
 
 - `src/backend/vpl.rs` 复用现有 DDA/WGC capture、GPU route converter、WASAPI/AAC、encoded ring 与 MP4 mux，只把编码段替换成 NVENC registered-resource。
 - WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
-- DDA 保持独立 capture device。捕获 shader 直接写 `D3D11_RESOURCE_MISC_SHARED` ordinary route texture，NVENC device 通过 legacy shared handle 打开同一 allocation；capture context `Signal`、encoder context `Wait` 同一个 D3D11 shared fence 后，打开的纹理直接作为 persistent registered input，不再执行兼容 `CopyResource`。
+- DDA 保持独立 capture device。捕获 shader 直接写 `D3D11_RESOURCE_MISC_SHARED` ordinary route texture，NVENC device 通过 legacy shared handle 打开同一 allocation；capture context `Signal`、encoder context `Wait` 同一个 D3D11 shared fence 后，执行一次 `CopyResource` 到池化 encoder-local texture，再将本地纹理作为 persistent registered input。copy pool 固定为 `LookaheadDepth + 1`，对应输入只在 NVENC 返回该帧 AU 后归还。
 - NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
 - current-display route 自身记录 adapter LUID；录制初始化同时验证 route LUID、当前 DXGI adapter LUID 与 NVENC encoder D3D11 device LUID，防止多 NVIDIA GPU 或枚举顺序变化造成跨设备误配。
 - oneVPL implementation 同样通过 dispatcher 的 `mfxExtendedDeviceId.DeviceLUID` 与 DXGI adapter 精确绑定；同厂商多 GPU 不再只按 vendor ID 猜测。
@@ -192,7 +192,7 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 2. 4:2:2 NV16/P210 与 planar 4:4:4 已通过 CUDA external-memory 生产化，但要求 NVIDIA 驱动同时支持对应 NVENC input format/profile/caps、CUDA D3D11 external memory 和 keyed-mutex external semaphore；任一环节失败都会明确返回不支持，不回退 CPU 或伪造布局。
 3. Lookahead 已实现多 bitstream 延迟输出，但会增加输入 surface 占用和编码压力；高分辨率路线会按 3 GiB capture-pool 预算限制最大可用深度，例如 8K P010/YUV444_10BIT 当前最大为 15。性能不足时应降低 Lookahead/色度或刷新率，后端不会合成 CFR 掩盖源端丢帧。
 4. WGC 使用 500 us polling 获取 `TryGetNextFrame`，同时保留 WGC `SystemRelativeTime` 的 VFR 时间戳。短测已稳定，仍应在目标硬件上做长时间 4K/高刷新性能验证。
-5. NVENC DDA 零拷贝要求 capture/encoder device 支持 `ID3D11Device5`、`ID3D11DeviceContext4`、ordinary shared video texture 和 shared fence。缺少这些接口或资源创建失败时明确返回不支持，不退回 CPU 路径。
+5. NVENC DDA 要求 capture/encoder device 支持 `ID3D11Device5`、`ID3D11DeviceContext4`、ordinary shared video texture、shared fence 和一次 encoder-local GPU copy。shared texture 直接注册在 4K/240 Hz + split Auto 下会产生跨 split 的未来帧混合，因此不再作为生产路线；缺少所需接口或资源创建失败时明确返回不支持，不退回 CPU 路径。
 6. 旋转输出当前明确不支持；多 GPU/非主输出已进入探测和 LUID 绑定，但仍需在更多真实拓扑上做生产验证。
 7. 4K capture slot 保持 32；8K 和跨设备分配已按显存预算收紧，后续仍可按刷新率和实测 backlog 自适应。
 8. 用户取消已有独立错误类型；完整 `RecordExit::{Stopped, Completed, Failed}` 状态枚举仍可作为后续 API 整理项。

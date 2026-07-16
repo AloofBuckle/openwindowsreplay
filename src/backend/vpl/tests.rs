@@ -230,9 +230,18 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(0)
         .min(31);
+    let nvenc_split_encode_mode = match std::env::var("RUST_REPLAY_NVENC_SMOKE_SPLIT")
+        .ok()
+        .as_deref()
+    {
+        Some("disabled") => crate::rate_control::NvencSplitEncodeMode::Disabled,
+        Some("three") => crate::rate_control::NvencSplitEncodeMode::ThreeForced,
+        _ => crate::rate_control::NvencSplitEncodeMode::Auto,
+    };
     let rate_control = RateControlConfig {
         method: RateControlMethod::Cbr,
         look_ahead_depth,
+        nvenc_split_encode_mode,
         ..RateControlConfig::default()
     };
     let mut sink = SmokeStatusSink::default();

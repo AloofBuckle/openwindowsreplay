@@ -119,7 +119,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     use crate::backend::mp4_mux::{HevcMp4Track, write_hevc_aac_mp4};
     use std::time::{Duration, Instant};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11DeviceContext4,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11DeviceContext4, ID3D11Texture2D,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
@@ -151,7 +151,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     }
 
     let mut notes = vec![
-        "NVENC production path: native D3D11 formats use WGC local inputs or DDA shared-fence inputs; planar 422/444 formats use same-device CUDA external-memory inputs with keyed mutex; no compatibility CopyResource and no CPU Map/staging/raw-frame fallback".to_owned(),
+        "NVENC production path: native D3D11 formats use WGC local inputs or DDA shared-fence capture plus one encoder-local safety copy; planar 422/444 formats use same-device CUDA external-memory inputs with keyed mutex; no CPU Map/staging/raw-frame fallback".to_owned(),
         format!(
             "NVENC rate-control request accepted and written to NV_ENC_RC_PARAMS: {}",
             rate_control.method.short_name()
@@ -281,7 +281,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let encoder_context4: Option<ID3D11DeviceContext4> =
             if capture_source == RecordCaptureSource::Dda && !nvenc_encoder.uses_cuda_interop() {
                 Some(immediate.cast().map_err(|err| BackendError::WindowsApi {
-                    func: "ID3D11DeviceContext::cast<ID3D11DeviceContext4>(NVENC DDA)",
+                    func: "ID3D11DeviceContext::cast<ID3D11DeviceContext4>(NVENC DDA safety copy)",
                     message: err.to_string(),
                 })?)
             } else {
@@ -363,18 +363,19 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         sink_status(
             &mut encoded_sink,
             format!(
-                "初始化阶段：NVENC 输入槽位格式就绪 input={} storage={}x{} encode={}x{} zero_copy_capture_slots=true，累计 {:.1}ms",
+                "初始化阶段：NVENC 输入槽位格式就绪 input={} storage={}x{} encode={}x{} zero_copy_capture_slots={}，累计 {:.1}ms",
                 nvenc_input_format.label(),
                 target_desc.Width,
                 target_desc.Height,
                 encode_width,
                 encode_height,
+                capture_source != RecordCaptureSource::Dda || nvenc_encoder.uses_cuda_interop(),
                 record_started.elapsed().as_secs_f64() * 1000.0
             ),
         );
         match (capture_source, nvenc_encoder.uses_cuda_interop()) {
             (RecordCaptureSource::Dda, false) => notes.push(
-                "NVENC DDA 零拷贝路线：独立 capture device 的 shader 直接写普通共享 YUV texture；encoder device 打开同一资源并通过 D3D11 shared fence 等待后直接注册编码"
+                "NVENC DDA 安全路线：独立 capture device 的 shader 写普通共享 YUV texture；encoder device 等待 shared fence 后复制一次到本地纹理，再交给 NVENC split engines"
                     .to_owned(),
             ),
             (RecordCaptureSource::Wgc, false) => notes.push(
@@ -391,8 +392,18 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             ),
         }
 
+        struct DdaCopyInput {
+            texture: ID3D11Texture2D,
+        }
+
+        struct PendingCaptureInput {
+            capture_slot: CaptureFrameSlot,
+            dda_copy_input: Option<DdaCopyInput>,
+        }
+
         let mut samples = Vec::new();
-        let mut pending_slots = std::collections::VecDeque::<CaptureFrameSlot>::new();
+        let mut pending_slots = std::collections::VecDeque::<PendingCaptureInput>::new();
+        let mut dda_copy_free = Vec::<DdaCopyInput>::new();
         let mut encoded_stats = RecordHevcStats::default();
         let retain_output_samples = write_output_mp4 || encoded_sink.is_none();
         let mut captured_frames = 0u32;
@@ -452,6 +463,28 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                         rate_control.look_ahead_depth, capture_pool_size, required_lookahead_slots
                     ),
                     "当前分辨率/跨设备路线的 GPU surface 内存预算不足以保留全部延迟输入",
+                ));
+            }
+            if capture_source == RecordCaptureSource::Dda && !nvenc_encoder.uses_cuda_interop() {
+                dda_copy_free.reserve(required_lookahead_slots);
+                for _ in 0..required_lookahead_slots {
+                    let mut texture = None;
+                    encoder_device
+                        .CreateTexture2D(&target_desc, None, Some(&mut texture))
+                        .map_err(|err| BackendError::WindowsApi {
+                            func: "ID3D11Device::CreateTexture2D(NVENC DDA safety copy)",
+                            message: err.to_string(),
+                        })?;
+                    dda_copy_free.push(DdaCopyInput {
+                        texture: texture.ok_or_else(|| BackendError::WindowsApi {
+                            func: "CreateTexture2D(NVENC DDA safety copy)",
+                            message: "返回空 encoder-local texture".to_owned(),
+                        })?,
+                    });
+                }
+                notes.push(format!(
+                    "NVENC DDA encoder-local safety-copy pool: textures={} (LookaheadDepth+1)",
+                    dda_copy_free.len()
                 ));
             }
             let capture_queue_size = capture_pool_size;
@@ -633,7 +666,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             full_convert_frames = full_convert_frames.saturating_add(1);
 
                             let fence_started = Instant::now();
-                            let direct_input = match &slot {
+                            let source_input = match &slot {
                                 CaptureFrameSlot::Shared(_) => {
                                     return Err(BackendError::unsupported(
                                         "NVENC direct DDA input",
@@ -648,12 +681,12 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                             BackendError::unsupported(
                                                 "NVENC shared-fence DDA input",
                                                 "ID3D11DeviceContext4",
-                                                "encoder context 不支持 shared-fence GPU wait",
+                                                "encoder 缺少 GPU wait context",
                                             )
                                         })?
                                         .Wait(&shared.encoder_fence, shared.fence_value)
                                         .map_err(|err| BackendError::WindowsApi {
-                                            func: "ID3D11DeviceContext4::Wait(NVENC DDA)",
+                                            func: "ID3D11DeviceContext4::Wait(NVENC DDA safety copy)",
                                             message: err.to_string(),
                                         })?;
                                     shared.encoder_texture.clone()
@@ -666,6 +699,34 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                 }
                             };
                             perf.source_fence.add(fence_started.elapsed());
+
+                            let mut dda_copy_input = None;
+                            let direct_input = if matches!(&slot, CaptureFrameSlot::FenceShared(_))
+                            {
+                                let copy_started = Instant::now();
+                                let copy_input = dda_copy_free.pop().ok_or_else(|| {
+                                    BackendError::unsupported(
+                                        "NVENC DDA safety copy",
+                                        format!(
+                                            "LookaheadDepth={} pending={}",
+                                            rate_control.look_ahead_depth,
+                                            pending_slots.len()
+                                        ),
+                                        "encoder-local input pool exhausted before NVENC returned an output",
+                                    )
+                                })?;
+                                copy_texture_resource(
+                                    &immediate,
+                                    &source_input,
+                                    &copy_input.texture,
+                                )?;
+                                let texture = copy_input.texture.clone();
+                                dda_copy_input = Some(copy_input);
+                                perf.copy.add(copy_started.elapsed());
+                                texture
+                            } else {
+                                source_input
+                            };
 
                             let (sample_ts90, force_idr, discard_from_track) = if warmup {
                                 let warmup_ts90 = u64::from(warmup_encoded_frames)
@@ -710,21 +771,29 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             let outputs = match encode_result {
                                 Ok(outputs) => outputs,
                                 Err(err) => {
+                                    if let Some(copy_input) = dda_copy_input.take() {
+                                        dda_copy_free.push(copy_input);
+                                    }
                                     let _ = free_tx.send(slot);
                                     return Err(err);
                                 }
                             };
-                            pending_slots.push_back(slot);
+                            pending_slots.push_back(PendingCaptureInput {
+                                capture_slot: slot,
+                                dda_copy_input,
+                            });
                             for sample in outputs {
-                                let completed_slot =
-                                    pending_slots.pop_front().ok_or_else(|| {
-                                        BackendError::unsupported(
-                                            "NVENC delayed output",
-                                            "capture slot queue",
-                                            "编码器返回 AU 时没有对应的 pending capture slot",
-                                        )
-                                    })?;
-                                let _ = free_tx.send(completed_slot);
+                                let completed = pending_slots.pop_front().ok_or_else(|| {
+                                    BackendError::unsupported(
+                                        "NVENC delayed output",
+                                        "capture slot queue",
+                                        "编码器返回 AU 时没有对应的 pending capture slot",
+                                    )
+                                })?;
+                                if let Some(copy_input) = completed.dda_copy_input {
+                                    dda_copy_free.push(copy_input);
+                                }
+                                let _ = free_tx.send(completed.capture_slot);
                                 push_record_hevc_sample(
                                     &mut samples,
                                     sample,
@@ -817,13 +886,16 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let flush_started = Instant::now();
         let flushed_outputs = nvenc_encoder.flush()?;
         for sample in flushed_outputs {
-            let _completed_slot = pending_slots.pop_front().ok_or_else(|| {
+            let completed = pending_slots.pop_front().ok_or_else(|| {
                 BackendError::unsupported(
                     "NVENC delayed output flush",
                     "capture slot queue",
                     "EOS flush 返回 AU 时没有对应的 pending capture slot",
                 )
             })?;
+            if let Some(copy_input) = completed.dda_copy_input {
+                dda_copy_free.push(copy_input);
+            }
             push_record_hevc_sample(
                 &mut samples,
                 sample,

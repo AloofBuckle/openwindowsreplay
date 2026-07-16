@@ -1,12 +1,12 @@
 # NVENC 合并与问题审计状态
 
-本文对应 `RustReplay-NVENC/docs/q.md` 的 16 项问题，并补充审计合并后新增的 NVENC DDA/WGC 代码。基线 NVENC 合并提交为 `88a8367`；本轮审计日期为 2026-07-15。
+本文对应 `RustReplay-NVENC/docs/q.md` 的 16 项问题，并补充审计合并后新增的 NVENC DDA/WGC 代码。基线 NVENC 合并提交为 `88a8367`；本轮审计日期为 2026-07-15，并于 2026-07-16 补充 DDA split 高刷新损坏复现与修复结果。
 
 ## 结论
 
 - NVENC 已同时具备 WGC 与 DDA 生产路线。
 - WGC：capture shader 直接写同设备普通 NVENC input texture，无额外 `CopyResource`。
-- DDA：独立 D3D11 capture device 的 shader 直接写 legacy ordinary shared route texture，NVENC device 打开同一 allocation，并通过 D3D11 shared fence 建立 GPU 依赖后直接注册编码；不再执行兼容 `CopyResource`，也不经过 CPU readback/staging。
+- DDA：独立 D3D11 capture device 的 shader 写 legacy ordinary shared route texture，NVENC device 通过 shared fence 建立 GPU 依赖后执行一次 `CopyResource` 到 encoder-local input，再交给 NVENC；不经过 CPU readback/staging。
 - oneVPL 与 NVENC 共用 encoded ring、磁盘循环、AAC、MP4 和保存控制器；本轮修复均同时覆盖两种编码后端。
 - 当前没有发现阻止主线构建、NVENC WGC 录制或 NVENC DDA 录制的剩余 P0/P1 缺陷。
 
@@ -147,7 +147,7 @@
 
 - NVENC route 记录并验证 adapter LUID，避免 DXGI 枚举顺序变化后把旧计划应用到另一张 NVIDIA GPU。
 - NVENC encoder D3D11 device 在运行时再次与当前桌面 adapter LUID 对比。
-- NVENC DDA 零拷贝固定使用 ordinary shared texture + shared fence：同设备直接 DDA 会严重串行化，P010 NTHANDLE render-target 纹理在当前驱动返回 `E_INVALIDARG`，两条失败路线均未保留在生产分支。
+- NVENC DDA 固定使用 ordinary shared texture + shared fence + encoder-local safety copy：同设备直接 DDA 会严重串行化，P010 NTHANDLE render-target 纹理在当前驱动返回 `E_INVALIDARG`，而 shared texture 直接注册在 4K/240 Hz + split Auto 下会稳定产生三分区跨帧混合；三条失败路线均未保留在生产分支。
 - DDA/WGC 源纹理宽高或格式变化会触发 `ReconfigureRequired`，不会在旧 encoder/session 内临时换格式。
 - NVENC `frameRateNum/Den` 只取当前显示器刷新率作为码控提示；MP4 继续使用 DDA `LastPresentTime` / WGC `SystemRelativeTime` 的 VFR 时间戳。
 - 驱动 API 兼容检查使用 `NvEncodeAPIGetMaxSupportedVersion` 的 `(major << 4) | minor` 编码，不与 NVENC FFI struct version 编码混用。
@@ -157,9 +157,10 @@
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`
-- `cargo test --locked --target x86_64-pc-windows-msvc`：103 passed，12 ignored，0 failed；ignored 项均为显式硬件 smoke。
-- 本机 RTX 5090，4K/170 Hz/HDR PQ/P010：NVENC WGC 与 NVENC DDA 真实桌面录制均通过。
-- NVENC DDA shared-fence 零拷贝 10 秒长测得到 2234 个源 VFR 视频包，`copy=0`、`encode_submit` 平均约 3.71ms；HEVC/AAC 完整解码，2234 个 packet DTS 严格递增。
+- `cargo test`：106 passed，17 ignored，0 failed；ignored 项均为显式硬件 smoke。
+- 本机 RTX 5090，4K/240 Hz/HDR PQ/P010：NVENC WGC 与修复后的 NVENC DDA 真实 GPU 动态源录制均通过。
+- DDA shared texture 直接注册 + split Auto 的 5 秒样本在 1192 帧中检出 425 帧明显分区混帧；split Disabled 画面干净但只能编码 738 帧并丢弃 455 个源帧。
+- 固定 safety-copy 路线的 10 秒样本编码 2391/2391 帧，`dropped_no_slot=0`，`frame_body` 平均约 3.96ms；2391 帧区域审计未发现 split 混帧。Lookahead 4 的 3 秒样本也完成 712/712 帧与正常 EOS flush。
 - 独立 shared-fence 格式 smoke 已验证 NV12/Main、P010/Main10、AYUV/RExt 三种生产输入均可被 NVENC 直接注册并编码。
 - 保留的 3 秒审计文件经 `ffprobe` 识别为 HEVC Main10 / yuv420p10le / BT.2020 / PQ / full-range + AAC LC。
 - WGC/DDA 视频与音频分别完整解码到 raw sink，0 decode error；视频 packet DTS 严格递增。
