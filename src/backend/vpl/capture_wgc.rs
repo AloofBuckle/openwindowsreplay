@@ -422,6 +422,9 @@ pub(super) unsafe fn run_wgc_capture_thread(
                 route,
                 initial_source_desc.Width,
                 initial_source_desc.Height,
+                // WGC P010 直接注册给 NVENC 时，compute/UAV 双平面写会在部分
+                // NVIDIA 驱动上产生跨帧色度损坏；平面 RTV 写保持零复制且稳定。
+                false,
                 source_srv_cache.clone(),
             )
             .map_err(|err| err.to_string())?,

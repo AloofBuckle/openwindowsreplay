@@ -86,7 +86,7 @@ cargo test --locked --target x86_64-pc-windows-msvc
 ## 已生产化的 NVENC 链路
 
 - `src/backend/vpl.rs` 复用现有 DDA/WGC capture、GPU route converter、WASAPI/AAC、encoded ring 与 MP4 mux，只把编码段替换成 NVENC registered-resource。
-- WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
+- WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。P010 固定使用 plane RTV 写入；compute/UAV 双平面直写在 NVIDIA persistent registered input 上实测会产生跨帧色度损坏，因此不进入生产路线。
 - DDA 保持独立 capture device。捕获 shader 直接写 `D3D11_RESOURCE_MISC_SHARED` ordinary route texture，NVENC device 通过 legacy shared handle 打开同一 allocation；capture context `Signal`、encoder context `Wait` 同一个 D3D11 shared fence 后，执行一次 `CopyResource` 到池化 encoder-local texture，再将本地纹理作为 persistent registered input。copy pool 固定为 `LookaheadDepth + 1`，对应输入只在 NVENC 返回该帧 AU 后归还。
 - NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
 - current-display route 自身记录 adapter LUID；录制初始化同时验证 route LUID、当前 DXGI adapter LUID 与 NVENC encoder D3D11 device LUID，防止多 NVIDIA GPU 或枚举顺序变化造成跨设备误配。
@@ -116,6 +116,8 @@ NVENC CUDA external-memory 与 Lookahead：
 
 NVENC 4K HDR PQ 真实录制（2026-07-16，3840x2160、240 Hz）：
 
+- WGC P010 plane RTV 零复制路线连续 10 秒产出 2401 帧，源间隔 `4.156-4.178 ms`，`dropped_no_slot=0`；Lookahead 4 的 5 秒回归产出 1201 帧并完整 drain。两份 MP4 均通过 ffmpeg 全流解码，暗区纵向色度异常抽样接近 0。
+- 曾尝试把 `Direct3D11CaptureFrame` 保留到 GPU event query 完成后再 `Close`；该路线反而产生大面积蓝/洋红平面和固定竖带，已撤销，不作为 WGC 同步方案。
 - DDA/WGC 的 P210 与 YUV444_10BIT 均成功输出 HEVC FRExt + AAC LC MP4。
 - `ffprobe` 分别识别为 `yuv422p10le` / `yuv444p10le`、BT.2020 non-constant / SMPTE ST 2084 / full-range。
 - DDA/WGC x P210/YUV444_10BIT x Lookahead 0/8 共 8 个输出均保持包级 PTS/DTS 严格递增，并通过 ffmpeg 全流解码。

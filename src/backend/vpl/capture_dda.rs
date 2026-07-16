@@ -325,6 +325,7 @@ pub(super) unsafe fn run_dda_capture_thread(
                                 route,
                                 source_desc.Width,
                                 source_desc.Height,
+                                true,
                                 source_srv_cache.clone(),
                             )
                             .map_err(|err| err.to_string())?;

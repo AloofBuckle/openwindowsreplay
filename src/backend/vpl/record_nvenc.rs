@@ -379,7 +379,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                     .to_owned(),
             ),
             (RecordCaptureSource::Wgc, false) => notes.push(
-                "NVENC WGC 路线：使用 NVENC D3D11 device 创建 WGC capture，每个本地 YUV 槽位自带 route converter；shader 直接写最终槽位，等待 GPU fence 后直接注册为 NVENC input，全程不再复制"
+                "NVENC WGC 路线：使用 NVENC D3D11 device 创建 WGC capture，每个本地 YUV 槽位自带 route converter；P010 使用平面 RTV、其他原生格式使用对应 GPU writer 直接写最终槽位，等待 GPU fence 后直接注册为 NVENC input，全程不再复制"
                     .to_owned(),
             ),
             (RecordCaptureSource::Dda, true) => notes.push(

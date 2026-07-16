@@ -327,9 +327,11 @@ pub(in super::super) unsafe fn create_local_route_slot(
     route: VplRecordRoute,
     input_width: u32,
     input_height: u32,
+    enable_p010_compute: bool,
     source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
 ) -> Result<LocalRouteSlot, BackendError> {
-    let texture = create_route_intermediate(device, source_desc, route, true)?;
+    let enable_compute = route.fourcc != MFX_FOURCC_P010 || enable_p010_compute;
+    let texture = create_route_intermediate(device, source_desc, route, enable_compute)?;
     let converter = GpuRecordConverter::new_with_source_cache(
         route,
         device,
@@ -337,7 +339,7 @@ pub(in super::super) unsafe fn create_local_route_slot(
         &texture,
         input_width,
         input_height,
-        true,
+        enable_compute,
         source_srv_cache,
     )?;
     let keyed_mutex = if route.is_nvenc_cuda_planar() {
