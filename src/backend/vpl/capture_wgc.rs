@@ -203,7 +203,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
 
     struct WgcCaptureState {
         stats: CaptureStats,
-        free_slots: VecDeque<WgcLocalSlot>,
+        free_slots: VecDeque<LocalRouteSlot>,
         source_desc: Option<D3D11_TEXTURE2D_DESC>,
         capture_index: u64,
         timestamp_origin_100ns: Option<i64>,
@@ -414,7 +414,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         std::sync::Arc::new(std::sync::Mutex::new(ShaderResourceViewCache::transient()));
     for id in 0..pool_size {
         initial_state.free_slots.push_back(
-            create_wgc_local_slot(
+            create_local_route_slot(
                 id,
                 &device,
                 &context,
@@ -586,7 +586,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
                 }
             }
             let captured = CapturedSnapshot {
-                slot: CaptureFrameSlot::WgcLocal(slot),
+                slot: CaptureFrameSlot::Local(slot),
                 source_desc: snapshot_desc,
                 move_rect_bytes: 0,
                 dirty_rects: Vec::new(),
@@ -625,7 +625,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
                 .observe_source_interval(capture_index, timestamp_90k.saturating_sub(previous));
         }
         let captured = CapturedSnapshot {
-            slot: CaptureFrameSlot::WgcLocal(slot),
+            slot: CaptureFrameSlot::Local(slot),
             source_desc: snapshot_desc,
             move_rect_bytes: 0,
             dirty_rects: Vec::new(),
@@ -645,7 +645,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         Ok(())
     };
     let return_slot = |slot: CaptureFrameSlot| -> Result<(), String> {
-        let CaptureFrameSlot::WgcLocal(slot) = slot else {
+        let CaptureFrameSlot::Local(slot) = slot else {
             return Ok(());
         };
         let mut state = callback_state
@@ -667,7 +667,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         if state
             .source_desc
             .as_ref()
-            .is_none_or(|desc| wgc_local_slot_matches(&slot, desc))
+            .is_none_or(|desc| local_route_slot_matches(&slot, desc))
         {
             state.free_slots.push_back(slot);
         }

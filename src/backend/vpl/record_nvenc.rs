@@ -119,10 +119,11 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     use crate::backend::mp4_mux::{HevcMp4Track, write_hevc_aac_mp4};
     use std::time::{Duration, Instant};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Texture2D,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11DeviceContext4,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    use windows::core::Interface;
 
     if requested_chroma == ChromaSampling::Yuv422 {
         return Err(BackendError::unsupported(
@@ -157,7 +158,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     }
 
     let mut notes = vec![
-        "NVENC production path: WGC converts directly into pooled registered inputs; DDA uses keyed shared snapshots plus one GPU compatibility copy because NVENC rejects keyed shared input; no CPU Map/staging/raw-frame fallback".to_owned(),
+        "NVENC production path: WGC uses same-device local registered inputs; DDA uses cross-device ordinary shared textures plus D3D11 shared fences; no compatibility CopyResource and no CPU Map/staging/raw-frame fallback".to_owned(),
         format!(
             "NVENC rate-control request accepted and written to NV_ENC_RC_PARAMS: {}",
             rate_control.method.short_name()
@@ -277,6 +278,15 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         )?;
         let encoder_device = nvenc_encoder.device().clone();
         let immediate = nvenc_encoder.context().clone();
+        let encoder_context4: Option<ID3D11DeviceContext4> =
+            if capture_source == RecordCaptureSource::Dda {
+                Some(immediate.cast().map_err(|err| BackendError::WindowsApi {
+                    func: "ID3D11DeviceContext::cast<ID3D11DeviceContext4>(NVENC DDA)",
+                    message: err.to_string(),
+                })?)
+            } else {
+                None
+            };
         let (encoder_luid_low, encoder_luid_high) = d3d11_device_adapter_luid(&encoder_device)?;
         if encoder_luid_low != desc.AdapterLuid.LowPart
             || encoder_luid_high != desc.AdapterLuid.HighPart
@@ -345,35 +355,19 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        let dda_target_texture = if capture_source == RecordCaptureSource::Dda {
-            let mut texture: Option<ID3D11Texture2D> = None;
-            encoder_device
-                .CreateTexture2D(&target_desc, None, Some(&mut texture))
-                .map_err(|err| BackendError::WindowsApi {
-                    func: "ID3D11Device::CreateTexture2D(NVENC DDA compatibility input)",
-                    message: err.to_string(),
-                })?;
-            Some(texture.ok_or_else(|| BackendError::WindowsApi {
-                func: "CreateTexture2D(NVENC DDA compatibility input)",
-                message: "返回空纹理".to_owned(),
-            })?)
-        } else {
-            None
-        };
         sink_status(
             &mut encoded_sink,
             format!(
-                "初始化阶段：NVENC 输入槽位格式就绪 input={} {}x{} dda_copy_target={}，累计 {:.1}ms",
+                "初始化阶段：NVENC 输入槽位格式就绪 input={} {}x{} zero_copy_capture_slots=true，累计 {:.1}ms",
                 nvenc_input_format.label(),
                 target_desc.Width,
                 target_desc.Height,
-                dda_target_texture.is_some(),
                 record_started.elapsed().as_secs_f64() * 1000.0
             ),
         );
         match capture_source {
             RecordCaptureSource::Dda => notes.push(
-                "NVENC DDA 兼容路线：独立 D3D11 capture device 获取并转换到 keyed shared YUV snapshot；NVIDIA 驱动不接受 keyed shared texture 直接编码，编码端保留一次 GPU CopyResource 到普通 NVENC input"
+                "NVENC DDA 零拷贝路线：独立 capture device 的 shader 直接写普通共享 YUV texture；encoder device 打开同一资源并通过 D3D11 shared fence 等待后直接注册编码"
                     .to_owned(),
             ),
             RecordCaptureSource::Wgc => notes.push(
@@ -446,8 +440,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                         selected_output_index,
                         capture_device,
                         capture_context,
-                        encoder_device.clone(),
-                        None,
+                        DdaOutputMode::SharedFenceToEncoder(encoder_device.clone()),
                         start,
                         end_at,
                         source_stop_90k,
@@ -488,7 +481,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                 ),
             );
             notes.push(format!(
-                "NVENC capture snapshot pool: textures={}, queue={}",
+                "NVENC capture input pool: textures={}, queue={}",
                 capture_pool_size, capture_queue_size
             ));
 
@@ -603,34 +596,32 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             full_convert_frames = full_convert_frames.saturating_add(1);
 
                             let fence_started = Instant::now();
-                            let mut keyed_mutex_guard = None;
                             let direct_input = match &slot {
-                                CaptureFrameSlot::Shared(shared) => {
-                                    keyed_mutex_guard = Some(KeyedMutexGuard::acquire(
-                                        &shared.encoder_mutex,
-                                        1,
-                                        0,
-                                        1_000,
-                                        "IDXGIKeyedMutex::AcquireSync(NVENC DDA snapshot)",
-                                    )?);
-                                    let target = dda_target_texture.as_ref().ok_or_else(|| {
-                                        BackendError::unsupported(
-                                            "NVENC DDA compatibility copy",
-                                            "missing ordinary input texture",
-                                            "DDA shared snapshot cannot be submitted directly to this NVENC driver",
-                                        )
-                                    })?;
-                                    let copy_started = Instant::now();
-                                    let copy_result = copy_texture_resource(
-                                        &immediate,
-                                        &shared.encoder_texture,
-                                        target,
-                                    );
-                                    perf.copy.add(copy_started.elapsed());
-                                    copy_result?;
-                                    target.clone()
+                                CaptureFrameSlot::Shared(_) => {
+                                    return Err(BackendError::unsupported(
+                                        "NVENC direct DDA input",
+                                        "keyed shared capture slot",
+                                        "NVENC DDA 直写路线不接受 shared snapshot 或兼容复制回退",
+                                    ));
                                 }
-                                CaptureFrameSlot::WgcLocal(local) => {
+                                CaptureFrameSlot::FenceShared(shared) => {
+                                    encoder_context4
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            BackendError::unsupported(
+                                                "NVENC shared-fence DDA input",
+                                                "ID3D11DeviceContext4",
+                                                "encoder context 不支持 shared-fence GPU wait",
+                                            )
+                                        })?
+                                        .Wait(&shared.encoder_fence, shared.fence_value)
+                                        .map_err(|err| BackendError::WindowsApi {
+                                            func: "ID3D11DeviceContext4::Wait(NVENC DDA)",
+                                            message: err.to_string(),
+                                        })?;
+                                    shared.encoder_texture.clone()
+                                }
+                                CaptureFrameSlot::Local(local) => {
                                     local.capture_fence.wait_ready(&immediate)?;
                                     local.texture.clone()
                                 }
@@ -678,15 +669,6 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             );
                             perf.submit.add(submit_started.elapsed());
 
-                            let release_result = match &slot {
-                                CaptureFrameSlot::Shared(_) => keyed_mutex_guard
-                                    .take()
-                                    .expect("shared snapshot owns keyed mutex guard")
-                                    .release("IDXGIKeyedMutex::ReleaseSync(NVENC DDA snapshot)"),
-                                CaptureFrameSlot::WgcLocal(_) => Ok(()),
-                            };
-                            release_result?;
-                            drop(keyed_mutex_guard);
                             let sample = encode_result?;
                             let _ = free_tx.send(slot);
 

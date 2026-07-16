@@ -58,7 +58,7 @@ pub(in super::super) struct CapturedSnapshot {
 }
 
 #[cfg(windows)]
-pub(in super::super) struct WgcLocalSlot {
+pub(in super::super) struct LocalRouteSlot {
     pub(in super::super) id: usize,
     pub(in super::super) texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     pub(in super::super) converter: GpuRecordConverter,
@@ -66,14 +66,41 @@ pub(in super::super) struct WgcLocalSlot {
 }
 
 #[cfg(windows)]
-unsafe impl Send for WgcLocalSlot {}
+unsafe impl Send for LocalRouteSlot {}
 #[cfg(windows)]
-unsafe impl Sync for WgcLocalSlot {}
+unsafe impl Sync for LocalRouteSlot {}
+
+#[cfg(windows)]
+pub(in super::super) struct SharedFenceSlot {
+    pub(in super::super) id: usize,
+    pub(in super::super) capture_texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    pub(in super::super) encoder_texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    pub(in super::super) converter: GpuRecordConverter,
+    pub(in super::super) capture_fence: windows::Win32::Graphics::Direct3D11::ID3D11Fence,
+    pub(in super::super) encoder_fence: windows::Win32::Graphics::Direct3D11::ID3D11Fence,
+    pub(in super::super) fence_value: u64,
+    pub(in super::super) fence_shared_handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for SharedFenceSlot {}
+#[cfg(windows)]
+unsafe impl Sync for SharedFenceSlot {}
+
+#[cfg(windows)]
+impl Drop for SharedFenceSlot {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.fence_shared_handle);
+        }
+    }
+}
 
 #[cfg(windows)]
 pub(in super::super) enum CaptureFrameSlot {
     Shared(SnapshotSlot),
-    WgcLocal(WgcLocalSlot),
+    FenceShared(SharedFenceSlot),
+    Local(LocalRouteSlot),
 }
 
 #[cfg(windows)]
@@ -259,8 +286,8 @@ pub(in super::super) fn snapshot_slot_matches(
 }
 
 #[cfg(windows)]
-pub(in super::super) fn wgc_local_slot_matches(
-    slot: &WgcLocalSlot,
+pub(in super::super) fn local_route_slot_matches(
+    slot: &LocalRouteSlot,
     desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
 ) -> bool {
     let mut slot_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
@@ -273,8 +300,22 @@ pub(in super::super) fn wgc_local_slot_matches(
 }
 
 #[cfg(windows)]
+pub(in super::super) fn shared_fence_slot_matches(
+    slot: &SharedFenceSlot,
+    desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+) -> bool {
+    let mut slot_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        slot.capture_texture.GetDesc(&mut slot_desc);
+    }
+    slot_desc.Width == desc.Width
+        && slot_desc.Height == desc.Height
+        && slot_desc.Format.0 == desc.Format.0
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-pub(in super::super) unsafe fn create_wgc_local_slot(
+pub(in super::super) unsafe fn create_local_route_slot(
     id: usize,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
@@ -283,7 +324,7 @@ pub(in super::super) unsafe fn create_wgc_local_slot(
     input_width: u32,
     input_height: u32,
     source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
-) -> Result<WgcLocalSlot, BackendError> {
+) -> Result<LocalRouteSlot, BackendError> {
     let texture = create_route_intermediate(device, source_desc, route, true)?;
     let converter = GpuRecordConverter::new_with_source_cache(
         route,
@@ -295,7 +336,7 @@ pub(in super::super) unsafe fn create_wgc_local_slot(
         true,
         source_srv_cache,
     )?;
-    Ok(WgcLocalSlot {
+    Ok(LocalRouteSlot {
         id,
         texture,
         converter,

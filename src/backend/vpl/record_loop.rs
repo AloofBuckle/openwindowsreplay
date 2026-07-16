@@ -819,8 +819,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                         selected_output_index,
                         capture_device,
                         capture_context,
-                        vpl_device.clone(),
-                        None,
+                        DdaOutputMode::SharedToEncoder(vpl_device.clone()),
                         start,
                         end_at,
                         source_stop_90k,
@@ -1105,7 +1104,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     )?);
                                     shared.encoder_texture.clone()
                                 }
-                                CaptureFrameSlot::WgcLocal(local) => local.texture.clone(),
+                                CaptureFrameSlot::FenceShared(_) => {
+                                    return Err(BackendError::unsupported(
+                                        "oneVPL capture slot",
+                                        "D3D11 shared-fence NVENC slot",
+                                        "oneVPL 路线不接受 NVENC 专用 shared-fence slot",
+                                    ));
+                                }
+                                CaptureFrameSlot::Local(local) => local.texture.clone(),
                             };
                             let conversion_result = (|| -> Result<(), BackendError> {
                                 if direct_route_snapshot {
@@ -1140,7 +1146,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                             })();
 
                             let return_wgc_slot_immediately =
-                                matches!(&slot, CaptureFrameSlot::WgcLocal(_));
+                                matches!(&slot, CaptureFrameSlot::Local(_));
                             let fence_started = Instant::now();
                             match &slot {
                                 CaptureFrameSlot::Shared(shared) => {
@@ -1152,7 +1158,8 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                             "IDXGIKeyedMutex::ReleaseSync(encoder snapshot)",
                                         )?;
                                 }
-                                CaptureFrameSlot::WgcLocal(_) => {}
+                                CaptureFrameSlot::FenceShared(_) => {}
+                                CaptureFrameSlot::Local(_) => {}
                             }
                             perf.source_fence.add(fence_started.elapsed());
                             drop(keyed_mutex_guard);

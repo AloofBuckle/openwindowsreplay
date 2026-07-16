@@ -72,7 +72,7 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 cargo test --locked --target x86_64-pc-windows-msvc
 ```
 
-通过：103 passed，11 ignored，0 failed（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、三种码控、非默认调参与真实录制 smoke）。
+通过：103 passed，12 ignored，0 failed（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、shared-fence 输入格式、三种码控、非默认调参与真实录制 smoke）。
 
 ## NVENC 码控暴露与测试范围
 
@@ -87,7 +87,7 @@ cargo test --locked --target x86_64-pc-windows-msvc
 
 - `src/backend/vpl.rs` 复用现有 DDA/WGC capture、GPU route converter、WASAPI/AAC、encoded ring 与 MP4 mux，只把编码段替换成 NVENC registered-resource。
 - WGC 使用持久 MTA 服务线程，并在 NVENC D3D11 device 上直接把 shader 输出写入池化 registered input texture；等待 GPU event query 后直接送入 NVENC，不再经过额外 `CopyResource`。
-- DDA 保持独立 capture device。捕获线程把 route 输出写入 keyed shared snapshot，编码线程再执行一次 GPU `CopyResource` 到普通 NVENC registered input；这是当前 NVIDIA 驱动拒绝 keyed shared texture 直接注册后的兼容路线。
+- DDA 保持独立 capture device。捕获 shader 直接写 `D3D11_RESOURCE_MISC_SHARED` ordinary route texture，NVENC device 通过 legacy shared handle 打开同一 allocation；capture context `Signal`、encoder context `Wait` 同一个 D3D11 shared fence 后，打开的纹理直接作为 persistent registered input，不再执行兼容 `CopyResource`。
 - NVENC D3D11 device/context 按 adapter LUID 缓存，WGC WinRT D3D device 在线程内缓存；重复开始 WGC 录制时不再反复重建整套设备对象。
 - current-display route 自身记录 adapter LUID；录制初始化同时验证 route LUID、当前 DXGI adapter LUID 与 NVENC encoder D3D11 device LUID，防止多 NVIDIA GPU 或枚举顺序变化造成跨设备误配。
 - oneVPL implementation 同样通过 dispatcher 的 `mfxExtendedDeviceId.DeviceLUID` 与 DXGI adapter 精确绑定；同厂商多 GPU 不再只按 vendor ID 猜测。
@@ -171,7 +171,7 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 2. 4:2:2 NV16/P210 与 planar 4:4:4 缺少本项目可证明的原生 D3D11 texture layout，保持 probe-only；未来若接入 CUDA interop 或 NVIDIA 给出可验证 D3D11 layout，再单独生产化。
 3. NVENC caps 报告 async=true，但当前编码器采用同步 registered-resource 提交；捕获 snapshot pool 与编码线程已解耦，本机 240 Hz 实录 `encode_submit` 平均约 2.2 ms。后续如引入 completion event + 多 bitstream buffer，需要保持现有 VFR 时间戳与停止语义。
 4. WGC 使用 500 us polling 获取 `TryGetNextFrame`，同时保留 WGC `SystemRelativeTime` 的 VFR 时间戳。短测已稳定，仍应在目标硬件上做长时间 4K/高刷新性能验证。
-5. DDA 的 keyed shared snapshot 不能直接注册为 NVENC input，当前保留一次同 GPU `CopyResource`。该路径不做 CPU readback，也不伪装成零拷贝。
+5. NVENC DDA 零拷贝要求 capture/encoder device 支持 `ID3D11Device5`、`ID3D11DeviceContext4`、ordinary shared video texture 和 shared fence。缺少这些接口或资源创建失败时明确返回不支持，不退回 CPU 路径。
 6. 旋转输出当前明确不支持；多 GPU/非主输出已进入探测和 LUID 绑定，但仍需在更多真实拓扑上做生产验证。
 7. 4K capture slot 保持 32；8K 和跨设备分配已按显存预算收紧，后续仍可按刷新率和实测 backlog 自适应。
 8. 用户取消已有独立错误类型；完整 `RecordExit::{Stopped, Completed, Failed}` 状态枚举仍可作为后续 API 整理项。

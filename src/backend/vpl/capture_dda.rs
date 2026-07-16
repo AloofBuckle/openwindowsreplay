@@ -8,6 +8,12 @@ pub(super) enum CaptureMsg {
 }
 
 #[cfg(windows)]
+pub(super) enum DdaOutputMode {
+    SharedToEncoder(windows::Win32::Graphics::Direct3D11::ID3D11Device),
+    SharedFenceToEncoder(windows::Win32::Graphics::Direct3D11::ID3D11Device),
+}
+
+#[cfg(windows)]
 const DDA_RECONFIGURE_PREFIX: &str = "DDA_RECONFIGURE_REQUIRED:";
 
 #[cfg(windows)]
@@ -17,8 +23,7 @@ pub(super) fn spawn_dda_capture_thread(
     output_index: u32,
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
-    d3d_multithread: Option<windows::Win32::Graphics::Direct3D11::ID3D11Multithread>,
+    output_mode: DdaOutputMode,
     start: std::time::Instant,
     end_at: std::time::Instant,
     source_stop_90k: u64,
@@ -38,8 +43,7 @@ pub(super) fn spawn_dda_capture_thread(
                 output_index,
                 device,
                 context,
-                encoder_device,
-                d3d_multithread,
+                output_mode,
                 start,
                 end_at,
                 source_stop_90k,
@@ -75,8 +79,7 @@ pub(super) unsafe fn run_dda_capture_thread(
     output_index: u32,
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    encoder_device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
-    d3d_multithread: Option<windows::Win32::Graphics::Direct3D11::ID3D11Multithread>,
+    output_mode: DdaOutputMode,
     start: std::time::Instant,
     end_at: std::time::Instant,
     source_stop_90k: u64,
@@ -91,7 +94,7 @@ pub(super) unsafe fn run_dda_capture_thread(
 ) -> Result<CaptureStats, String> {
     use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
-    use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
+    use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11DeviceContext4};
     use windows::Win32::Graphics::Dxgi::{
         DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
         DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -100,6 +103,14 @@ pub(super) unsafe fn run_dda_capture_thread(
     use windows::core::Interface;
 
     let _thread_priority = RecordThreadPriorityGuard::raise_capture_thread();
+    let capture_context4: Option<ID3D11DeviceContext4> =
+        if matches!(&output_mode, DdaOutputMode::SharedFenceToEncoder(_)) {
+            Some(context.cast().map_err(|err| {
+                format!("DDA shared-fence capture requires ID3D11DeviceContext4: {err}")
+            })?)
+        } else {
+            None
+        };
     let duplication = create_duplication_on_device(&adapter1, output_index, &device, route)
         .map_err(|err| err.to_string())?;
     let mut stats = CaptureStats::new();
@@ -118,10 +129,19 @@ pub(super) unsafe fn run_dda_capture_thread(
     while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < max_end_at {
         while let Ok(slot) = free_rx.try_recv() {
             let slot_matches = match &slot {
-                CaptureFrameSlot::Shared(shared) => snapshot_desc0
-                    .as_ref()
-                    .is_none_or(|desc| snapshot_slot_matches(shared, desc)),
-                CaptureFrameSlot::WgcLocal(_) => false,
+                CaptureFrameSlot::Shared(shared) => {
+                    matches!(&output_mode, DdaOutputMode::SharedToEncoder(_))
+                        && snapshot_desc0
+                            .as_ref()
+                            .is_none_or(|desc| snapshot_slot_matches(shared, desc))
+                }
+                CaptureFrameSlot::FenceShared(shared) => {
+                    matches!(&output_mode, DdaOutputMode::SharedFenceToEncoder(_))
+                        && snapshot_desc0
+                            .as_ref()
+                            .is_none_or(|desc| shared_fence_slot_matches(shared, desc))
+                }
+                CaptureFrameSlot::Local(_) => false,
             };
             if slot_matches {
                 free_slots.push_back(slot);
@@ -225,45 +245,72 @@ pub(super) unsafe fn run_dda_capture_thread(
                     CPUAccessFlags: 0,
                     MiscFlags: 0,
                 };
-                route_intermediate = Some(
-                    create_route_intermediate(&device, &snapshot_desc, route, true)
-                        .map_err(|err| err.to_string())?,
-                );
-                let intermediate = route_intermediate
-                    .as_ref()
-                    .ok_or_else(|| "DDA route intermediate missing after create".to_owned())?;
-                route_converter = Some(
-                    GpuRecordConverter::new(
-                        route,
-                        &device,
-                        &context,
-                        intermediate,
-                        source_desc.Width,
-                        source_desc.Height,
-                        true,
-                    )
-                    .map_err(|err| err.to_string())?,
-                );
                 snapshot_desc0 = Some(snapshot_desc);
                 free_slots.clear();
-                for id in 0..pool_size {
-                    let slot =
-                        create_shared_snapshot_slot(id, &device, &encoder_device, &snapshot_desc)
+                match &output_mode {
+                    DdaOutputMode::SharedToEncoder(encoder_device) => {
+                        route_intermediate = Some(
+                            create_route_intermediate(&device, &snapshot_desc, route, true)
+                                .map_err(|err| err.to_string())?,
+                        );
+                        let intermediate = route_intermediate.as_ref().ok_or_else(|| {
+                            "DDA route intermediate missing after create".to_owned()
+                        })?;
+                        route_converter = Some(
+                            GpuRecordConverter::new(
+                                route,
+                                &device,
+                                &context,
+                                intermediate,
+                                source_desc.Width,
+                                source_desc.Height,
+                                true,
+                            )
+                            .map_err(|err| err.to_string())?,
+                        );
+                        for id in 0..pool_size {
+                            let slot = create_shared_snapshot_slot(
+                                id,
+                                &device,
+                                encoder_device,
+                                &snapshot_desc,
+                            )
                             .map_err(|err| err.to_string())?;
-                    free_slots.push_back(CaptureFrameSlot::Shared(slot));
+                            free_slots.push_back(CaptureFrameSlot::Shared(slot));
+                        }
+                    }
+                    DdaOutputMode::SharedFenceToEncoder(encoder_device) => {
+                        let source_srv_cache = std::sync::Arc::new(std::sync::Mutex::new(
+                            ShaderResourceViewCache::retained(),
+                        ));
+                        for id in 0..pool_size {
+                            let slot = create_shared_fence_route_slot(
+                                id,
+                                &device,
+                                &context,
+                                encoder_device,
+                                &snapshot_desc,
+                                route,
+                                source_desc.Width,
+                                source_desc.Height,
+                                source_srv_cache.clone(),
+                            )
+                            .map_err(|err| err.to_string())?;
+                            free_slots.push_back(CaptureFrameSlot::FenceShared(slot));
+                        }
+                    }
                 }
             }
             let snapshot_desc =
                 snapshot_desc0.ok_or_else(|| "DDA route snapshot desc missing".to_owned())?;
 
-            let Some(slot) = free_slots.pop_front() else {
+            let Some(mut slot) = free_slots.pop_front() else {
                 stats.dropped_no_slot += 1;
                 return Ok(());
             };
 
             {
-                let _guard = D3d11MultithreadGuard::enter(&d3d_multithread);
-                match &slot {
+                match &mut slot {
                     CaptureFrameSlot::Shared(shared) => {
                         let mutex_guard = KeyedMutexGuard::acquire(
                             &shared.capture_mutex,
@@ -296,8 +343,29 @@ pub(super) unsafe fn run_dda_capture_thread(
                             .map_err(|err| err.to_string())?;
                         convert_result.map_err(|err| err.to_string())?;
                     }
-                    CaptureFrameSlot::WgcLocal(_) => {
-                        return Err("DDA received unexpected WGC-local slot".to_owned());
+                    CaptureFrameSlot::FenceShared(shared) => {
+                        shared.converter.convert(&source).map_err(|err| {
+                            format!(
+                                "DDA shared-fence route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
+                                source_desc.Format.0,
+                                snapshot_desc.Format.0,
+                                snapshot_desc.Width,
+                                snapshot_desc.Height
+                            )
+                        })?;
+                        shared.fence_value = shared.fence_value.saturating_add(1);
+                        capture_context4
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "DDA shared-fence capture context is unavailable".to_owned()
+                            })?
+                            .Signal(&shared.capture_fence, shared.fence_value)
+                            .map_err(|err| {
+                                format!("ID3D11DeviceContext4::Signal(DDA capture): {err}")
+                            })?;
+                    }
+                    CaptureFrameSlot::Local(_) => {
+                        return Err("DDA received unexpected local route slot".to_owned());
                     }
                 }
             }

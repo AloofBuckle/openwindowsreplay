@@ -398,3 +398,90 @@ fn local_nvenc_dda_d3d11_record_smoke() {
         println!("NVENC DDA repeat {}/{} done", repeat + 1, repeats);
     }
 }
+
+#[test]
+#[ignore = "需要本机 NVIDIA 驱动和 D3D11 shared-fence 支持；手动验证 NV12/P010/AYUV 零拷贝共享输入"]
+fn local_nvenc_shared_fence_route_formats_smoke() {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11DeviceContext4,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    use windows::core::Interface;
+
+    let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+    let nvenc_probe = crate::backend::nvenc::probe_nvenc_adapters(&adapters);
+    let adapter_index = nvenc_probe
+        .current_display_routes
+        .first()
+        .expect("本机需要至少一个 NVENC current-display route")
+        .adapter_index;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+    let adapter1 = unsafe { factory.EnumAdapters1(adapter_index) }.unwrap();
+    let width = 1280;
+    let height = 720;
+
+    for route in [
+        VplRecordRoute::sdr8_nv12(),
+        VplRecordRoute::hdr_pq_p010(),
+        VplRecordRoute::sdr8_ayuv(),
+    ] {
+        let input_format = nvenc_input_format_from_route(route).unwrap();
+        let mut encoder = crate::backend::nvenc::NvencD3d11Encoder::open(
+            adapter_index,
+            width,
+            height,
+            input_format,
+            route.mp4_color,
+        )
+        .unwrap();
+        let (capture_device, capture_context) =
+            unsafe { create_d3d11_device_for_adapter(&adapter1) }.unwrap();
+        let target_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: route.try_dxgi_format().unwrap(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut slot = unsafe {
+            create_shared_fence_route_slot(
+                0,
+                &capture_device,
+                &capture_context,
+                encoder.device(),
+                &target_desc,
+                route,
+                width,
+                height,
+                std::sync::Arc::new(std::sync::Mutex::new(ShaderResourceViewCache::retained())),
+            )
+        }
+        .unwrap();
+        let capture_context4: ID3D11DeviceContext4 = capture_context.cast().unwrap();
+        let encoder_context4: ID3D11DeviceContext4 = encoder.context().cast().unwrap();
+        slot.fence_value = 1;
+        unsafe {
+            capture_context4
+                .Signal(&slot.capture_fence, slot.fence_value)
+                .unwrap();
+            encoder_context4
+                .Wait(&slot.encoder_fence, slot.fence_value)
+                .unwrap();
+        }
+        let sample = encoder
+            .encode_texture(&slot.encoder_texture, 0, true, false)
+            .unwrap();
+        assert!(!sample.data.is_empty(), "{} shared input", route.summary());
+        encoder.shutdown().unwrap();
+        println!("shared-fence route passed: {}", route.summary());
+    }
+}

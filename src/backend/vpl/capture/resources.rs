@@ -414,3 +414,146 @@ pub(in super::super) unsafe fn create_shared_snapshot_slot(
         }),
     })
 }
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) unsafe fn create_shared_fence_route_slot(
+    id: usize,
+    capture_device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    capture_context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    encoder_device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    target_desc: &windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+    route: VplRecordRoute,
+    input_width: u32,
+    input_height: u32,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
+) -> Result<SharedFenceSlot, BackendError> {
+    use windows::Win32::Foundation::GENERIC_ALL;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, D3D11_FENCE_FLAG_SHARED,
+        D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device5,
+        ID3D11Fence, ID3D11Texture2D,
+    };
+    use windows::Win32::Graphics::Dxgi::IDXGIResource;
+    use windows::core::{Interface, PCWSTR};
+
+    let use_render_target = matches!(route.fourcc, MFX_FOURCC_P010 | MFX_FOURCC_RGB4);
+    let bind_flags = if use_render_target {
+        D3D11_BIND_RENDER_TARGET.0 as u32
+    } else {
+        D3D11_BIND_UNORDERED_ACCESS.0 as u32
+    };
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: target_desc.Width.max(1),
+        Height: target_desc.Height.max(1),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: target_desc.Format,
+        SampleDesc: target_desc.SampleDesc,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: bind_flags,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+    };
+    let mut capture_texture = None;
+    capture_device
+        .CreateTexture2D(&desc, None, Some(&mut capture_texture))
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::CreateTexture2D(shared-fence DDA route)",
+            message: err.to_string(),
+        })?;
+    let capture_texture = capture_texture.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateTexture2D(shared-fence DDA route)",
+        message: "返回空 capture texture".to_owned(),
+    })?;
+    let resource: IDXGIResource =
+        capture_texture
+            .cast()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Texture2D::cast<IDXGIResource>(shared-fence DDA route)",
+                message: err.to_string(),
+            })?;
+    let texture_handle = resource
+        .GetSharedHandle()
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIResource::GetSharedHandle(shared-fence DDA route)",
+            message: err.to_string(),
+        })?;
+    let mut encoder_texture: Option<ID3D11Texture2D> = None;
+    encoder_device
+        .OpenSharedResource(texture_handle, &mut encoder_texture)
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::OpenSharedResource(shared-fence DDA route)",
+            message: err.to_string(),
+        })?;
+    let encoder_texture = encoder_texture.ok_or_else(|| BackendError::WindowsApi {
+        func: "ID3D11Device::OpenSharedResource(shared-fence DDA route)",
+        message: "返回空 encoder texture".to_owned(),
+    })?;
+
+    let capture_device5: ID3D11Device5 =
+        capture_device
+            .cast()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::cast<ID3D11Device5>(shared-fence DDA capture)",
+                message: err.to_string(),
+            })?;
+    let mut capture_fence: Option<ID3D11Fence> = None;
+    capture_device5
+        .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut capture_fence)
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device5::CreateFence(shared-fence DDA route)",
+            message: err.to_string(),
+        })?;
+    let capture_fence = capture_fence.ok_or_else(|| BackendError::WindowsApi {
+        func: "ID3D11Device5::CreateFence(shared-fence DDA route)",
+        message: "返回空 capture fence".to_owned(),
+    })?;
+    let fence_handle = OwnedSharedHandle(
+        capture_fence
+            .CreateSharedHandle(None, GENERIC_ALL.0, PCWSTR::null())
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Fence::CreateSharedHandle(shared-fence DDA route)",
+                message: err.to_string(),
+            })?,
+    );
+    let encoder_device5: ID3D11Device5 =
+        encoder_device
+            .cast()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::cast<ID3D11Device5>(shared-fence DDA encoder)",
+                message: err.to_string(),
+            })?;
+    let mut encoder_fence: Option<ID3D11Fence> = None;
+    encoder_device5
+        .OpenSharedFence(fence_handle.get(), &mut encoder_fence)
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device5::OpenSharedFence(shared-fence DDA route)",
+            message: err.to_string(),
+        })?;
+    let encoder_fence = encoder_fence.ok_or_else(|| BackendError::WindowsApi {
+        func: "ID3D11Device5::OpenSharedFence(shared-fence DDA route)",
+        message: "返回空 encoder fence".to_owned(),
+    })?;
+    let converter = GpuRecordConverter::new_with_source_cache(
+        route,
+        capture_device,
+        capture_context,
+        &capture_texture,
+        input_width,
+        input_height,
+        !use_render_target,
+        source_srv_cache,
+    )?;
+
+    Ok(SharedFenceSlot {
+        id,
+        capture_texture,
+        encoder_texture,
+        converter,
+        capture_fence,
+        encoder_fence,
+        fence_value: 0,
+        fence_shared_handle: fence_handle.into_raw(),
+    })
+}

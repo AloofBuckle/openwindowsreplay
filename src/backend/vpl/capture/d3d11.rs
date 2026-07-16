@@ -669,7 +669,8 @@ pub(in super::super) unsafe fn return_ready_snapshot_slots(
                     slot.encoder_fence.is_ready(context)?
                 }
             }
-            CaptureFrameSlot::WgcLocal(_) => true,
+            CaptureFrameSlot::FenceShared(_) => true,
+            CaptureFrameSlot::Local(_) => true,
         };
         if ready {
             let slot = pending.swap_remove(index);
