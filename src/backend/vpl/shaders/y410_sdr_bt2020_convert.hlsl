@@ -17,7 +17,7 @@ float bt2020_oetf(float linear_value) {
 }
 
 float3 sc_rgb_to_bt2020_signal(float3 sc_rgb) {
-    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(max(sc_rgb, 0.0)), 0.0);
+    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(sc_rgb), 0.0);
     return saturate(float3(
         bt2020_oetf(bt2020_linear.r),
         bt2020_oetf(bt2020_linear.g),

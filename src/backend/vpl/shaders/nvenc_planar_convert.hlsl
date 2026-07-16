@@ -36,15 +36,15 @@ float3 source_to_signal(float3 source) {
     if (RR_COLOR_MODE <= 1) {
         return saturate(source);
     }
-    float3 linear_rgb = max(source, 0.0);
     if (RR_COLOR_MODE == 2) {
+        float3 linear_rgb = max(source, 0.0);
         return saturate(float3(
             signal_oetf(linear_rgb.r),
             signal_oetf(linear_rgb.g),
             signal_oetf(linear_rgb.b)
         ));
     }
-    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(linear_rgb), 0.0);
+    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(source), 0.0);
     if (RR_COLOR_MODE == 3) {
         return saturate(float3(
             signal_oetf(bt2020_linear.r),

@@ -1106,16 +1106,15 @@ pub(in super::super) unsafe fn create_st2084_pq_lut_srv(
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UNORM;
     use windows::core::Interface;
 
-    const LUT_SIZE: usize = 4096;
-    let mut data = [0u16; LUT_SIZE];
+    let mut data = [0u16; ST2084_PQ_LUT_SIZE];
     for (i, value) in data.iter_mut().enumerate() {
-        let normalized_luminance = i as f64 / (LUT_SIZE - 1) as f64;
+        let normalized_luminance = st2084_pq_lut_normalized_luminance(i);
         let pq = st2084_pq_oetf_scalar(normalized_luminance);
         *value = (pq.clamp(0.0, 1.0) * 65535.0).round() as u16;
     }
 
     let desc = D3D11_TEXTURE1D_DESC {
-        Width: LUT_SIZE as u32,
+        Width: ST2084_PQ_LUT_SIZE as u32,
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_R16_UNORM,
@@ -1126,7 +1125,7 @@ pub(in super::super) unsafe fn create_st2084_pq_lut_srv(
     };
     let initial = D3D11_SUBRESOURCE_DATA {
         pSysMem: data.as_ptr() as *const c_void,
-        SysMemPitch: (LUT_SIZE * std::mem::size_of::<u16>()) as u32,
+        SysMemPitch: (ST2084_PQ_LUT_SIZE * std::mem::size_of::<u16>()) as u32,
         SysMemSlicePitch: 0,
     };
     let mut texture = None;
@@ -1155,6 +1154,13 @@ pub(in super::super) unsafe fn create_st2084_pq_lut_srv(
         func: "CreateShaderResourceView(PQ LUT)",
         message: "返回空 SRV".to_owned(),
     })
+}
+
+pub(in super::super) const ST2084_PQ_LUT_SIZE: usize = 4096;
+
+pub(in super::super) fn st2084_pq_lut_normalized_luminance(index: usize) -> f64 {
+    let coordinate = index.min(ST2084_PQ_LUT_SIZE - 1) as f64 / (ST2084_PQ_LUT_SIZE - 1) as f64;
+    coordinate.powi(4)
 }
 
 pub(in super::super) fn st2084_pq_oetf_scalar(normalized_luminance: f64) -> f64 {

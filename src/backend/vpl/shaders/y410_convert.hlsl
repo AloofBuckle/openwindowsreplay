@@ -23,7 +23,7 @@ float3 rec709_linear_to_bt2020_linear(float3 rgb709) {
 }
 
 float3 sc_rgb_to_pq2020(float3 sc_rgb) {
-    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(max(sc_rgb, 0.0)), 0.0);
+    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(sc_rgb), 0.0);
     float3 normalized_nits = bt2020_linear * (80.0 / 10000.0);
     return float3(pq_oetf(normalized_nits.r), pq_oetf(normalized_nits.g), pq_oetf(normalized_nits.b));
 }

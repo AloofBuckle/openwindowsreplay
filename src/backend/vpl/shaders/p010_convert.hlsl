@@ -13,7 +13,12 @@ float4 vs_main(uint id : SV_VertexID) : SV_Position {
 }
 
 float pq_oetf(float normalized_luminance) {
-    uint idx = (uint)(saturate(normalized_luminance) * 4095.0 + 0.5);
+    // A linear 0..10000-nit LUT gives only about 33 samples below 80 nit and
+    // turns tiny per-channel shadow differences into large PQ code jumps.
+    // The LUT stores luminance on a quartic domain, so two square roots map
+    // linear luminance back to a dense near-black lookup coordinate.
+    float lut_coord = sqrt(sqrt(saturate(normalized_luminance)));
+    uint idx = min((uint)(lut_coord * 4095.0 + 0.5), 4095u);
     return transfer_lut.Load(int2(idx, 0));
 }
 
@@ -29,7 +34,10 @@ float3 sc_rgb_to_pq2020(float3 sc_rgb) {
     // Windows HDR desktop capture is scRGB linear with Rec.709/sRGB primaries
     // and 1.0 == 80 cd/m^2. Convert that display-referred signal to BT.2020
     // linear light, then encode each component with ST 2084 over 0..10000 nits.
-    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(max(sc_rgb, 0.0)), 0.0);
+    // scRGB legitimately uses negative Rec.709 components to represent colors
+    // outside the Rec.709 gamut. Preserve them through the primary conversion
+    // and clip only after the signal is expressed in BT.2020.
+    float3 bt2020_linear = max(rec709_linear_to_bt2020_linear(sc_rgb), 0.0);
     float3 normalized_nits = bt2020_linear * (80.0 / 10000.0);
     return float3(
         pq_oetf(normalized_nits.r),

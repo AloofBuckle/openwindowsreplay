@@ -96,6 +96,79 @@ fn wgc_timestamp_quantization_exposes_sub_tick_duplicates() {
 }
 
 #[test]
+fn pq_lut_quartic_domain_stays_within_one_10bit_code() {
+    for sample in 0..=1_000_000u32 {
+        let normalized_luminance = f64::from(sample) / 1_000_000.0;
+        let coordinate = normalized_luminance.sqrt().sqrt();
+        let index = (coordinate * (ST2084_PQ_LUT_SIZE - 1) as f64)
+            .round()
+            .clamp(0.0, (ST2084_PQ_LUT_SIZE - 1) as f64) as usize;
+        let exact = (st2084_pq_oetf_scalar(normalized_luminance) * 1023.0).round() as i32;
+        let approximated = (st2084_pq_oetf_scalar(st2084_pq_lut_normalized_luminance(index))
+            * 1023.0)
+            .round() as i32;
+        assert!(
+            (exact - approximated).abs() <= 1,
+            "sample={sample} normalized_luminance={normalized_luminance} exact={exact} approximated={approximated}"
+        );
+    }
+}
+
+#[test]
+fn signed_scrgb_components_survive_bt2020_primary_conversion() {
+    fn rec709_to_bt2020(rgb: [f64; 3]) -> [f64; 3] {
+        [
+            0.6274039 * rgb[0] + 0.3292830 * rgb[1] + 0.0433131 * rgb[2],
+            0.0690973 * rgb[0] + 0.9195404 * rgb[1] + 0.0113623 * rgb[2],
+            0.0163914 * rgb[0] + 0.0880133 * rgb[1] + 0.8955953 * rgb[2],
+        ]
+    }
+
+    let bt2020_red_in_scrgb = [1.660491, -0.124550, -0.018151];
+    let bt2020_green_in_scrgb = [-0.587641, 1.132900, -0.100579];
+    let red = rec709_to_bt2020(bt2020_red_in_scrgb);
+    let green = rec709_to_bt2020(bt2020_green_in_scrgb);
+    assert!((red[0] - 1.0).abs() < 0.000_01);
+    assert!(red[1].abs() < 0.000_01 && red[2].abs() < 0.000_01);
+    assert!((green[1] - 1.0).abs() < 0.000_01);
+    assert!(green[0].abs() < 0.000_01 && green[2].abs() < 0.000_01);
+
+    let clipped_red = rec709_to_bt2020([
+        bt2020_red_in_scrgb[0].max(0.0),
+        bt2020_red_in_scrgb[1].max(0.0),
+        bt2020_red_in_scrgb[2].max(0.0),
+    ]);
+    let clipped_green = rec709_to_bt2020([
+        bt2020_green_in_scrgb[0].max(0.0),
+        bt2020_green_in_scrgb[1].max(0.0),
+        bt2020_green_in_scrgb[2].max(0.0),
+    ]);
+    assert!(clipped_red[1] > 0.1, "pre-clipped red becomes orange");
+    assert!(
+        clipped_green[0] > 0.3,
+        "pre-clipped green becomes yellow-green"
+    );
+
+    for (name, shader) in [
+        ("P010 HDR", P010_CONVERT_HLSL),
+        ("P010 BT.2020 SDR", P010_SDR_BT2020_CONVERT_HLSL),
+        ("Y210 HDR", Y210_CONVERT_HLSL),
+        ("Y210 BT.2020 SDR", Y210_SDR_BT2020_CONVERT_HLSL),
+        ("Y410 HDR", Y410_CONVERT_HLSL),
+        ("Y410 BT.2020 SDR", Y410_SDR_BT2020_CONVERT_HLSL),
+    ] {
+        assert!(
+            !shader.contains("rec709_linear_to_bt2020_linear(max("),
+            "{name} must preserve signed scRGB through the primary conversion"
+        );
+    }
+    assert!(
+        NVENC_PLANAR_CONVERT_HLSL.contains("rec709_linear_to_bt2020_linear(source)"),
+        "NVENC planar 422/444 conversion must preserve signed scRGB"
+    );
+}
+
+#[test]
 fn rate_control_config_writes_union_and_ext_fields() {
     let cfg = RateControlConfig {
         method: RateControlMethod::Qvbr,
