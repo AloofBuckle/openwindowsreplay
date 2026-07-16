@@ -18,7 +18,7 @@ pub(super) fn rate_control_fields(
         RateControlMethod::Cbr => {
             kbps_fields(ui, cfg, false, backend);
             if features.look_ahead_depth {
-                lookahead_field(ui, cfg, backend);
+                lookahead_field(ui, cfg, backend, features.look_ahead_depth_max);
             }
             if features.win_brc {
                 sliding_window_fields(ui, cfg);
@@ -27,7 +27,7 @@ pub(super) fn rate_control_fields(
         RateControlMethod::Vbr => {
             kbps_fields(ui, cfg, true, backend);
             if features.look_ahead_depth {
-                lookahead_field(ui, cfg, backend);
+                lookahead_field(ui, cfg, backend, features.look_ahead_depth_max);
             }
             if features.win_brc {
                 sliding_window_fields(ui, cfg);
@@ -56,7 +56,7 @@ pub(super) fn rate_control_fields(
         RateControlMethod::La => {
             target_field(ui, cfg);
             if features.look_ahead_depth {
-                lookahead_field(ui, cfg, backend);
+                lookahead_field(ui, cfg, backend, features.look_ahead_depth_max);
             }
             if features.win_brc {
                 sliding_window_fields(ui, cfg);
@@ -80,13 +80,13 @@ pub(super) fn rate_control_fields(
         RateControlMethod::LaIcq => {
             icq_field(ui, cfg);
             if features.look_ahead_depth {
-                lookahead_field(ui, cfg, backend);
+                lookahead_field(ui, cfg, backend, features.look_ahead_depth_max);
             }
         }
         RateControlMethod::LaHrd => {
             kbps_fields(ui, cfg, true, backend);
             if features.look_ahead_depth {
-                lookahead_field(ui, cfg, backend);
+                lookahead_field(ui, cfg, backend, features.look_ahead_depth_max);
             }
             if features.win_brc {
                 sliding_window_fields(ui, cfg);
@@ -189,15 +189,19 @@ pub(super) fn sanitize_hidden_rate_control_fields(
     if !features.brc_param_multiplier {
         cfg.brc_param_multiplier = 1;
     }
-    if !features.look_ahead_depth {
+    if !features.look_ahead_depth || features.look_ahead_depth_max == 0 {
         cfg.look_ahead_depth = 0;
     } else if matches!(backend, Some(VideoEncoderBackend::Nvenc)) {
-        cfg.look_ahead_depth = cfg.look_ahead_depth.min(31);
+        cfg.look_ahead_depth = cfg
+            .look_ahead_depth
+            .min(features.look_ahead_depth_max.min(31));
     } else {
         if (1..10).contains(&cfg.look_ahead_depth) {
             cfg.look_ahead_depth = 10;
         }
-        cfg.look_ahead_depth = cfg.look_ahead_depth.min(100);
+        cfg.look_ahead_depth = cfg
+            .look_ahead_depth
+            .min(features.look_ahead_depth_max.min(100));
     }
     if matches!(backend, Some(VideoEncoderBackend::Nvenc)) {
         cfg.buffer_size_kb = cfg.buffer_size_kb.min(524_287);
@@ -427,14 +431,17 @@ pub(super) fn lookahead_field(
     ui: &mut egui::Ui,
     cfg: &mut RateControlConfig,
     backend: Option<VideoEncoderBackend>,
+    max_depth: u16,
 ) {
     ui.horizontal(|ui| {
         if matches!(backend, Some(VideoEncoderBackend::Nvenc)) {
-            ui.label("NVENC LookAheadDepth (0-31，0=关闭/默认)");
-            ui.add(egui::DragValue::new(&mut cfg.look_ahead_depth).range(0..=31));
+            let max_depth = max_depth.min(31);
+            ui.label(format!("NVENC LookAheadDepth (0-{max_depth}，0=关闭/默认)"));
+            ui.add(egui::DragValue::new(&mut cfg.look_ahead_depth).range(0..=max_depth));
         } else {
-            ui.label("LookAheadDepth (10-100，0=默认)");
-            ui.add(egui::DragValue::new(&mut cfg.look_ahead_depth).range(0..=100));
+            let max_depth = max_depth.min(100);
+            ui.label(format!("LookAheadDepth (10-{max_depth}，0=默认)"));
+            ui.add(egui::DragValue::new(&mut cfg.look_ahead_depth).range(0..=max_depth));
             if (1..10).contains(&cfg.look_ahead_depth) {
                 cfg.look_ahead_depth = 10;
             }

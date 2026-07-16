@@ -125,13 +125,6 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     use windows::core::Interface;
 
-    if requested_chroma == ChromaSampling::Yuv422 {
-        return Err(BackendError::unsupported(
-            "NVENC 录制",
-            requested_chroma.doc_label(),
-            "NV16/P210 没有可直接注册且保持平面语义的原生 DXGI texture layout，4:2:2 继续保持 probe-only",
-        ));
-    }
     if let Err(err) = rate_control.to_nvenc_fields() {
         return Err(BackendError::unsupported(
             "NVENC 码控",
@@ -158,7 +151,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
     }
 
     let mut notes = vec![
-        "NVENC production path: WGC uses same-device local registered inputs; DDA uses cross-device ordinary shared textures plus D3D11 shared fences; no compatibility CopyResource and no CPU Map/staging/raw-frame fallback".to_owned(),
+        "NVENC production path: native D3D11 formats use WGC local inputs or DDA shared-fence inputs; planar 422/444 formats use same-device CUDA external-memory inputs with keyed mutex; no compatibility CopyResource and no CPU Map/staging/raw-frame fallback".to_owned(),
         format!(
             "NVENC rate-control request accepted and written to NV_ENC_RC_PARAMS: {}",
             rate_control.method.short_name()
@@ -220,6 +213,13 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                 "不支持的桌面模式",
             ));
         }
+        if requested_chroma == ChromaSampling::Yuv422 && capture_width % 2 != 0 {
+            return Err(BackendError::unsupported(
+                "NVENC 录制尺寸",
+                format!("{}x{} 4:2:2", capture_width, capture_height),
+                "不支持的桌面模式",
+            ));
+        }
         let encode_width = u32::from(capture_width);
         let encode_height = u32::from(capture_height);
         notes.push(format!(
@@ -266,7 +266,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         ));
 
         let init_started = Instant::now();
-        let mut nvenc_encoder = crate::backend::nvenc::NvencD3d11Encoder::open_with_rate_control(
+        let mut nvenc_encoder = crate::backend::nvenc::NvencTextureEncoder::open_with_rate_control(
             adapter_index,
             encode_width,
             encode_height,
@@ -279,7 +279,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let encoder_device = nvenc_encoder.device().clone();
         let immediate = nvenc_encoder.context().clone();
         let encoder_context4: Option<ID3D11DeviceContext4> =
-            if capture_source == RecordCaptureSource::Dda {
+            if capture_source == RecordCaptureSource::Dda && !nvenc_encoder.uses_cuda_interop() {
                 Some(immediate.cast().map_err(|err| BackendError::WindowsApi {
                     func: "ID3D11DeviceContext::cast<ID3D11DeviceContext4>(NVENC DDA)",
                     message: err.to_string(),
@@ -324,8 +324,13 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         sink_status(
             &mut encoded_sink,
             format!(
-                "初始化阶段：NVENC D3D11 encoder/session 完成 input={}，累计 {:.1}ms，本阶段 {:.1}ms",
+                "初始化阶段：NVENC encoder/session 完成 input={} transport={}，累计 {:.1}ms，本阶段 {:.1}ms",
                 nvenc_input_format.label(),
+                if nvenc_encoder.uses_cuda_interop() {
+                    "CUDA external-memory array"
+                } else {
+                    "D3D11 direct"
+                },
                 record_started.elapsed().as_secs_f64() * 1000.0,
                 init_started.elapsed().as_secs_f64() * 1000.0
             ),
@@ -339,10 +344,10 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             });
         }
 
-        let record_route_dxgi_format = record_route.try_dxgi_format()?;
+        let record_route_dxgi_format = nvenc_input_format.dxgi_format();
         let target_desc = D3D11_TEXTURE2D_DESC {
             Width: encode_width,
-            Height: encode_height,
+            Height: nvenc_input_format.texture_height(encode_height),
             MipLevels: 1,
             ArraySize: 1,
             Format: record_route_dxgi_format,
@@ -358,25 +363,36 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         sink_status(
             &mut encoded_sink,
             format!(
-                "初始化阶段：NVENC 输入槽位格式就绪 input={} {}x{} zero_copy_capture_slots=true，累计 {:.1}ms",
+                "初始化阶段：NVENC 输入槽位格式就绪 input={} storage={}x{} encode={}x{} zero_copy_capture_slots=true，累计 {:.1}ms",
                 nvenc_input_format.label(),
                 target_desc.Width,
                 target_desc.Height,
+                encode_width,
+                encode_height,
                 record_started.elapsed().as_secs_f64() * 1000.0
             ),
         );
-        match capture_source {
-            RecordCaptureSource::Dda => notes.push(
+        match (capture_source, nvenc_encoder.uses_cuda_interop()) {
+            (RecordCaptureSource::Dda, false) => notes.push(
                 "NVENC DDA 零拷贝路线：独立 capture device 的 shader 直接写普通共享 YUV texture；encoder device 打开同一资源并通过 D3D11 shared fence 等待后直接注册编码"
                     .to_owned(),
             ),
-            RecordCaptureSource::Wgc => notes.push(
+            (RecordCaptureSource::Wgc, false) => notes.push(
                 "NVENC WGC 路线：使用 NVENC D3D11 device 创建 WGC capture，每个本地 YUV 槽位自带 route converter；shader 直接写最终槽位，等待 GPU fence 后直接注册为 NVENC input，全程不再复制"
+                    .to_owned(),
+            ),
+            (RecordCaptureSource::Dda, true) => notes.push(
+                "NVENC DDA CUDA-array 路线：DDA 与 shader 使用同一 D3D11 device 写带 keyed mutex 的连续平面 texture；共享 NT handle 只导入一次 CUDA external memory 并持久注册 NVENC，无 GPU 内容拷贝"
+                    .to_owned(),
+            ),
+            (RecordCaptureSource::Wgc, true) => notes.push(
+                "NVENC WGC CUDA-array 路线：WGC 与 shader 使用同一 D3D11 device 写带 keyed mutex 的连续平面 texture；共享 NT handle 只导入一次 CUDA external memory 并持久注册 NVENC，无 GPU 内容拷贝"
                     .to_owned(),
             ),
         }
 
         let mut samples = Vec::new();
+        let mut pending_slots = std::collections::VecDeque::<CaptureFrameSlot>::new();
         let mut encoded_stats = RecordHevcStats::default();
         let retain_output_samples = write_output_mp4 || encoded_sink.is_none();
         let mut captured_frames = 0u32;
@@ -420,11 +436,24 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
 
         {
             let capture_pool_size = capture_pool_size_for_route(
-                target_desc.Width,
-                target_desc.Height,
+                encode_width,
+                encode_height,
                 record_route,
-                matches!(capture_source, RecordCaptureSource::Dda),
+                matches!(capture_source, RecordCaptureSource::Dda)
+                    && !nvenc_encoder.uses_cuda_interop(),
             );
+            let required_lookahead_slots =
+                usize::from(rate_control.look_ahead_depth).saturating_add(1);
+            if capture_pool_size < required_lookahead_slots {
+                return Err(BackendError::unsupported(
+                    "NVENC Lookahead capture pool",
+                    format!(
+                        "depth={} available_slots={} required_slots={}",
+                        rate_control.look_ahead_depth, capture_pool_size, required_lookahead_slots
+                    ),
+                    "当前分辨率/跨设备路线的 GPU surface 内存预算不足以保留全部延迟输入",
+                ));
+            }
             let capture_queue_size = capture_pool_size;
             let (frame_tx, frame_rx) = std::sync::mpsc::channel::<CaptureMsg>();
             let (free_tx, free_rx) = std::sync::mpsc::channel::<CaptureFrameSlot>();
@@ -433,14 +462,22 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             let capture_thread_started = Instant::now();
             let capture_handle = match capture_source {
                 RecordCaptureSource::Dda => {
-                    let (capture_device, capture_context) =
-                        create_d3d11_device_for_adapter(&adapter1)?;
+                    let (capture_device, capture_context) = if nvenc_encoder.uses_cuda_interop() {
+                        (encoder_device.clone(), immediate.clone())
+                    } else {
+                        create_d3d11_device_for_adapter(&adapter1)?
+                    };
+                    let output_mode = if nvenc_encoder.uses_cuda_interop() {
+                        DdaOutputMode::Local
+                    } else {
+                        DdaOutputMode::SharedFenceToEncoder(encoder_device.clone())
+                    };
                     spawn_dda_capture_thread(
                         adapter1.clone(),
                         selected_output_index,
                         capture_device,
                         capture_context,
-                        DdaOutputMode::SharedFenceToEncoder(encoder_device.clone()),
+                        output_mode,
                         start,
                         end_at,
                         source_stop_90k,
@@ -622,7 +659,9 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                     shared.encoder_texture.clone()
                                 }
                                 CaptureFrameSlot::Local(local) => {
-                                    local.capture_fence.wait_ready(&immediate)?;
+                                    if local.keyed_mutex.is_none() {
+                                        local.capture_fence.wait_ready(&immediate)?;
+                                    }
                                     local.texture.clone()
                                 }
                             };
@@ -661,24 +700,39 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                             };
 
                             let submit_started = Instant::now();
-                            let encode_result = nvenc_encoder.encode_texture(
+                            let encode_result = nvenc_encoder.submit_texture(
                                 &direct_input,
                                 sample_ts90,
                                 force_idr,
                                 discard_from_track,
                             );
                             perf.submit.add(submit_started.elapsed());
-
-                            let sample = encode_result?;
-                            let _ = free_tx.send(slot);
-
-                            push_record_hevc_sample(
-                                &mut samples,
-                                sample,
-                                &mut encoded_sink,
-                                retain_output_samples,
-                                &mut encoded_stats,
-                            );
+                            let outputs = match encode_result {
+                                Ok(outputs) => outputs,
+                                Err(err) => {
+                                    let _ = free_tx.send(slot);
+                                    return Err(err);
+                                }
+                            };
+                            pending_slots.push_back(slot);
+                            for sample in outputs {
+                                let completed_slot =
+                                    pending_slots.pop_front().ok_or_else(|| {
+                                        BackendError::unsupported(
+                                            "NVENC delayed output",
+                                            "capture slot queue",
+                                            "编码器返回 AU 时没有对应的 pending capture slot",
+                                        )
+                                    })?;
+                                let _ = free_tx.send(completed_slot);
+                                push_record_hevc_sample(
+                                    &mut samples,
+                                    sample,
+                                    &mut encoded_sink,
+                                    retain_output_samples,
+                                    &mut encoded_stats,
+                                );
+                            }
                             if warmup {
                                 perf.frame.add(frame_started.elapsed());
                                 return Ok(());
@@ -759,6 +813,41 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             );
             return Err(BackendError::cancelled("NVENC 录制循环"));
         }
+
+        let flush_started = Instant::now();
+        let flushed_outputs = nvenc_encoder.flush()?;
+        for sample in flushed_outputs {
+            let _completed_slot = pending_slots.pop_front().ok_or_else(|| {
+                BackendError::unsupported(
+                    "NVENC delayed output flush",
+                    "capture slot queue",
+                    "EOS flush 返回 AU 时没有对应的 pending capture slot",
+                )
+            })?;
+            push_record_hevc_sample(
+                &mut samples,
+                sample,
+                &mut encoded_sink,
+                retain_output_samples,
+                &mut encoded_stats,
+            );
+        }
+        if !pending_slots.is_empty() || nvenc_encoder.pending_frame_count() != 0 {
+            return Err(BackendError::unsupported(
+                "NVENC delayed output flush",
+                format!(
+                    "capture_slots={} encoder_pending={}",
+                    pending_slots.len(),
+                    nvenc_encoder.pending_frame_count()
+                ),
+                "EOS 后仍有未释放输入，拒绝生成不完整 MP4",
+            ));
+        }
+        notes.push(format!(
+            "NVENC delayed-output flush 完成：lookahead_depth={} elapsed={:.1}ms",
+            nvenc_encoder.lookahead_depth(),
+            flush_started.elapsed().as_secs_f64() * 1000.0
+        ));
 
         let duration_90k = encoded_timeline_duration_90k(
             &samples,

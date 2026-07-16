@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod boxes;
+mod hevc_config;
 mod parameter_sets;
 mod payload;
 mod types;
 mod writer;
 
 use boxes::*;
+#[cfg(test)]
+pub(crate) use hevc_config::synthetic_sps_nal;
+use hevc_config::*;
 pub(crate) use parameter_sets::HevcParameterSetTracker;
 use payload::*;
 use types::*;

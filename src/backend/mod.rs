@@ -154,6 +154,7 @@ pub struct RateControlFeatureSupport {
     pub method: RateControlMethod,
     pub brc_param_multiplier: bool,
     pub look_ahead_depth: bool,
+    pub look_ahead_depth_max: u16,
     pub win_brc: bool,
     pub low_delay_brc: bool,
     pub max_frame_size: bool,
@@ -169,6 +170,7 @@ impl RateControlFeatureSupport {
             method,
             brc_param_multiplier: false,
             look_ahead_depth: false,
+            look_ahead_depth_max: 0,
             win_brc: false,
             low_delay_brc: false,
             max_frame_size: false,
@@ -184,6 +186,7 @@ impl RateControlFeatureSupport {
             method: probe.method,
             brc_param_multiplier: true,
             look_ahead_depth: probe.look_ahead_depth,
+            look_ahead_depth_max: if probe.look_ahead_depth { 100 } else { 0 },
             win_brc: probe.win_brc,
             low_delay_brc: probe.low_delay_brc,
             max_frame_size: probe.max_frame_size,
@@ -194,13 +197,21 @@ impl RateControlFeatureSupport {
         }
     }
 
-    fn from_nvenc_probe(probe: &nvenc::NvencRateControlFeatureProbe) -> Self {
+    fn from_nvenc_probe(
+        probe: &nvenc::NvencRateControlFeatureProbe,
+        look_ahead_depth_max: u16,
+    ) -> Self {
         Self {
             method: probe.method,
             // BRCParamMultiplier 是 oneVPL mfxInfoMFX 字段；NVENC bit/s 字段为 u32，
             // 不向 GUI 暴露该 oneVPL 专用倍率。
             brc_param_multiplier: false,
             look_ahead_depth: probe.lookahead,
+            look_ahead_depth_max: if probe.lookahead {
+                look_ahead_depth_max.min(31)
+            } else {
+                0
+            },
             win_brc: false,
             low_delay_brc: false,
             max_frame_size: false,
@@ -218,6 +229,10 @@ impl RateControlFeatureSupport {
         let mut out = probes.iter().skip(1).fold(first, |mut acc, item| {
             acc.brc_param_multiplier |= item.brc_param_multiplier;
             acc.look_ahead_depth |= item.look_ahead_depth;
+            acc.look_ahead_depth_max = match (acc.look_ahead_depth_max, item.look_ahead_depth_max) {
+                (0, value) | (value, 0) => value,
+                (left, right) => left.min(right),
+            };
             acc.win_brc |= item.win_brc;
             acc.low_delay_brc |= item.low_delay_brc;
             acc.max_frame_size |= item.max_frame_size;
@@ -571,6 +586,16 @@ impl ProbeCaps {
                 "当前 route/method 未确认支持 LookAheadDepth；前端应隐藏该字段",
             ));
         }
+        if uses_lookahead && cfg.look_ahead_depth > features.look_ahead_depth_max {
+            return Err(BackendError::unsupported(
+                context,
+                format!("LookAheadDepth={}", cfg.look_ahead_depth),
+                format!(
+                    "当前 route 的 GPU surface 池最多允许 LookAheadDepth={}；前端应按能力上限限制该字段",
+                    features.look_ahead_depth_max
+                ),
+            ));
+        }
         if (cfg.win_brc_max_avg_kbps > 0 || cfg.win_brc_size > 0) && !features.win_brc {
             return Err(BackendError::unsupported(
                 context,
@@ -821,6 +846,8 @@ pub fn probe_all() -> ProbeCaps {
                     .iter()
                     .filter(|route| !route.input_format.is_empty())
                 {
+                    let look_ahead_depth_max =
+                        nvenc::lookahead_depth_max_for_current_display_route(display_route);
                     let Some(route) = nvenc
                         .adapters
                         .iter()
@@ -848,10 +875,12 @@ pub fn probe_all() -> ProbeCaps {
                             .iter()
                             .find(|feature| feature.method == *method)
                         {
-                            by_method
-                                .entry(*method)
-                                .or_default()
-                                .push(RateControlFeatureSupport::from_nvenc_probe(feature));
+                            by_method.entry(*method).or_default().push(
+                                RateControlFeatureSupport::from_nvenc_probe(
+                                    feature,
+                                    look_ahead_depth_max,
+                                ),
+                            );
                         } else {
                             by_method
                                 .entry(*method)

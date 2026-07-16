@@ -11,6 +11,7 @@ pub(super) enum CaptureMsg {
 pub(super) enum DdaOutputMode {
     SharedToEncoder(windows::Win32::Graphics::Direct3D11::ID3D11Device),
     SharedFenceToEncoder(windows::Win32::Graphics::Direct3D11::ID3D11Device),
+    Local,
 }
 
 #[cfg(windows)]
@@ -94,7 +95,9 @@ pub(super) unsafe fn run_dda_capture_thread(
 ) -> Result<CaptureStats, String> {
     use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
-    use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11DeviceContext4};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_TEXTURE2D_DESC, ID3D11DeviceContext4, ID3D11Multithread,
+    };
     use windows::Win32::Graphics::Dxgi::{
         DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
         DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -111,6 +114,11 @@ pub(super) unsafe fn run_dda_capture_thread(
         } else {
             None
         };
+    if matches!(&output_mode, DdaOutputMode::Local)
+        && let Ok(multithread) = context.cast::<ID3D11Multithread>()
+    {
+        let _ = multithread.SetMultithreadProtected(true);
+    }
     let duplication = create_duplication_on_device(&adapter1, output_index, &device, route)
         .map_err(|err| err.to_string())?;
     let mut stats = CaptureStats::new();
@@ -141,7 +149,12 @@ pub(super) unsafe fn run_dda_capture_thread(
                             .as_ref()
                             .is_none_or(|desc| shared_fence_slot_matches(shared, desc))
                 }
-                CaptureFrameSlot::Local(_) => false,
+                CaptureFrameSlot::Local(local) => {
+                    matches!(&output_mode, DdaOutputMode::Local)
+                        && snapshot_desc0
+                            .as_ref()
+                            .is_none_or(|desc| local_route_slot_matches(local, desc))
+                }
             };
             if slot_matches {
                 free_slots.push_back(slot);
@@ -299,6 +312,25 @@ pub(super) unsafe fn run_dda_capture_thread(
                             free_slots.push_back(CaptureFrameSlot::FenceShared(slot));
                         }
                     }
+                    DdaOutputMode::Local => {
+                        let source_srv_cache = std::sync::Arc::new(std::sync::Mutex::new(
+                            ShaderResourceViewCache::retained(),
+                        ));
+                        for id in 0..pool_size {
+                            let slot = create_local_route_slot(
+                                id,
+                                &device,
+                                &context,
+                                &snapshot_desc,
+                                route,
+                                source_desc.Width,
+                                source_desc.Height,
+                                source_srv_cache.clone(),
+                            )
+                            .map_err(|err| err.to_string())?;
+                            free_slots.push_back(CaptureFrameSlot::Local(slot));
+                        }
+                    }
                 }
             }
             let snapshot_desc =
@@ -364,8 +396,41 @@ pub(super) unsafe fn run_dda_capture_thread(
                                 format!("ID3D11DeviceContext4::Signal(DDA capture): {err}")
                             })?;
                     }
-                    CaptureFrameSlot::Local(_) => {
-                        return Err("DDA received unexpected local route slot".to_owned());
+                    CaptureFrameSlot::Local(local) => {
+                        if !matches!(&output_mode, DdaOutputMode::Local) {
+                            return Err("DDA received unexpected local route slot".to_owned());
+                        }
+                        let keyed_mutex_guard = if let Some(mutex) = local.keyed_mutex.as_ref() {
+                            Some(
+                                KeyedMutexGuard::acquire(
+                                    mutex,
+                                    0,
+                                    1,
+                                    1_000,
+                                    "IDXGIKeyedMutex::AcquireSync(DDA CUDA planar capture)",
+                                )
+                                .map_err(|err| err.to_string())?,
+                            )
+                        } else {
+                            None
+                        };
+                        let convert_result = local.converter.convert(&source).map_err(|err| {
+                            format!(
+                                "DDA local route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
+                                source_desc.Format.0,
+                                snapshot_desc.Format.0,
+                                snapshot_desc.Width,
+                                snapshot_desc.Height
+                            )
+                        });
+                        if let Some(guard) = keyed_mutex_guard {
+                            guard
+                                .release("IDXGIKeyedMutex::ReleaseSync(DDA CUDA planar capture)")
+                                .map_err(|err| err.to_string())?;
+                        } else {
+                            local.capture_fence.mark(&context);
+                        }
+                        convert_result?;
                     }
                 }
             }

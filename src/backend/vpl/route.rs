@@ -46,6 +46,12 @@ pub(super) const MFX_FOURCC_P210: u32 = make_fourcc(b'P', b'2', b'1', b'0');
 pub(super) const MFX_FOURCC_AYUV: u32 = make_fourcc(b'A', b'Y', b'U', b'V');
 pub(super) const MFX_FOURCC_Y210: u32 = make_fourcc(b'Y', b'2', b'1', b'0');
 pub(super) const MFX_FOURCC_Y410: u32 = make_fourcc(b'Y', b'4', b'1', b'0');
+// NVENC CUDA-array-only storage layouts. These are internal route identifiers,
+// deliberately distinct from oneVPL FourCC values so they cannot leak into MFX Query/Init.
+pub(super) const NVENC_FOURCC_NV16: u32 = make_fourcc(b'N', b'V', b'1', b'6');
+pub(super) const NVENC_FOURCC_P210: u32 = make_fourcc(b'N', b'2', b'1', b'0');
+pub(super) const NVENC_FOURCC_Y444: u32 = make_fourcc(b'Y', b'4', b'4', b'4');
+pub(super) const NVENC_FOURCC_Y4P0: u32 = make_fourcc(b'Y', b'4', b'P', b'0');
 
 pub(super) const MFX_PROFILE_HEVC_MAIN: u32 = 1;
 pub(super) const MFX_PROFILE_HEVC_MAIN10: u32 = 2;
@@ -250,6 +256,13 @@ impl VplRecordRoute {
 
     pub(super) fn requires_fp16_capture(self) -> bool {
         self.bit_depth >= 10
+    }
+
+    pub(super) fn is_nvenc_cuda_planar(self) -> bool {
+        matches!(
+            self.fourcc,
+            NVENC_FOURCC_NV16 | NVENC_FOURCC_P210 | NVENC_FOURCC_Y444 | NVENC_FOURCC_Y4P0
+        )
     }
 
     pub(super) fn supports_requested_chroma(self, requested: ChromaSampling) -> bool {
@@ -554,23 +567,32 @@ pub(super) fn record_route_from_nvenc_display_plan(
     let (fourcc, codec) = match plan.input_format.as_str() {
         "NV12" => (MFX_FOURCC_NV12, HevcCodecMetadata::main_420_8()),
         "P010" => (MFX_FOURCC_P010, HevcCodecMetadata::main10_420_10()),
+        "NV16" => (NVENC_FOURCC_NV16, HevcCodecMetadata::rext(2, 8)),
+        "P210" => (NVENC_FOURCC_P210, HevcCodecMetadata::rext(2, 10)),
         "AYUV" => (MFX_FOURCC_AYUV, HevcCodecMetadata::rext(3, 8)),
+        "YUV444" => (NVENC_FOURCC_Y444, HevcCodecMetadata::rext(3, 8)),
+        "YUV444_10BIT" => (NVENC_FOURCC_Y4P0, HevcCodecMetadata::rext(3, 10)),
         other => {
             return Err(BackendError::unsupported(
                 "NVENC 录制 RoutePlan",
                 format!("input_format={other}"),
-                "当前 NVENC 生产路径只接入 NV12/P010/AYUV；NV16/P210/planar YUV444 仍为 probe-only",
+                "当前 NVENC 生产路径没有该 input format 的 D3D11/CUDA GPU writer",
             ));
         }
     };
     Ok(VplRecordRoute {
         label: "NVENC Probe RoutePlan",
         fourcc,
-        chroma: if plan.input_format == "AYUV" { 3 } else { 1 },
+        chroma: match plan.input_format.as_str() {
+            "NV12" | "P010" => 1,
+            "NV16" | "P210" => 2,
+            "AYUV" | "YUV444" | "YUV444_10BIT" => 3,
+            _ => 0,
+        },
         bit_depth: plan.bit_depth,
         profile: match plan.input_format.as_str() {
             "P010" => MFX_PROFILE_HEVC_MAIN10 as u16,
-            "AYUV" => MFX_PROFILE_HEVC_REXT as u16,
+            "NV16" | "P210" | "AYUV" | "YUV444" | "YUV444_10BIT" => MFX_PROFILE_HEVC_REXT as u16,
             _ => MFX_PROFILE_HEVC_MAIN as u16,
         },
         mp4_color: NclxColorMetadata {
@@ -589,11 +611,15 @@ pub(super) fn nvenc_input_format_from_route(
     match route.fourcc {
         MFX_FOURCC_NV12 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Nv12),
         MFX_FOURCC_P010 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::P010),
+        NVENC_FOURCC_NV16 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Nv16),
+        NVENC_FOURCC_P210 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::P210),
         MFX_FOURCC_AYUV => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Ayuv),
+        NVENC_FOURCC_Y444 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Yuv444),
+        NVENC_FOURCC_Y4P0 => Ok(crate::backend::nvenc::NvencD3d11InputFormat::Yuv44410),
         _ => Err(BackendError::unsupported(
             "NVENC 录制 route",
             route.summary(),
-            "当前 NVENC 生产路径只接入 NV12/P010/AYUV；NV16/P210/planar YUV444 仍为 probe-only",
+            "当前 NVENC 生产路径没有该 route 的 D3D11/CUDA GPU writer",
         )),
     }
 }
@@ -705,16 +731,6 @@ pub(super) fn validate_current_nvenc_route_plan(
     use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
     use windows::core::Interface;
 
-    if !matches!(
-        requested_chroma,
-        ChromaSampling::Yuv420 | ChromaSampling::Yuv444
-    ) {
-        return Err(BackendError::unsupported(
-            "NVENC 录制 RoutePlan",
-            requested_chroma.doc_label(),
-            "NVENC 4:2:2 NV16/P210 缺少可直接注册且保持平面语义的原生 DXGI texture layout",
-        ));
-    }
     if plan.chroma != requested_chroma || plan.input_format.is_empty() {
         return Err(BackendError::unsupported(
             "NVENC 录制 RoutePlan",
@@ -727,11 +743,14 @@ pub(super) fn validate_current_nvenc_route_plan(
             "能力探测没有当前色度的可录制 NVENC route，请重新探测能力",
         ));
     }
-    if !matches!(plan.input_format.as_str(), "NV12" | "P010" | "AYUV") {
+    if !matches!(
+        plan.input_format.as_str(),
+        "NV12" | "P010" | "NV16" | "P210" | "AYUV" | "YUV444" | "YUV444_10BIT"
+    ) {
         return Err(BackendError::unsupported(
             "NVENC 录制 RoutePlan",
             format!("input_format={}", plan.input_format),
-            "当前 NVENC 生产路径只接入 NV12/P010/AYUV；其他格式仍为 probe-only",
+            "当前 NVENC 生产路径没有该 input format 的 D3D11/CUDA GPU writer",
         ));
     }
     if plan.adapter_index != adapter_index || plan.output_index != output_index {
@@ -846,7 +865,8 @@ impl VplRecordRoute {
     ) -> Result<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, BackendError> {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-            DXGI_FORMAT_Y210, DXGI_FORMAT_Y410, DXGI_FORMAT_YUY2,
+            DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_Y210, DXGI_FORMAT_Y410,
+            DXGI_FORMAT_YUY2,
         };
         let format = match self.fourcc {
             MFX_FOURCC_NV12 => DXGI_FORMAT_NV12,
@@ -865,6 +885,8 @@ impl VplRecordRoute {
             MFX_FOURCC_AYUV => DXGI_FORMAT_AYUV,
             MFX_FOURCC_Y410 => DXGI_FORMAT_Y410,
             MFX_FOURCC_RGB4 => DXGI_FORMAT_B8G8R8A8_UNORM,
+            NVENC_FOURCC_NV16 | NVENC_FOURCC_Y444 => DXGI_FORMAT_R8_UINT,
+            NVENC_FOURCC_P210 | NVENC_FOURCC_Y4P0 => DXGI_FORMAT_R16_UINT,
             _ => {
                 return Err(BackendError::unsupported(
                     "录制 route DXGI format",

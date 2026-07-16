@@ -393,20 +393,27 @@ pub(super) fn make_hvcc_with_codec(
     sets: &HevcParameterSets,
     codec: HevcCodecMetadata,
 ) -> Result<Vec<u8>, BackendError> {
+    let config = decoder_configuration_from_parameter_sets(sets, codec)?;
     let mut p = vec![
         1, // configurationVersion
-        codec.profile_idc & 0x1f,
+        ((config.profile_space & 0x03) << 6)
+            | (u8::from(config.tier_flag) << 5)
+            | (config.profile_idc & 0x1f),
     ];
-    p.extend_from_slice(&0x6000_0000u32.to_be_bytes());
-    p.extend_from_slice(&[0; 6]);
-    p.push(153); // level 5.1
+    p.extend_from_slice(&config.profile_compatibility_flags.to_be_bytes());
+    p.extend_from_slice(&config.constraint_indicator_flags);
+    p.push(config.level_idc);
     be16(&mut p, 0xf000);
     p.push(0xfc);
-    p.push(0xfc | (codec.chroma_format_idc & 0x03));
-    p.push(0xf8 | (codec.bit_depth_luma_minus8 & 0x07));
-    p.push(0xf8 | (codec.bit_depth_chroma_minus8 & 0x07));
+    p.push(0xfc | (config.chroma_format_idc & 0x03));
+    p.push(0xf8 | (config.bit_depth_luma_minus8 & 0x07));
+    p.push(0xf8 | (config.bit_depth_chroma_minus8 & 0x07));
     be16(&mut p, 0);
-    p.push(0x0f); // one temporal layer, nested, 4-byte NAL lengths
+    p.push(
+        ((config.num_temporal_layers & 0x07) << 3)
+            | (u8::from(config.temporal_id_nested) << 2)
+            | 0x03,
+    );
     p.push(3);
     append_hvcc_array(&mut p, 32, &sets.vps)?;
     append_hvcc_array(&mut p, 33, &sets.sps)?;

@@ -940,6 +940,10 @@ pub(super) fn capture_pool_size_for_route(
         MFX_FOURCC_YUY2 => pixels.saturating_mul(2),
         MFX_FOURCC_Y210 => pixels.saturating_mul(4),
         MFX_FOURCC_AYUV | MFX_FOURCC_Y410 | MFX_FOURCC_RGB4 => pixels.saturating_mul(4),
+        NVENC_FOURCC_NV16 => pixels.saturating_mul(2),
+        NVENC_FOURCC_P210 => pixels.saturating_mul(4),
+        NVENC_FOURCC_Y444 => pixels.saturating_mul(3),
+        NVENC_FOURCC_Y4P0 => pixels.saturating_mul(6),
         _ => pixels.saturating_mul(4),
     };
     let per_slot = texture_bytes.saturating_mul(if shared_cross_device { 2 } else { 1 });

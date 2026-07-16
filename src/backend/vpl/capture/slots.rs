@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(windows)]
+use windows::core::Interface;
+
+#[cfg(windows)]
 #[derive(Clone)]
 pub(in super::super) struct SnapshotSlot {
     pub(in super::super) inner: std::sync::Arc<SnapshotSlotInner>,
@@ -63,6 +66,7 @@ pub(in super::super) struct LocalRouteSlot {
     pub(in super::super) texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     pub(in super::super) converter: GpuRecordConverter,
     pub(in super::super) capture_fence: GpuCompletionFence,
+    pub(in super::super) keyed_mutex: Option<windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex>,
 }
 
 #[cfg(windows)]
@@ -336,10 +340,23 @@ pub(in super::super) unsafe fn create_local_route_slot(
         true,
         source_srv_cache,
     )?;
+    let keyed_mutex = if route.is_nvenc_cuda_planar() {
+        Some(
+            texture
+                .cast::<windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex>()
+                .map_err(|err| BackendError::WindowsApi {
+                    func: "ID3D11Texture2D::cast<IDXGIKeyedMutex>(NVENC CUDA planar slot)",
+                    message: err.to_string(),
+                })?,
+        )
+    } else {
+        None
+    };
     Ok(LocalRouteSlot {
         id,
         texture,
         converter,
         capture_fence: GpuCompletionFence::new(device)?,
+        keyed_mutex,
     })
 }

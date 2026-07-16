@@ -15,13 +15,18 @@ use crate::rate_control::{
 };
 use libloading::Library;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 
+#[cfg(windows)]
+#[path = "nvenc/cuda.rs"]
+mod cuda;
+
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 const NV_ENC_SUCCESS: i32 = 0;
+const NV_ENC_ERR_NEED_MORE_INPUT: i32 = 17;
 
 // Video Codec SDK 13.1 header encoding. The official driver entry point also
 // reports its max supported API version; this compiled version is intentionally
@@ -46,7 +51,9 @@ const NV_ENC_PIC_PARAMS_VER: u32 = nvencapi_struct_version(7) | (1u32 << 31);
 const NV_ENC_LOCK_BITSTREAM_VER: u32 = nvencapi_struct_version(2) | (1u32 << 31);
 
 const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0;
+const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0;
+const NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY: u32 = 2;
 const NV_ENC_INPUT_IMAGE: u32 = 0;
 const NV_ENC_TUNING_INFO_LOW_LATENCY: u32 = 2;
 const NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME: u32 = 1;
@@ -54,6 +61,7 @@ const NV_ENC_BIT_DEPTH_8: u32 = 8;
 const NV_ENC_BIT_DEPTH_10: u32 = 10;
 const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
 const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
+const NV_ENC_PIC_FLAG_EOS: u32 = 0x8;
 const NV_ENC_PIC_STRUCT_FRAME: u32 = 0x01;
 
 // SDK 13.x nvEncodeAPI.h layout, verified locally against nv-codec-headers:
@@ -279,8 +287,8 @@ pub struct NvencRouteProbe {
     pub bit_depth: u16,
     pub profile: String,
     pub query_supported: bool,
-    /// 当前只是 NVENC SDK/驱动能力可见性；生产录制接线未完成前保持 false，避免
-    /// GUI 把 NVENC 暴露成已经可录制路径。
+    /// NVENC SDK/驱动能力与当前已实现 GPU writer 均成立时为 true，GUI 只暴露
+    /// 这些已经可进入生产录制后端的路线。
     pub production_record_supported: bool,
     pub production_blocker: Option<String>,
     pub rate_controls: Vec<RateControlMethod>,
@@ -331,6 +339,42 @@ pub struct NvencCurrentDisplayRouteInfo {
     pub note: String,
 }
 
+pub fn lookahead_depth_max_for_current_display_route(route: &NvencCurrentDisplayRouteInfo) -> u16 {
+    const MAX_SLOTS: u128 = 32;
+    const MIN_SLOTS: u128 = 8;
+    const SLOT_BUDGET_BYTES: u128 = 3 * 1024 * 1024 * 1024;
+
+    if route.input_format.is_empty() {
+        return 0;
+    }
+    let width = u128::from(route.desktop_right.abs_diff(route.desktop_left).max(1));
+    let height = u128::from(route.desktop_bottom.abs_diff(route.desktop_top).max(1));
+    let pixels = width.saturating_mul(height);
+    let texture_bytes = match route.input_format.as_str() {
+        "NV12" => pixels.saturating_mul(3) / 2,
+        "P010" => pixels.saturating_mul(3),
+        "NV16" => pixels.saturating_mul(2),
+        "P210" => pixels.saturating_mul(4),
+        "AYUV" => pixels.saturating_mul(4),
+        "YUV444" => pixels.saturating_mul(3),
+        "YUV444_10BIT" => pixels.saturating_mul(6),
+        _ => return 0,
+    };
+    // 原生 D3D11 DDA route 同时持有 capture/encoder 两个 resource view；CUDA
+    // planar route 是同设备单 allocation。按较重的 DDA 路径给 GUI 保守上限。
+    let allocation_count = if nvenc_route_requires_cuda(&route.input_format) {
+        1
+    } else {
+        2
+    };
+    let per_slot = texture_bytes.saturating_mul(allocation_count);
+    if per_slot == 0 {
+        return 0;
+    }
+    let slots = (SLOT_BUDGET_BYTES / per_slot).clamp(MIN_SLOTS, MAX_SLOTS);
+    slots.saturating_sub(1).min(31) as u16
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NvencD3d11EncodeSmokeReport {
     pub adapter_index: u32,
@@ -345,7 +389,11 @@ pub struct NvencD3d11EncodeSmokeReport {
 pub enum NvencD3d11InputFormat {
     Nv12,
     P010,
+    Nv16,
+    P210,
     Ayuv,
+    Yuv444,
+    Yuv44410,
 }
 
 impl NvencD3d11InputFormat {
@@ -353,7 +401,11 @@ impl NvencD3d11InputFormat {
         match self {
             Self::Nv12 => "NV12",
             Self::P010 => "P010",
+            Self::Nv16 => "NV16",
+            Self::P210 => "P210",
             Self::Ayuv => "AYUV",
+            Self::Yuv444 => "YUV444",
+            Self::Yuv44410 => "YUV444_10BIT",
         }
     }
 
@@ -361,36 +413,60 @@ impl NvencD3d11InputFormat {
         match self {
             Self::Nv12 => NV_ENC_BUFFER_FORMAT_NV12,
             Self::P010 => NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
+            Self::Nv16 => NV_ENC_BUFFER_FORMAT_NV16,
+            Self::P210 => NV_ENC_BUFFER_FORMAT_P210,
             Self::Ayuv => NV_ENC_BUFFER_FORMAT_AYUV,
+            Self::Yuv444 => NV_ENC_BUFFER_FORMAT_YUV444,
+            Self::Yuv44410 => NV_ENC_BUFFER_FORMAT_YUV444_10BIT,
         }
     }
 
-    const fn dxgi_pitch_bytes(self, width: u32) -> u32 {
+    pub(crate) const fn dxgi_pitch_bytes(self, width: u32) -> u32 {
         match self {
-            Self::Nv12 => width,
-            Self::P010 => width.saturating_mul(2),
+            Self::Nv12 | Self::Nv16 | Self::Yuv444 => width,
+            Self::P010 | Self::P210 | Self::Yuv44410 => width.saturating_mul(2),
             Self::Ayuv => width.saturating_mul(4),
         }
     }
 
-    const fn frame_size_bytes(self, width: u32, height: u32) -> usize {
+    pub(crate) const fn texture_height(self, height: u32) -> u32 {
+        match self {
+            Self::Nv16 | Self::P210 => height.saturating_mul(2),
+            Self::Yuv444 | Self::Yuv44410 => height.saturating_mul(3),
+            Self::Nv12 | Self::P010 | Self::Ayuv => height,
+        }
+    }
+
+    pub(crate) const fn frame_size_bytes(self, width: u32, height: u32) -> usize {
         let pitch = self.dxgi_pitch_bytes(width) as usize;
         match self {
             Self::Nv12 | Self::P010 => pitch * height as usize * 3 / 2,
+            Self::Nv16 | Self::P210 => pitch * height as usize * 2,
+            Self::Yuv444 | Self::Yuv44410 => pitch * height as usize * 3,
             Self::Ayuv => pitch * height as usize,
         }
     }
 
     #[cfg(windows)]
-    const fn dxgi_format(self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    pub(crate) const fn dxgi_format(self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
+            DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R16_UINT,
         };
         match self {
             Self::Nv12 => DXGI_FORMAT_NV12,
             Self::P010 => DXGI_FORMAT_P010,
+            Self::Nv16 | Self::Yuv444 => DXGI_FORMAT_R8_UINT,
+            Self::P210 | Self::Yuv44410 => DXGI_FORMAT_R16_UINT,
             Self::Ayuv => DXGI_FORMAT_AYUV,
         }
+    }
+
+    pub const fn requires_cuda_interop(self) -> bool {
+        matches!(
+            self,
+            Self::Nv16 | Self::P210 | Self::Yuv444 | Self::Yuv44410
+        )
     }
 }
 
@@ -398,7 +474,8 @@ impl NvencD3d11InputFormat {
 pub struct NvencD3d11Encoder {
     registered_inputs: HashMap<usize, NvencRegisteredResource>,
     persistent_registration: bool,
-    bitstream: NvencBitstreamBuffer,
+    free_bitstreams: Vec<NvencBitstreamBuffer>,
+    pending_frames: VecDeque<NvencPendingFrame>,
     session: NvencSession,
     _api: NvencApi,
     width: u32,
@@ -407,6 +484,17 @@ pub struct NvencD3d11Encoder {
     expected_color: NclxColorMetadata,
     vui_verified: bool,
     frame_idx: u32,
+    lookahead_depth: u16,
+    eos_submitted: bool,
+}
+
+#[cfg(windows)]
+struct NvencPendingFrame {
+    mapped: NvencMappedInputResource,
+    transient_registered: Option<NvencRegisteredResource>,
+    bitstream: NvencBitstreamBuffer,
+    timestamp_90k: u64,
+    discard_from_track: bool,
 }
 
 #[cfg(windows)]
@@ -448,13 +536,6 @@ impl NvencD3d11Encoder {
         frame_rate_num: u32,
         frame_rate_den: u32,
     ) -> Result<Self, BackendError> {
-        if rate_control.look_ahead_depth > 0 {
-            return Err(BackendError::unsupported(
-                "NVENC RateControl",
-                format!("LookAheadDepth={}", rate_control.look_ahead_depth),
-                "当前同步编码器使用单 bitstream buffer 并在每次提交后立即锁定输出，尚未实现 NV_ENC_ERR_NEED_MORE_INPUT 所需的延迟输出队列",
-            ));
-        }
         unsafe {
             let (api, _dll_path) = NvencApi::load()
                 .map_err(|err| BackendError::unsupported("NVENC", "nvEncodeAPI64.dll", err))?;
@@ -470,12 +551,17 @@ impl NvencD3d11Encoder {
                 frame_rate_num,
                 frame_rate_den,
             )?;
-            let bitstream = create_bitstream_buffer(&api, session.encoder)?;
+            let output_buffer_count = usize::from(rate_control.look_ahead_depth).saturating_add(1);
+            let mut free_bitstreams = Vec::with_capacity(output_buffer_count);
+            for _ in 0..output_buffer_count {
+                free_bitstreams.push(create_bitstream_buffer(&api, session.encoder)?);
+            }
             Ok(Self {
                 registered_inputs: HashMap::new(),
                 persistent_registration: std::env::var_os("RUST_REPLAY_NVENC_REGISTER_PER_FRAME")
                     .is_none(),
-                bitstream,
+                free_bitstreams,
+                pending_frames: VecDeque::with_capacity(output_buffer_count),
                 session,
                 _api: api,
                 width,
@@ -484,6 +570,8 @@ impl NvencD3d11Encoder {
                 expected_color: color,
                 vui_verified: false,
                 frame_idx: 0,
+                lookahead_depth: rate_control.look_ahead_depth,
+                eos_submitted: false,
             })
         }
     }
@@ -508,40 +596,81 @@ impl NvencD3d11Encoder {
         }
     }
 
-    pub fn encode_texture(
+    pub fn lookahead_depth(&self) -> u16 {
+        self.lookahead_depth
+    }
+
+    pub fn pending_frame_count(&self) -> usize {
+        self.pending_frames.len()
+    }
+
+    pub fn submit_texture(
         &mut self,
         texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         timestamp_90k: u64,
         force_idr: bool,
         discard_from_track: bool,
-    ) -> Result<HevcAccessUnit, BackendError> {
+    ) -> Result<Vec<HevcAccessUnit>, BackendError> {
         use windows::core::Interface;
+
+        if self.eos_submitted {
+            return Err(BackendError::unsupported(
+                "NVENC encode",
+                self.input_format.label(),
+                "EOS 已提交，不能继续提交输入帧",
+            ));
+        }
 
         unsafe {
             validate_d3d11_input_texture(texture, self.width, self.height, self.input_format)?;
+            let bitstream = self.free_bitstreams.pop().ok_or_else(|| {
+                BackendError::unsupported(
+                    "NVENC delayed output",
+                    format!(
+                        "LookAheadDepth={} pending={}",
+                        self.lookahead_depth,
+                        self.pending_frames.len()
+                    ),
+                    "延迟输出超过已分配 bitstream pool；驱动没有按配置深度返回输出",
+                )
+            })?;
+
             let texture_key = texture.as_raw() as usize;
             if self.persistent_registration && !self.registered_inputs.contains_key(&texture_key) {
-                let registered = register_d3d11_input_texture(
+                let registered = match register_d3d11_input_texture(
                     &self._api,
                     self.session.encoder,
                     texture,
                     self.width,
                     self.height,
                     self.input_format,
-                )?;
+                ) {
+                    Ok(registered) => registered,
+                    Err(err) => {
+                        self.free_bitstreams.push(bitstream);
+                        return Err(err);
+                    }
+                };
                 self.registered_inputs.insert(texture_key, registered);
             }
-            let transient_registered = if self.persistent_registration {
+            let mut transient_registered = if self.persistent_registration {
                 None
             } else {
-                Some(register_d3d11_input_texture(
+                let registered = match register_d3d11_input_texture(
                     &self._api,
                     self.session.encoder,
                     texture,
                     self.width,
                     self.height,
                     self.input_format,
-                )?)
+                ) {
+                    Ok(registered) => registered,
+                    Err(err) => {
+                        self.free_bitstreams.push(bitstream);
+                        return Err(err);
+                    }
+                };
+                Some(registered)
             };
             let registered = if let Some(registered) = transient_registered.as_ref() {
                 registered
@@ -554,54 +683,161 @@ impl NvencD3d11Encoder {
                     )
                 })?
             };
-            let mut mapped = map_input_resource(&self._api, self.session.encoder, registered)?;
-            encode_one_d3d11_frame(
+            let mut mapped = match map_input_resource(&self._api, self.session.encoder, registered)
+            {
+                Ok(mapped) => mapped,
+                Err(err) => {
+                    self.free_bitstreams.push(bitstream);
+                    return Err(err);
+                }
+            };
+            let status = match encode_one_d3d11_frame(
                 &self._api,
                 self.session.encoder,
                 &mapped,
-                &self.bitstream,
+                &bitstream,
                 self.width,
                 self.height,
                 self.input_format,
                 self.frame_idx,
                 timestamp_90k,
                 force_idr || self.frame_idx == 0,
-            )?;
-            let bitstream_result =
-                lock_and_copy_bitstream(&self._api, self.session.encoder, &self.bitstream);
-            let unmap_status = mapped.unmap_now();
-            let (bytes, annex_b_start_code_seen) = bitstream_result?;
-            nvenc_check("NvEncUnmapInputResource", unmap_status)?;
-            if bytes.is_empty() {
-                return Err(BackendError::unsupported(
-                    "NVENC encode",
-                    self.input_format.label(),
-                    "返回空 HEVC bitstream",
-                ));
-            }
-            if !annex_b_start_code_seen {
-                return Err(BackendError::unsupported(
-                    "NVENC encode",
-                    "HEVC Annex-B bitstream",
-                    "bitstream 中未发现 Annex-B start code，无法交给当前 MP4 muxer",
-                ));
-            }
-            if !self.vui_verified {
-                verify_hevc_vui_matches(&bytes, self.expected_color)?;
-                self.vui_verified = true;
-            }
-            let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&bytes);
-            self.frame_idx = self.frame_idx.wrapping_add(1);
-            Ok(HevcAccessUnit {
+            ) {
+                Ok(status) => status,
+                Err(err) => {
+                    let _ = mapped.unmap_now();
+                    if let Some(registered) = transient_registered.as_mut() {
+                        let _ = registered.unregister_now();
+                    }
+                    self.free_bitstreams.push(bitstream);
+                    return Err(err);
+                }
+            };
+            self.pending_frames.push_back(NvencPendingFrame {
+                mapped,
+                transient_registered,
+                bitstream,
                 timestamp_90k,
-                data: bytes.into(),
-                is_sync,
                 discard_from_track,
-            })
+            });
+            self.frame_idx = self.frame_idx.wrapping_add(1);
+
+            match status {
+                NvencEncodePictureStatus::OutputAvailable => {
+                    Ok(vec![self.drain_one_pending_output()?])
+                }
+                NvencEncodePictureStatus::NeedMoreInput => Ok(Vec::new()),
+            }
         }
     }
 
+    pub fn encode_texture(
+        &mut self,
+        texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        timestamp_90k: u64,
+        force_idr: bool,
+        discard_from_track: bool,
+    ) -> Result<HevcAccessUnit, BackendError> {
+        let mut outputs =
+            self.submit_texture(texture, timestamp_90k, force_idr, discard_from_track)?;
+        if outputs.len() != 1 {
+            return Err(BackendError::unsupported(
+                "NVENC synchronous encode",
+                format!("LookAheadDepth={}", self.lookahead_depth),
+                "该调用要求每次提交立即返回一个 AU；启用 Lookahead 时请使用 submit_texture/flush 延迟输出接口",
+            ));
+        }
+        Ok(outputs.remove(0))
+    }
+
+    pub fn flush(&mut self) -> Result<Vec<HevcAccessUnit>, BackendError> {
+        if self.eos_submitted {
+            return Ok(Vec::new());
+        }
+        unsafe {
+            submit_encoder_eos(&self._api, self.session.encoder)?;
+            self.eos_submitted = true;
+            let mut outputs = Vec::with_capacity(self.pending_frames.len());
+            while !self.pending_frames.is_empty() {
+                outputs.push(self.drain_one_pending_output()?);
+            }
+            Ok(outputs)
+        }
+    }
+
+    unsafe fn drain_one_pending_output(&mut self) -> Result<HevcAccessUnit, BackendError> {
+        let pending = self.pending_frames.pop_front().ok_or_else(|| {
+            BackendError::unsupported(
+                "NVENC delayed output",
+                self.input_format.label(),
+                "驱动报告有输出，但 pending frame 队列为空",
+            )
+        })?;
+        let NvencPendingFrame {
+            mut mapped,
+            mut transient_registered,
+            bitstream,
+            timestamp_90k,
+            discard_from_track,
+        } = pending;
+        let bitstream_result =
+            lock_and_copy_bitstream(&self._api, self.session.encoder, &bitstream);
+        let unmap_status = mapped.unmap_now();
+        let unregister_status = transient_registered
+            .as_mut()
+            .map(|registered| registered.unregister_now());
+        self.free_bitstreams.push(bitstream);
+
+        let output = bitstream_result?;
+        nvenc_check("NvEncUnmapInputResource", unmap_status)?;
+        if let Some(status) = unregister_status {
+            nvenc_check("NvEncUnregisterResource(transient)", status)?;
+        }
+        if output.output_timestamp_90k != timestamp_90k {
+            return Err(BackendError::unsupported(
+                "NVENC delayed output timestamp",
+                format!(
+                    "submitted={} returned={}",
+                    timestamp_90k, output.output_timestamp_90k
+                ),
+                "NVENC 没有按输入 VFR 时间戳返回对应输出，拒绝重写或合成时间戳",
+            ));
+        }
+        if output.bytes.is_empty() {
+            return Err(BackendError::unsupported(
+                "NVENC encode",
+                self.input_format.label(),
+                "返回空 HEVC bitstream",
+            ));
+        }
+        if !output.annex_b_start_code_seen {
+            return Err(BackendError::unsupported(
+                "NVENC encode",
+                "HEVC Annex-B bitstream",
+                "bitstream 中未发现 Annex-B start code，无法交给当前 MP4 muxer",
+            ));
+        }
+        if !self.vui_verified {
+            verify_hevc_vui_matches(&output.bytes, self.expected_color)?;
+            self.vui_verified = true;
+        }
+        let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
+        Ok(HevcAccessUnit {
+            timestamp_90k,
+            data: output.bytes.into(),
+            is_sync,
+            discard_from_track,
+        })
+    }
+
     pub fn shutdown(mut self) -> Result<(), BackendError> {
+        if !self.pending_frames.is_empty() {
+            return Err(BackendError::unsupported(
+                "NVENC shutdown",
+                format!("pending_frames={}", self.pending_frames.len()),
+                "正常关闭前必须调用 flush 取回全部延迟输出；快速取消由 Drop 中止会话",
+            ));
+        }
         let mut failures = Vec::new();
         for (_, mut resource) in self.registered_inputs.drain() {
             let status = unsafe { resource.unregister_now() };
@@ -609,11 +845,13 @@ impl NvencD3d11Encoder {
                 failures.push(format!("NvEncUnregisterResource status={status}"));
             }
         }
-        let bitstream_status = unsafe { self.bitstream.destroy_now() };
-        if bitstream_status != NV_ENC_SUCCESS {
-            failures.push(format!(
-                "NvEncDestroyBitstreamBuffer status={bitstream_status}"
-            ));
+        for mut bitstream in self.free_bitstreams.drain(..) {
+            let bitstream_status = unsafe { bitstream.destroy_now() };
+            if bitstream_status != NV_ENC_SUCCESS {
+                failures.push(format!(
+                    "NvEncDestroyBitstreamBuffer status={bitstream_status}"
+                ));
+            }
         }
         let encoder_status = unsafe { self.session.destroy_now() };
         if encoder_status != NV_ENC_SUCCESS {
@@ -627,6 +865,160 @@ impl NvencD3d11Encoder {
                 self.input_format.label(),
                 failures.join(" | "),
             ))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NvencD3d11Encoder {
+    fn drop(&mut self) {
+        if self.session.encoder.is_null() {
+            return;
+        }
+        unsafe {
+            // Fast cancellation intentionally skips EOS/bitstream draining. Destroying
+            // the encoder first makes all child handles invalid; disarm their Drop
+            // implementations so they do not call back into a dead NVENC session.
+            let _ = self.session.destroy_now();
+            for mut pending in self.pending_frames.drain(..) {
+                pending.mapped.abandon();
+                if let Some(registered) = pending.transient_registered.as_mut() {
+                    registered.abandon();
+                }
+                pending.bitstream.abandon();
+            }
+            for bitstream in &mut self.free_bitstreams {
+                bitstream.abandon();
+            }
+            for resource in self.registered_inputs.values_mut() {
+                resource.abandon();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub enum NvencTextureEncoder {
+    D3d11(NvencD3d11Encoder),
+    Cuda(cuda::NvencCudaInteropEncoder),
+}
+
+#[cfg(windows)]
+impl NvencTextureEncoder {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_rate_control(
+        adapter_index: u32,
+        width: u32,
+        height: u32,
+        input_format: NvencD3d11InputFormat,
+        color: NclxColorMetadata,
+        rate_control: &RateControlConfig,
+        frame_rate_num: u32,
+        frame_rate_den: u32,
+    ) -> Result<Self, BackendError> {
+        if input_format.requires_cuda_interop() {
+            unsafe {
+                cuda::NvencCudaInteropEncoder::open_with_rate_control(
+                    adapter_index,
+                    width,
+                    height,
+                    input_format,
+                    color,
+                    rate_control,
+                    frame_rate_num,
+                    frame_rate_den,
+                )
+                .map(Self::Cuda)
+            }
+        } else {
+            NvencD3d11Encoder::open_with_rate_control(
+                adapter_index,
+                width,
+                height,
+                input_format,
+                color,
+                rate_control,
+                frame_rate_num,
+                frame_rate_den,
+            )
+            .map(Self::D3d11)
+        }
+    }
+
+    pub fn device(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Device {
+        match self {
+            Self::D3d11(encoder) => encoder.device(),
+            Self::Cuda(encoder) => encoder.device(),
+        }
+    }
+
+    pub fn context(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext {
+        match self {
+            Self::D3d11(encoder) => encoder.context(),
+            Self::Cuda(encoder) => encoder.context(),
+        }
+    }
+
+    pub fn input_format(&self) -> NvencD3d11InputFormat {
+        match self {
+            Self::D3d11(encoder) => encoder.input_format(),
+            Self::Cuda(encoder) => encoder.input_format(),
+        }
+    }
+
+    pub fn registration_mode(&self) -> &'static str {
+        match self {
+            Self::D3d11(encoder) => encoder.registration_mode(),
+            Self::Cuda(encoder) => encoder.registration_mode(),
+        }
+    }
+
+    pub fn uses_cuda_interop(&self) -> bool {
+        matches!(self, Self::Cuda(_))
+    }
+
+    pub fn lookahead_depth(&self) -> u16 {
+        match self {
+            Self::D3d11(encoder) => encoder.lookahead_depth(),
+            Self::Cuda(encoder) => encoder.lookahead_depth(),
+        }
+    }
+
+    pub fn pending_frame_count(&self) -> usize {
+        match self {
+            Self::D3d11(encoder) => encoder.pending_frame_count(),
+            Self::Cuda(encoder) => encoder.pending_frame_count(),
+        }
+    }
+
+    pub fn submit_texture(
+        &mut self,
+        texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        timestamp_90k: u64,
+        force_idr: bool,
+        discard_from_track: bool,
+    ) -> Result<Vec<HevcAccessUnit>, BackendError> {
+        match self {
+            Self::D3d11(encoder) => {
+                encoder.submit_texture(texture, timestamp_90k, force_idr, discard_from_track)
+            }
+            Self::Cuda(encoder) => {
+                encoder.submit_texture(texture, timestamp_90k, force_idr, discard_from_track)
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> Result<Vec<HevcAccessUnit>, BackendError> {
+        match self {
+            Self::D3d11(encoder) => encoder.flush(),
+            Self::Cuda(encoder) => encoder.flush(),
+        }
+    }
+
+    pub fn shutdown(self) -> Result<(), BackendError> {
+        match self {
+            Self::D3d11(encoder) => encoder.shutdown(),
+            Self::Cuda(encoder) => encoder.shutdown(),
         }
     }
 }
@@ -831,8 +1223,13 @@ fn probe_current_display_routes_for_adapter(
             match display {
                 Ok((desc1, display)) => {
                     for chroma in ChromaSampling::all() {
-                        let chroma_alignment_supported = chroma != ChromaSampling::Yuv420
-                            || (width.is_multiple_of(2) && height.is_multiple_of(2));
+                        let chroma_alignment_supported = match chroma {
+                            ChromaSampling::Yuv420 => {
+                                width.is_multiple_of(2) && height.is_multiple_of(2)
+                            }
+                            ChromaSampling::Yuv422 => width.is_multiple_of(2),
+                            ChromaSampling::Yuv444 => true,
+                        };
                         let matched = chroma_alignment_supported
                             .then(|| {
                                 nvenc_display_route_choices(chroma, display)
@@ -886,7 +1283,7 @@ fn probe_current_display_routes_for_adapter(
                                     )
                                 } else {
                                     format!(
-                                        "当前输出 {}x{} 不满足 NV12/P010 4:2:0 偶数尺寸要求",
+                                        "当前输出 {}x{} 不满足所选色度采样的尺寸对齐要求",
                                         width, height
                                     )
                                 },
@@ -1126,8 +1523,8 @@ fn nvenc_display_route_choices(
         (ChromaSampling::Yuv420, true) => vec![("P010", 10, "Main10")],
         (ChromaSampling::Yuv422, false) => vec![("NV16", 8, "FRExt")],
         (ChromaSampling::Yuv422, true) => vec![("P210", 10, "FRExt")],
-        // 优先 packed AYUV；若驱动只暴露 planar YUV444，后续生产路径需要在
-        // GPU writer 中按最终 input_format 选择 layout。
+        // SDR 4:4:4 优先 packed AYUV；驱动不暴露 AYUV 时使用已实现的 planar
+        // YUV444 CUDA external-memory writer。
         (ChromaSampling::Yuv444, false) => vec![("AYUV", 8, "FRExt"), ("YUV444", 8, "FRExt")],
         (ChromaSampling::Yuv444, true) => vec![("YUV444_10BIT", 10, "FRExt")],
     }
@@ -1328,6 +1725,33 @@ unsafe fn probe_adapter(
             .map(rate_controls_from_mask)
             .unwrap_or_default();
         routes = build_route_candidates(&input_formats, &profiles, &caps, &rate_controls);
+        if let Some(input_format) =
+            routes
+                .iter()
+                .find_map(|route| match route.input_format.as_str() {
+                    "NV16" => Some(NvencD3d11InputFormat::Nv16),
+                    "P210" => Some(NvencD3d11InputFormat::P210),
+                    "YUV444" => Some(NvencD3d11InputFormat::Yuv444),
+                    "YUV444_10BIT" => Some(NvencD3d11InputFormat::Yuv44410),
+                    _ => None,
+                })
+        {
+            let mut adapter_luid = [0u8; 8];
+            adapter_luid[..4].copy_from_slice(&adapter.luid_low.to_ne_bytes());
+            adapter_luid[4..].copy_from_slice(&adapter.luid_high.to_ne_bytes());
+            if let Err(err) =
+                cuda::probe_external_texture_interop(adapter_luid, session.device(), input_format)
+            {
+                let reason = format!("CUDA external-memory/keyed-mutex 生产前提探测失败：{err}");
+                warnings.push(reason.clone());
+                for route in &mut routes {
+                    if nvenc_route_requires_cuda(&route.input_format) {
+                        route.production_record_supported = false;
+                        route.production_blocker = Some(reason.clone());
+                    }
+                }
+            }
+        }
         match probe_current_display_routes_for_adapter(adapter, &routes, &caps) {
             Ok(display_routes) => current_display_routes = display_routes,
             Err(err) => warnings.push(format!("当前显示器 NVENC route 探测失败：{err}")),
@@ -1352,6 +1776,10 @@ unsafe fn probe_adapter(
         d3d11_texture_input_seen: hevc_supported,
         warnings,
     })
+}
+
+fn nvenc_route_requires_cuda(input_format: &str) -> bool {
+    matches!(input_format, "NV16" | "P210" | "YUV444" | "YUV444_10BIT")
 }
 
 #[cfg(windows)]
@@ -1562,7 +1990,11 @@ fn build_route_candidates(
                    note: &'static str| {
         let supported =
             formats.contains(format) && profile_set.contains(profile) && extra_supported;
-        let production_record_supported = supported && matches!(format, "NV12" | "P010" | "AYUV");
+        let production_record_supported = supported
+            && matches!(
+                format,
+                "NV12" | "P010" | "NV16" | "P210" | "AYUV" | "YUV444" | "YUV444_10BIT"
+            );
         out.push(NvencRouteProbe {
             input_format: format.to_owned(),
             chroma,
@@ -1570,14 +2002,8 @@ fn build_route_candidates(
             profile: profile.to_owned(),
             query_supported: supported,
             production_record_supported,
-            production_blocker: (!production_record_supported).then(|| {
-                if matches!(format, "NV16" | "P210" | "YUV444" | "YUV444_10BIT") {
-                    "NVENC 生产录制路径已接入 NV12/P010/AYUV；NV16/P210/planar YUV444 仍为 probe-only，避免暴露没有原生 DXGI texture layout 的格式"
-                        .to_owned()
-                } else {
-                    "NVENC SDK/驱动未同时确认该 input format/profile/caps".to_owned()
-                }
-            }),
+            production_blocker: (!production_record_supported)
+                .then(|| "NVENC SDK/驱动未同时确认该 input format/profile/caps".to_owned()),
             rate_controls: if supported {
                 rate_controls.to_vec()
             } else {
@@ -1617,7 +2043,7 @@ fn build_route_candidates(
         8,
         "FRExt",
         yuv422,
-        "NVENC HEVC RExt 4:2:2 8-bit D3D11 input",
+        "NVENC HEVC RExt 4:2:2 8-bit CUDA-array input",
     );
     add(
         "P210",
@@ -1625,7 +2051,7 @@ fn build_route_candidates(
         10,
         "FRExt",
         yuv422 && ten_bit,
-        "NVENC HEVC RExt 4:2:2 10-bit D3D11 input",
+        "NVENC HEVC RExt 4:2:2 10-bit CUDA-array input",
     );
     add(
         "AYUV",
@@ -1641,7 +2067,7 @@ fn build_route_candidates(
         8,
         "FRExt",
         yuv444,
-        "NVENC HEVC RExt 4:4:4 8-bit planar input",
+        "NVENC HEVC RExt 4:4:4 8-bit planar CUDA-array input",
     );
     add(
         "YUV444_10BIT",
@@ -1649,7 +2075,7 @@ fn build_route_candidates(
         10,
         "FRExt",
         yuv444 && ten_bit,
-        "NVENC HEVC RExt 4:4:4 10-bit planar input",
+        "NVENC HEVC RExt 4:4:4 10-bit planar CUDA-array input",
     );
     out.into_iter()
         .filter(|route| route.query_supported)
@@ -1660,16 +2086,15 @@ fn nvenc_rate_control_features(
     rate_controls: &[RateControlMethod],
     caps: &NvencCapsInfo,
 ) -> Vec<NvencRateControlFeatureProbe> {
+    let lookahead_cap = caps.lookahead.unwrap_or(false);
     let temporal_aq_cap = caps.temporal_aq.unwrap_or(false);
     rate_controls
         .iter()
         .copied()
         .map(|method| NvencRateControlFeatureProbe {
             method,
-            // HW cap alone is insufficient: lookahead returns NEED_MORE_INPUT and
-            // requires multiple output buffers plus ordered delayed-output draining.
-            // The current synchronous production encoder intentionally exposes none.
-            lookahead: false,
+            lookahead: lookahead_cap
+                && matches!(method, RateControlMethod::Cbr | RateControlMethod::Vbr),
             vbv: matches!(method, RateControlMethod::Cbr | RateControlMethod::Vbr),
             spatial_aq: true,
             temporal_aq: temporal_aq_cap,
@@ -1721,10 +2146,16 @@ where
 }
 
 #[cfg(windows)]
-unsafe fn open_d3d11_session_for_adapter(
-    api: &NvencApi,
+unsafe fn cached_d3d11_device_for_adapter(
     adapter_index: u32,
-) -> Result<NvencSession, BackendError> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        [u8; 8],
+    ),
+    BackendError,
+> {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -1808,6 +2239,20 @@ unsafe fn open_d3d11_session_for_adapter(
             (device, context)
         }
     };
+    let mut luid = [0u8; 8];
+    luid[..4].copy_from_slice(&adapter_desc.AdapterLuid.LowPart.to_ne_bytes());
+    luid[4..].copy_from_slice(&adapter_desc.AdapterLuid.HighPart.to_ne_bytes());
+    Ok((device, context, luid))
+}
+
+#[cfg(windows)]
+unsafe fn open_d3d11_session_for_adapter(
+    api: &NvencApi,
+    adapter_index: u32,
+) -> Result<NvencSession, BackendError> {
+    use windows::core::Interface;
+
+    let (device, context, _) = cached_d3d11_device_for_adapter(adapter_index)?;
 
     let open = api
         .functions
@@ -2011,7 +2456,11 @@ unsafe fn make_low_latency_hevc_config_from_base(
     let (profile, bit_depth, chroma_format_idc) = match input_format {
         NvencD3d11InputFormat::Nv12 => (NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_BIT_DEPTH_8, 1),
         NvencD3d11InputFormat::P010 => (NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_BIT_DEPTH_10, 1),
+        NvencD3d11InputFormat::Nv16 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 2),
+        NvencD3d11InputFormat::P210 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 2),
         NvencD3d11InputFormat::Ayuv => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 3),
+        NvencD3d11InputFormat::Yuv444 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 3),
+        NvencD3d11InputFormat::Yuv44410 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 3),
     };
     config.write_u32(0, NV_ENC_CONFIG_VER);
     config.write_guid(NV_ENC_CONFIG_PROFILE_GUID_OFFSET, profile);
@@ -2179,7 +2628,7 @@ unsafe fn create_synthetic_input_texture(
     let pitch = input_format.dxgi_pitch_bytes(width) as usize;
     let mut pixels = vec![0u8; input_format.frame_size_bytes(width, height)];
     match input_format {
-        NvencD3d11InputFormat::Nv12 => {
+        NvencD3d11InputFormat::Nv12 | NvencD3d11InputFormat::Nv16 => {
             for y in 0..height_usize {
                 let row = &mut pixels[y * pitch..y * pitch + width_usize];
                 for (x, value) in row.iter_mut().enumerate() {
@@ -2188,7 +2637,12 @@ unsafe fn create_synthetic_input_texture(
                 }
             }
             let chroma_start = pitch * height_usize;
-            for y in 0..(height_usize / 2) {
+            let chroma_rows = if input_format == NvencD3d11InputFormat::Nv12 {
+                height_usize / 2
+            } else {
+                height_usize
+            };
+            for y in 0..chroma_rows {
                 let row =
                     &mut pixels[chroma_start + y * pitch..chroma_start + y * pitch + width_usize];
                 for pair in row.chunks_exact_mut(2) {
@@ -2197,7 +2651,7 @@ unsafe fn create_synthetic_input_texture(
                 }
             }
         }
-        NvencD3d11InputFormat::P010 => {
+        NvencD3d11InputFormat::P010 | NvencD3d11InputFormat::P210 => {
             for y in 0..height_usize {
                 let row = &mut pixels[y * pitch..y * pitch + width_usize * 2];
                 for (x, px) in row.chunks_exact_mut(2).enumerate() {
@@ -2209,13 +2663,47 @@ unsafe fn create_synthetic_input_texture(
                 }
             }
             let chroma_start = pitch * height_usize;
-            for y in 0..(height_usize / 2) {
+            let chroma_rows = if input_format == NvencD3d11InputFormat::P010 {
+                height_usize / 2
+            } else {
+                height_usize
+            };
+            for y in 0..chroma_rows {
                 let row = &mut pixels
                     [chroma_start + y * pitch..chroma_start + y * pitch + width_usize * 2];
                 for pair in row.chunks_exact_mut(4) {
                     let neutral = (512u16 << 6).to_le_bytes();
                     pair[0..2].copy_from_slice(&neutral);
                     pair[2..4].copy_from_slice(&neutral);
+                }
+            }
+        }
+        NvencD3d11InputFormat::Yuv444 => {
+            for y in 0..height_usize {
+                let row = &mut pixels[y * pitch..(y + 1) * pitch];
+                for (x, value) in row.iter_mut().enumerate() {
+                    *value = ((x * 255) / width_usize.max(1)) as u8;
+                }
+            }
+            let u_start = pitch * height_usize;
+            let v_start = u_start + pitch * height_usize;
+            pixels[u_start..v_start].fill(128);
+            pixels[v_start..v_start + pitch * height_usize].fill(128);
+        }
+        NvencD3d11InputFormat::Yuv44410 => {
+            for y in 0..height_usize {
+                let row = &mut pixels[y * pitch..(y + 1) * pitch];
+                for (x, value) in row.chunks_exact_mut(2).enumerate() {
+                    let sample = (((x * 1023) / width_usize.max(1)) as u16) << 6;
+                    value.copy_from_slice(&sample.to_le_bytes());
+                }
+            }
+            let plane_bytes = pitch * height_usize;
+            let neutral = (512u16 << 6).to_le_bytes();
+            for plane in 1..=2 {
+                let start = plane * plane_bytes;
+                for value in pixels[start..start + plane_bytes].chunks_exact_mut(2) {
+                    value.copy_from_slice(&neutral);
                 }
             }
         }
@@ -2233,7 +2721,7 @@ unsafe fn create_synthetic_input_texture(
 
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
-        Height: height,
+        Height: input_format.texture_height(height),
         MipLevels: 1,
         ArraySize: 1,
         Format: input_format.dxgi_format(),
@@ -2265,6 +2753,161 @@ unsafe fn create_synthetic_input_texture(
 }
 
 #[cfg(windows)]
+unsafe fn open_cuda_session(
+    api: &NvencApi,
+    context: *mut c_void,
+) -> Result<NvencCudaSession, BackendError> {
+    let open = api
+        .functions
+        .nvEncOpenEncodeSessionEx
+        .ok_or_else(|| nvenc_missing("NvEncOpenEncodeSessionEx"))?;
+    let destroy = api
+        .functions
+        .nvEncDestroyEncoder
+        .ok_or_else(|| nvenc_missing("NvEncDestroyEncoder"))?;
+    let mut params = NvEncOpenEncodeSessionExParams {
+        version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+        deviceType: NV_ENC_DEVICE_TYPE_CUDA,
+        device: context,
+        reserved: ptr::null_mut(),
+        apiVersion: NVENCAPI_VERSION,
+        reserved1: [0; 253],
+        reserved2: [ptr::null_mut(); 64],
+    };
+    let mut encoder = ptr::null_mut();
+    nvenc_check(
+        "NvEncOpenEncodeSessionEx(CUDA)",
+        open(&mut params, &mut encoder),
+    )?;
+    if encoder.is_null() {
+        return Err(BackendError::unsupported(
+            "NVENC CUDA",
+            "NvEncOpenEncodeSessionEx",
+            "返回空 encoder handle",
+        ));
+    }
+    Ok(NvencCudaSession {
+        encoder,
+        destroy: Some(destroy),
+    })
+}
+
+#[cfg(windows)]
+unsafe fn create_synthetic_input_buffer(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    width: u32,
+    height: u32,
+    input_format: NvencD3d11InputFormat,
+) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Buffer, BackendError> {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT,
+    };
+
+    let byte_width = input_format.frame_size_bytes(width, height);
+    let byte_width_u32 = u32::try_from(byte_width).map_err(|_| {
+        BackendError::unsupported(
+            "NVENC synthetic D3D11 buffer",
+            format!("{} bytes", byte_width),
+            "输入资源超过 D3D11 buffer 的 u32 ByteWidth",
+        )
+    })?;
+    let pixels = vec![0u8; byte_width];
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: byte_width_u32,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: 0,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: pixels.as_ptr() as *const c_void,
+        SysMemPitch: 0,
+        SysMemSlicePitch: 0,
+    };
+    let mut buffer = None;
+    device
+        .CreateBuffer(&desc, Some(&initial), Some(&mut buffer))
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::CreateBuffer(NVENC synthetic planar input)",
+            message: err.to_string(),
+        })?;
+    buffer.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateBuffer(NVENC synthetic planar input)",
+        message: "返回空 buffer".to_owned(),
+    })
+}
+
+#[cfg(windows)]
+unsafe fn create_synthetic_external_input_texture(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    width: u32,
+    height: u32,
+    input_format: NvencD3d11InputFormat,
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        windows::Win32::Foundation::HANDLE,
+    ),
+    BackendError,
+> {
+    use windows::Win32::Foundation::GENERIC_ALL;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::IDXGIResource1;
+    use windows::core::{Interface, PCWSTR};
+
+    let pixels = vec![0u8; input_format.frame_size_bytes(width, height)];
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: input_format.texture_height(height),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: input_format.dxgi_format(),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0)
+            as u32,
+    };
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: pixels.as_ptr() as *const c_void,
+        SysMemPitch: input_format.dxgi_pitch_bytes(width),
+        SysMemSlicePitch: 0,
+    };
+    let mut texture = None;
+    device
+        .CreateTexture2D(&desc, Some(&initial), Some(&mut texture))
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::CreateTexture2D(NVENC CUDA external memory)",
+            message: err.to_string(),
+        })?;
+    let texture = texture.ok_or_else(|| BackendError::WindowsApi {
+        func: "CreateTexture2D(NVENC CUDA external memory)",
+        message: "返回空 texture".to_owned(),
+    })?;
+    let resource: IDXGIResource1 = texture.cast().map_err(|err| BackendError::WindowsApi {
+        func: "ID3D11Texture2D::cast<IDXGIResource1>(NVENC CUDA external memory)",
+        message: err.to_string(),
+    })?;
+    let handle = resource
+        .CreateSharedHandle(None, GENERIC_ALL.0, PCWSTR::null())
+        .map_err(|err| BackendError::WindowsApi {
+            func: "IDXGIResource1::CreateSharedHandle(NVENC CUDA external memory)",
+            message: err.to_string(),
+        })?;
+    Ok((texture, handle))
+}
+
+#[cfg(windows)]
 unsafe fn validate_d3d11_input_texture(
     texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     width: u32,
@@ -2273,7 +2916,10 @@ unsafe fn validate_d3d11_input_texture(
 ) -> Result<(), BackendError> {
     let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
     texture.GetDesc(&mut desc);
-    if desc.Width != width || desc.Height != height || desc.Format != input_format.dxgi_format() {
+    if desc.Width != width
+        || desc.Height != input_format.texture_height(height)
+        || desc.Format != input_format.dxgi_format()
+    {
         return Err(BackendError::unsupported(
             "NVENC D3D11 input texture",
             format!(
@@ -2281,10 +2927,12 @@ unsafe fn validate_d3d11_input_texture(
                 desc.Width, desc.Height, desc.Format.0
             ),
             format!(
-                "需要 {}x{} {}，禁止 CPU/staging/raw-frame fallback",
+                "需要 storage={}x{} {}，encode={}x{}，禁止 CPU/staging/raw-frame fallback",
                 width,
-                height,
-                input_format.label()
+                input_format.texture_height(height),
+                input_format.label(),
+                width,
+                height
             ),
         ));
     }
@@ -2296,6 +2944,26 @@ unsafe fn register_d3d11_input_texture(
     api: &NvencApi,
     encoder: *mut c_void,
     texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    width: u32,
+    height: u32,
+    input_format: NvencD3d11InputFormat,
+) -> Result<NvencRegisteredResource, BackendError> {
+    use windows::core::Interface;
+
+    let resource = texture
+        .cast::<windows::Win32::Graphics::Direct3D11::ID3D11Resource>()
+        .map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Texture2D::cast<ID3D11Resource>(NVENC input)",
+            message: err.to_string(),
+        })?;
+    register_d3d11_input_resource(api, encoder, &resource, width, height, input_format)
+}
+
+#[cfg(windows)]
+unsafe fn register_d3d11_input_resource(
+    api: &NvencApi,
+    encoder: *mut c_void,
+    resource: &windows::Win32::Graphics::Direct3D11::ID3D11Resource,
     width: u32,
     height: u32,
     input_format: NvencD3d11InputFormat,
@@ -2320,7 +2988,7 @@ unsafe fn register_d3d11_input_texture(
     // 需要这里保持 0，否则部分格式（尤其 P010）会被判为 invalid param。
     params.pitch = 0;
     params.subResourceIndex = 0;
-    params.resourceToRegister = texture.as_raw();
+    params.resourceToRegister = resource.as_raw();
     params.bufferFormat = input_format.buffer_format();
     params.bufferUsage = NV_ENC_INPUT_IMAGE;
     nvenc_check(
@@ -2338,7 +3006,53 @@ unsafe fn register_d3d11_input_texture(
         encoder,
         resource: params.registeredResource,
         unregister: Some(unregister),
-        _texture: texture.clone(),
+        _resource: Some(resource.clone()),
+    })
+}
+
+#[cfg(windows)]
+unsafe fn register_cuda_array_input(
+    api: &NvencApi,
+    encoder: *mut c_void,
+    array: *mut c_void,
+    width: u32,
+    height: u32,
+    input_format: NvencD3d11InputFormat,
+) -> Result<NvencRegisteredResource, BackendError> {
+    let register = api
+        .functions
+        .nvEncRegisterResource
+        .ok_or_else(|| nvenc_missing("NvEncRegisterResource"))?;
+    let unregister = api
+        .functions
+        .nvEncUnregisterResource
+        .ok_or_else(|| nvenc_missing("NvEncUnregisterResource"))?;
+    let mut params: NvEncRegisterResource = std::mem::zeroed();
+    params.version = NV_ENC_REGISTER_RESOURCE_VER;
+    params.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
+    params.width = width;
+    params.height = height;
+    params.pitch = input_format.dxgi_pitch_bytes(width);
+    params.subResourceIndex = 0;
+    params.resourceToRegister = array;
+    params.bufferFormat = input_format.buffer_format();
+    params.bufferUsage = NV_ENC_INPUT_IMAGE;
+    nvenc_check(
+        "NvEncRegisterResource(CUDA array)",
+        register(encoder, &mut params),
+    )?;
+    if params.registeredResource.is_null() {
+        return Err(BackendError::unsupported(
+            "NVENC CUDA encode",
+            "NvEncRegisterResource",
+            "返回空 registeredResource",
+        ));
+    }
+    Ok(NvencRegisteredResource {
+        encoder,
+        resource: params.registeredResource,
+        unregister: Some(unregister),
+        _resource: None,
     })
 }
 
@@ -2379,6 +3093,13 @@ unsafe fn map_input_resource(
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvencEncodePictureStatus {
+    OutputAvailable,
+    NeedMoreInput,
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn encode_one_d3d11_frame(
     api: &NvencApi,
@@ -2391,7 +3112,7 @@ unsafe fn encode_one_d3d11_frame(
     frame_idx: u32,
     timestamp_90k: u64,
     force_idr: bool,
-) -> Result<(), BackendError> {
+) -> Result<NvencEncodePictureStatus, BackendError> {
     let encode = api
         .functions
         .nvEncEncodePicture
@@ -2417,10 +3138,33 @@ unsafe fn encode_one_d3d11_frame(
         mapped.format
     };
     params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    nvenc_check(
-        "NvEncEncodePicture(D3D11 texture)",
-        encode(encoder, &mut params),
-    )
+    match encode(encoder, &mut params) {
+        NV_ENC_SUCCESS => Ok(NvencEncodePictureStatus::OutputAvailable),
+        NV_ENC_ERR_NEED_MORE_INPUT => Ok(NvencEncodePictureStatus::NeedMoreInput),
+        status => {
+            nvenc_check("NvEncEncodePicture(D3D11 texture)", status)?;
+            unreachable!()
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn submit_encoder_eos(api: &NvencApi, encoder: *mut c_void) -> Result<(), BackendError> {
+    let encode = api
+        .functions
+        .nvEncEncodePicture
+        .ok_or_else(|| nvenc_missing("NvEncEncodePicture"))?;
+    let mut params: NvEncPicParams = std::mem::zeroed();
+    params.version = NV_ENC_PIC_PARAMS_VER;
+    params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+    nvenc_check("NvEncEncodePicture(EOS)", encode(encoder, &mut params))
+}
+
+#[cfg(windows)]
+struct NvencLockedOutput {
+    bytes: Vec<u8>,
+    annex_b_start_code_seen: bool,
+    output_timestamp_90k: u64,
 }
 
 #[cfg(windows)]
@@ -2428,7 +3172,7 @@ unsafe fn lock_and_copy_bitstream(
     api: &NvencApi,
     encoder: *mut c_void,
     bitstream: &NvencBitstreamBuffer,
-) -> Result<(Vec<u8>, bool), BackendError> {
+) -> Result<NvencLockedOutput, BackendError> {
     let lock = api
         .functions
         .nvEncLockBitstream
@@ -2462,7 +3206,11 @@ unsafe fn lock_and_copy_bitstream(
         .windows(4)
         .any(|window| window == [0x00, 0x00, 0x00, 0x01]);
     nvenc_check("NvEncUnlockBitstream", locked.unlock_now())?;
-    Ok((bytes, annex_b_start_code_seen))
+    Ok(NvencLockedOutput {
+        bytes,
+        annex_b_start_code_seen,
+        output_timestamp_90k: params.outputTimeStamp,
+    })
 }
 
 #[cfg(windows)]
@@ -2471,6 +3219,34 @@ struct NvencSession {
     destroy: Option<unsafe extern "system" fn(*mut c_void) -> i32>,
     _device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     _context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+}
+
+#[cfg(windows)]
+struct NvencCudaSession {
+    encoder: *mut c_void,
+    destroy: Option<unsafe extern "system" fn(*mut c_void) -> i32>,
+}
+
+#[cfg(windows)]
+impl NvencCudaSession {
+    unsafe fn destroy_now(&mut self) -> i32 {
+        if self.encoder.is_null() {
+            return NV_ENC_SUCCESS;
+        }
+        let encoder = std::mem::replace(&mut self.encoder, ptr::null_mut());
+        self.destroy
+            .map(|destroy| destroy(encoder))
+            .unwrap_or(NV_ENC_SUCCESS)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NvencCudaSession {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.destroy_now();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2521,6 +3297,12 @@ impl NvencBitstreamBuffer {
             .map(|destroy| destroy(self.encoder, buffer))
             .unwrap_or(NV_ENC_SUCCESS)
     }
+
+    unsafe fn abandon(&mut self) {
+        self.encoder = ptr::null_mut();
+        self.buffer = ptr::null_mut();
+        self.destroy = None;
+    }
 }
 
 #[cfg(windows)]
@@ -2538,7 +3320,7 @@ struct NvencRegisteredResource {
     resource: *mut c_void,
     unregister: Option<unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32>,
     // NVENC requires the external D3D11 resource to outlive unregister.
-    _texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    _resource: Option<windows::Win32::Graphics::Direct3D11::ID3D11Resource>,
 }
 
 #[cfg(windows)]
@@ -2551,6 +3333,12 @@ impl NvencRegisteredResource {
         self.unregister
             .map(|unregister| unregister(self.encoder, resource))
             .unwrap_or(NV_ENC_SUCCESS)
+    }
+
+    unsafe fn abandon(&mut self) {
+        self.encoder = ptr::null_mut();
+        self.resource = ptr::null_mut();
+        self.unregister = None;
     }
 }
 
@@ -2581,6 +3369,12 @@ impl NvencMappedInputResource {
         self.unmap
             .map(|unmap| unmap(self.encoder, mapped))
             .unwrap_or(NV_ENC_SUCCESS)
+    }
+
+    unsafe fn abandon(&mut self) {
+        self.encoder = ptr::null_mut();
+        self.mapped = ptr::null_mut();
+        self.unmap = None;
     }
 }
 
@@ -3794,7 +4588,7 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_rate_control_feature_matrix_hides_unimplemented_lookahead() {
+    fn nvenc_rate_control_feature_matrix_exposes_implemented_lookahead() {
         let caps = NvencCapsInfo {
             lookahead: Some(true),
             temporal_aq: Some(true),
@@ -3812,7 +4606,7 @@ mod tests {
             .iter()
             .find(|feature| feature.method == RateControlMethod::Cbr)
             .unwrap();
-        assert!(!cbr.lookahead);
+        assert!(cbr.lookahead);
         assert!(cbr.vbv);
         assert!(cbr.spatial_aq);
         assert!(!cbr.target_quality);
@@ -3821,7 +4615,7 @@ mod tests {
             .iter()
             .find(|feature| feature.method == RateControlMethod::Vbr)
             .unwrap();
-        assert!(!vbr.lookahead);
+        assert!(vbr.lookahead);
         assert!(vbr.vbv);
         assert!(vbr.target_quality);
 
@@ -3832,29 +4626,6 @@ mod tests {
         assert!(!cqp.lookahead);
         assert!(!cqp.vbv);
         assert!(!cqp.target_quality);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn nvenc_encoder_rejects_lookahead_before_opening_driver_session() {
-        let cfg = RateControlConfig {
-            look_ahead_depth: 1,
-            ..Default::default()
-        };
-        let err = match NvencD3d11Encoder::open_with_rate_control(
-            0,
-            1_280,
-            720,
-            NvencD3d11InputFormat::P010,
-            NclxColorMetadata::bt2020_pq(false),
-            &cfg,
-            60,
-            1,
-        ) {
-            Ok(_) => panic!("当前单 bitstream encoder 不应接受 lookahead"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("延迟输出队列"));
     }
 
     #[test]
@@ -3921,6 +4692,45 @@ mod tests {
         );
         assert_eq!(buffer_format_name(NV_ENC_BUFFER_FORMAT_NV16), "NV16");
         assert_eq!(buffer_format_name(NV_ENC_BUFFER_FORMAT_P210), "P210");
+    }
+
+    #[test]
+    fn nvenc_lookahead_depth_uses_route_surface_budget() {
+        let route = |width: i32, height: i32, input_format: &str| NvencCurrentDisplayRouteInfo {
+            adapter_index: 0,
+            adapter_luid: String::new(),
+            output_index: 0,
+            rotation: 1,
+            color_space: 0,
+            bits_per_color: 10,
+            desktop_left: 0,
+            desktop_top: 0,
+            desktop_right: width,
+            desktop_bottom: height,
+            chroma: ChromaSampling::Yuv444,
+            input_format: input_format.to_owned(),
+            bit_depth: 10,
+            profile: "FRExt".to_owned(),
+            nclx_colour_primaries: 9,
+            nclx_transfer_characteristics: 16,
+            nclx_matrix_coefficients: 9,
+            nclx_full_range: true,
+            route_summary: String::new(),
+            note: String::new(),
+        };
+
+        assert_eq!(
+            lookahead_depth_max_for_current_display_route(&route(3_840, 2_160, "YUV444_10BIT")),
+            31
+        );
+        assert_eq!(
+            lookahead_depth_max_for_current_display_route(&route(7_680, 4_320, "YUV444_10BIT")),
+            15
+        );
+        assert_eq!(
+            lookahead_depth_max_for_current_display_route(&route(7_680, 4_320, "P010")),
+            15
+        );
     }
 
     #[test]
@@ -3999,6 +4809,449 @@ mod tests {
                 .unwrap()
             );
             assert!(!sample.data.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本机支持 Lookahead 的 NVIDIA 驱动；验证 NEED_MORE_INPUT、EOS drain 与 VFR 时间戳顺序"]
+    fn local_nvenc_lookahead_delayed_output_smoke() {
+        let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+        let adapter_index = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID && adapter.flags & 0x2 == 0)
+            .map(|adapter| adapter.index)
+            .expect("本机需要至少一个 NVIDIA 显示 adapter");
+
+        unsafe {
+            let width = 1_280;
+            let height = 720;
+            let input_format = NvencD3d11InputFormat::P010;
+            let color = current_display_color_for_adapter(adapter_index).unwrap();
+            let rate_control = RateControlConfig {
+                method: RateControlMethod::Cbr,
+                target_kbps: 20_000,
+                buffer_size_kb: 2_000,
+                initial_delay_kb: 1_000,
+                look_ahead_depth: 8,
+                ..Default::default()
+            };
+            let mut encoder = NvencD3d11Encoder::open_with_rate_control(
+                adapter_index,
+                width,
+                height,
+                input_format,
+                color,
+                &rate_control,
+                240,
+                1,
+            )
+            .unwrap();
+            let textures = (0..40)
+                .map(|_| {
+                    create_synthetic_input_texture(encoder.device(), width, height, input_format)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let timestamps = (0..textures.len())
+                .map(|index| (index as u64).saturating_mul(563))
+                .collect::<Vec<_>>();
+            let mut outputs = Vec::new();
+            let mut delayed_submits = 0usize;
+            for (index, texture) in textures.iter().enumerate() {
+                let ready = encoder
+                    .submit_texture(texture, timestamps[index], index == 0, false)
+                    .unwrap();
+                delayed_submits += usize::from(ready.is_empty());
+                outputs.extend(ready);
+            }
+            outputs.extend(encoder.flush().unwrap());
+
+            assert!(delayed_submits >= usize::from(rate_control.look_ahead_depth));
+            assert_eq!(outputs.len(), timestamps.len());
+            assert_eq!(encoder.pending_frame_count(), 0);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .map(|sample| sample.timestamp_90k)
+                    .collect::<Vec<_>>(),
+                timestamps
+            );
+            assert!(outputs.iter().all(|sample| !sample.data.is_empty()));
+            encoder.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "需要支持 HEVC 4:2:2/4:4:4 的 NVIDIA GPU；验证 D3D11-CUDA array 零拷贝注册和编码"]
+    fn local_nvenc_cuda_array_formats_smoke() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        use windows::core::Interface;
+
+        let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+        let adapter_index = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID && adapter.flags & 0x2 == 0)
+            .map(|adapter| adapter.index)
+            .expect("本机需要至少一个 NVIDIA 显示 adapter");
+
+        unsafe {
+            let (api, _) = NvencApi::load().unwrap();
+            let d3d_session = open_d3d11_session_for_adapter(&api, adapter_index).unwrap();
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().unwrap();
+            let adapter = factory.EnumAdapters1(adapter_index).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let mut luid = [0u8; 8];
+            luid[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_ne_bytes());
+            luid[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_ne_bytes());
+            let cuda_context = cuda::CudaPrimaryContext::for_adapter_luid(luid).unwrap();
+            let width = 1_280;
+            let height = 720;
+            for input_format in [
+                NvencD3d11InputFormat::Nv16,
+                NvencD3d11InputFormat::P210,
+                NvencD3d11InputFormat::Yuv444,
+                NvencD3d11InputFormat::Yuv44410,
+            ] {
+                let color = if matches!(
+                    input_format,
+                    NvencD3d11InputFormat::P210 | NvencD3d11InputFormat::Yuv44410
+                ) {
+                    NclxColorMetadata::bt2020_pq(true)
+                } else {
+                    NclxColorMetadata::bt709(true)
+                };
+                let texture = create_synthetic_input_texture(
+                    d3d_session.device(),
+                    width,
+                    height,
+                    input_format,
+                )
+                .unwrap();
+                let resource = texture
+                    .cast::<windows::Win32::Graphics::Direct3D11::ID3D11Resource>()
+                    .unwrap();
+                let mut cuda_resource = cuda_context.register_d3d11_resource(&resource).unwrap();
+                let array = cuda_resource.map_array().unwrap();
+                let mut encoder = open_cuda_session(&api, cuda_context.raw_context()).unwrap();
+                let rate_control = RateControlConfig {
+                    look_ahead_depth: 0,
+                    ..RateControlConfig::default()
+                };
+                initialize_low_latency_hevc_encoder(
+                    &api,
+                    encoder.encoder,
+                    width,
+                    height,
+                    input_format,
+                    color,
+                    &rate_control,
+                    60,
+                    1,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("{} CUDA NVENC init failed: {err}", input_format.label())
+                });
+                let mut bitstream = create_bitstream_buffer(&api, encoder.encoder).unwrap();
+                let mut registered = register_cuda_array_input(
+                    &api,
+                    encoder.encoder,
+                    array,
+                    width,
+                    height,
+                    input_format,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("{} CUDA array register failed: {err}", input_format.label())
+                });
+                let mut mapped = map_input_resource(&api, encoder.encoder, &registered).unwrap();
+                let status = encode_one_d3d11_frame(
+                    &api,
+                    encoder.encoder,
+                    &mapped,
+                    &bitstream,
+                    width,
+                    height,
+                    input_format,
+                    0,
+                    0,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(status, NvencEncodePictureStatus::OutputAvailable);
+                let output = lock_and_copy_bitstream(&api, encoder.encoder, &bitstream).unwrap();
+                assert!(!output.bytes.is_empty(), "{} output", input_format.label());
+                nvenc_check("NvEncUnmapInputResource", mapped.unmap_now()).unwrap();
+                nvenc_check("NvEncUnregisterResource", registered.unregister_now()).unwrap();
+                nvenc_check("NvEncDestroyBitstreamBuffer", bitstream.destroy_now()).unwrap();
+                nvenc_check("NvEncDestroyEncoder", encoder.destroy_now()).unwrap();
+                cuda_resource.unmap().unwrap();
+                println!(
+                    "D3D11-CUDA array format passed: {} pitch={} frame_bytes={} output_bytes={}",
+                    input_format.label(),
+                    input_format.dxgi_pitch_bytes(width),
+                    input_format.frame_size_bytes(width, height),
+                    output.bytes.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 NVIDIA CUDA external-memory interop；验证持久 D3D11 allocation -> CUDA array -> NVENC 性能"]
+    fn local_nvenc_cuda_external_memory_p210_smoke() {
+        use std::time::Instant;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+        let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+        let adapter_index = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID && adapter.flags & 0x2 == 0)
+            .map(|adapter| adapter.index)
+            .expect("本机需要至少一个 NVIDIA 显示 adapter");
+        unsafe {
+            let (api, _) = NvencApi::load().unwrap();
+            let (device, _immediate, _) = cached_d3d11_device_for_adapter(adapter_index).unwrap();
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().unwrap();
+            let adapter = factory.EnumAdapters1(adapter_index).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let mut luid = [0u8; 8];
+            luid[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_ne_bytes());
+            luid[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_ne_bytes());
+            let cuda_context = cuda::CudaPrimaryContext::for_adapter_luid(luid).unwrap();
+            let width = 1_920;
+            let height = 1_080;
+            let input_format = NvencD3d11InputFormat::P210;
+            let color = NclxColorMetadata::bt2020_pq(true);
+            let (_texture, handle) =
+                create_synthetic_external_input_texture(&device, width, height, input_format)
+                    .unwrap();
+            let external = cuda_context
+                .import_external_texture(
+                    handle,
+                    width,
+                    input_format.texture_height(height),
+                    input_format,
+                )
+                .unwrap();
+            let mut encoder = open_cuda_session(&api, cuda_context.raw_context()).unwrap();
+            let rate_control = RateControlConfig {
+                look_ahead_depth: 0,
+                ..RateControlConfig::default()
+            };
+            initialize_low_latency_hevc_encoder(
+                &api,
+                encoder.encoder,
+                width,
+                height,
+                input_format,
+                color,
+                &rate_control,
+                240,
+                1,
+            )
+            .unwrap();
+            let mut bitstream = create_bitstream_buffer(&api, encoder.encoder).unwrap();
+            let mut registered = register_cuda_array_input(
+                &api,
+                encoder.encoder,
+                external.array(),
+                width,
+                height,
+                input_format,
+            )
+            .unwrap();
+            let mut mapped = map_input_resource(&api, encoder.encoder, &registered).unwrap();
+            let frame_count = 120u32;
+            let started = Instant::now();
+            for frame in 0..frame_count {
+                assert_eq!(
+                    encode_one_d3d11_frame(
+                        &api,
+                        encoder.encoder,
+                        &mapped,
+                        &bitstream,
+                        width,
+                        height,
+                        input_format,
+                        frame,
+                        u64::from(frame) * 375,
+                        frame == 0,
+                    )
+                    .unwrap(),
+                    NvencEncodePictureStatus::OutputAvailable
+                );
+                let output = lock_and_copy_bitstream(&api, encoder.encoder, &bitstream).unwrap();
+                assert!(!output.bytes.is_empty());
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "CUDA external-memory P210 persistent input: frames={} total_ms={:.3} ms_per_frame={:.3}",
+                frame_count,
+                elapsed.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1000.0 / f64::from(frame_count)
+            );
+            nvenc_check("NvEncUnmapInputResource", mapped.unmap_now()).unwrap();
+            nvenc_check("NvEncUnregisterResource", registered.unregister_now()).unwrap();
+            nvenc_check("NvEncDestroyBitstreamBuffer", bitstream.destroy_now()).unwrap();
+            nvenc_check("NvEncDestroyEncoder", encoder.destroy_now()).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 NVIDIA CUDA external-memory interop 与 HEVC RExt；验证四种 planar 输入和 Lookahead 持久注册"]
+    fn local_nvenc_cuda_external_formats_lookahead_smoke() {
+        use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+        use windows::core::Interface;
+
+        let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+        let adapter_index = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID && adapter.flags & 0x2 == 0)
+            .map(|adapter| adapter.index)
+            .expect("本机需要至少一个 NVIDIA 显示 adapter");
+        unsafe {
+            for input_format in [
+                NvencD3d11InputFormat::Nv16,
+                NvencD3d11InputFormat::P210,
+                NvencD3d11InputFormat::Yuv444,
+                NvencD3d11InputFormat::Yuv44410,
+            ] {
+                let color = if matches!(
+                    input_format,
+                    NvencD3d11InputFormat::P210 | NvencD3d11InputFormat::Yuv44410
+                ) {
+                    NclxColorMetadata::bt2020_pq_full()
+                } else {
+                    NclxColorMetadata::bt709_full()
+                };
+                let rate_control = RateControlConfig {
+                    method: RateControlMethod::Cbr,
+                    target_kbps: 20_000,
+                    buffer_size_kb: 2_000,
+                    initial_delay_kb: 1_000,
+                    look_ahead_depth: 4,
+                    ..RateControlConfig::default()
+                };
+                let mut encoder = cuda::NvencCudaInteropEncoder::open_with_rate_control(
+                    adapter_index,
+                    1_280,
+                    720,
+                    input_format,
+                    color,
+                    &rate_control,
+                    120,
+                    1,
+                )
+                .unwrap_or_else(|err| panic!("{} 初始化失败：{err}", input_format.label()));
+                let textures = (0..12)
+                    .map(|_| {
+                        let (texture, unused_handle) = create_synthetic_external_input_texture(
+                            encoder.device(),
+                            1_280,
+                            720,
+                            input_format,
+                        )
+                        .unwrap();
+                        windows::Win32::Foundation::CloseHandle(unused_handle).unwrap();
+                        texture
+                    })
+                    .collect::<Vec<_>>();
+                let mutexes = textures
+                    .iter()
+                    .map(|texture| texture.cast::<IDXGIKeyedMutex>().unwrap())
+                    .collect::<Vec<_>>();
+                let timestamps = (0..textures.len())
+                    .map(|index| (index as u64).saturating_mul(750))
+                    .collect::<Vec<_>>();
+                let mut outputs = Vec::new();
+                for (index, (texture, mutex)) in textures.iter().zip(mutexes.iter()).enumerate() {
+                    mutex.AcquireSync(0, 1_000).unwrap();
+                    mutex.ReleaseSync(1).unwrap();
+                    outputs.extend(
+                        encoder
+                            .submit_texture(texture, timestamps[index], index == 0, false)
+                            .unwrap(),
+                    );
+                }
+                outputs.extend(encoder.flush().unwrap());
+                assert_eq!(outputs.len(), timestamps.len(), "{}", input_format.label());
+                assert_eq!(
+                    outputs
+                        .iter()
+                        .map(|sample| sample.timestamp_90k)
+                        .collect::<Vec<_>>(),
+                    timestamps,
+                    "{}",
+                    input_format.label()
+                );
+                encoder.shutdown().unwrap();
+                println!(
+                    "CUDA external-memory Lookahead passed: {} frames={}",
+                    input_format.label(),
+                    outputs.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 NVIDIA CUDA external-memory interop；验证快速中止释放 pending keyed mutex"]
+    fn local_nvenc_cuda_external_pending_drop_releases_keys() {
+        use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+        use windows::core::Interface;
+
+        let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
+        let adapter_index = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID && adapter.flags & 0x2 == 0)
+            .map(|adapter| adapter.index)
+            .expect("本机需要至少一个 NVIDIA 显示 adapter");
+        unsafe {
+            let rate_control = RateControlConfig {
+                look_ahead_depth: 8,
+                ..RateControlConfig::default()
+            };
+            let mut encoder = cuda::NvencCudaInteropEncoder::open_with_rate_control(
+                adapter_index,
+                1_280,
+                720,
+                NvencD3d11InputFormat::P210,
+                NclxColorMetadata::bt2020_pq_full(),
+                &rate_control,
+                120,
+                1,
+            )
+            .unwrap();
+            let mut textures = Vec::new();
+            let mut mutexes = Vec::new();
+            for index in 0..4u64 {
+                let (texture, unused_handle) = create_synthetic_external_input_texture(
+                    encoder.device(),
+                    1_280,
+                    720,
+                    NvencD3d11InputFormat::P210,
+                )
+                .unwrap();
+                windows::Win32::Foundation::CloseHandle(unused_handle).unwrap();
+                let mutex = texture.cast::<IDXGIKeyedMutex>().unwrap();
+                mutex.AcquireSync(0, 1_000).unwrap();
+                mutex.ReleaseSync(1).unwrap();
+                assert!(
+                    encoder
+                        .submit_texture(&texture, index.saturating_mul(750), index == 0, false)
+                        .unwrap()
+                        .is_empty()
+                );
+                textures.push(texture);
+                mutexes.push(mutex);
+            }
+            assert_eq!(encoder.pending_frame_count(), 4);
+            drop(encoder);
+            for mutex in &mutexes {
+                mutex.AcquireSync(0, 1_000).unwrap();
+                mutex.ReleaseSync(0).unwrap();
+            }
+            drop(textures);
         }
     }
 

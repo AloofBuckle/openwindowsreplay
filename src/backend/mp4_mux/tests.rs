@@ -190,7 +190,12 @@ fn chunk_offsets_switch_to_co64_when_needed() {
 fn fake_hevc_annex_b_access_unit() -> Vec<u8> {
     let mut out = Vec::new();
     append_fake_nal(&mut out, 32, &[1, 2, 3]); // VPS
-    append_fake_nal(&mut out, 33, &[4, 5, 6]); // SPS
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend(synthetic_sps_nal(
+        HevcCodecMetadata::main_420_8(),
+        0x6000_0000,
+        120,
+    ));
     append_fake_nal(&mut out, 34, &[7, 8, 9]); // PPS
     append_fake_nal(&mut out, 19, &[10, 11, 12]); // IDR
     out

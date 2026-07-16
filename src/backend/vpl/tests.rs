@@ -169,14 +169,19 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
     }
     let adapters = crate::backend::dxgi::enumerate_adapters().unwrap_or_default();
     let nvenc_probe = crate::backend::nvenc::probe_nvenc_adapters(&adapters);
+    let requested_chroma = match std::env::var("RUST_REPLAY_NVENC_SMOKE_CHROMA")
+        .ok()
+        .as_deref()
+    {
+        Some("422") => ChromaSampling::Yuv422,
+        Some("444") => ChromaSampling::Yuv444,
+        _ => ChromaSampling::Yuv420,
+    };
     let route_plan = nvenc_probe
         .current_display_routes
         .iter()
-        .find(|route| {
-            route.chroma == ChromaSampling::Yuv420
-                && matches!(route.input_format.as_str(), "NV12" | "P010")
-        })
-        .expect("本机需要当前显示器 NVENC NV12/P010 route");
+        .find(|route| route.chroma == requested_chroma && !route.input_format.is_empty())
+        .expect("本机需要当前显示器对应色度的 NVENC production route");
     let move_cursor = std::env::var_os("RUST_REPLAY_NVENC_SMOKE_MOVE_CURSOR").is_some();
     let cursor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cursor_thread = move_cursor.then(|| {
@@ -220,8 +225,14 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
         .and_then(|value| value.parse::<f32>().ok())
         .filter(|value| value.is_finite() && *value >= 0.1)
         .unwrap_or(5.0);
+    let look_ahead_depth = std::env::var("RUST_REPLAY_NVENC_SMOKE_LOOKAHEAD")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0)
+        .min(31);
     let rate_control = RateControlConfig {
         method: RateControlMethod::Cbr,
+        look_ahead_depth,
         ..RateControlConfig::default()
     };
     let mut sink = SmokeStatusSink::default();
@@ -231,7 +242,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
             &path,
             duration_seconds,
             &rate_control,
-            ChromaSampling::Yuv420,
+            requested_chroma,
             None,
             Some(&mut sink),
             Some(route_plan),
@@ -242,7 +253,7 @@ fn run_local_nvenc_d3d11_record_smoke(capture_source: RecordCaptureSource) {
                 &path,
                 duration_seconds,
                 &rate_control,
-                ChromaSampling::Yuv420,
+                requested_chroma,
                 None,
                 Some(&mut sink),
                 Some(route_plan),

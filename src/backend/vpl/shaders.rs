@@ -51,3 +51,5 @@ pub(crate) const SNAPSHOT_COPY_HLSL: &str = include_str!("shaders/snapshot_copy.
 
 #[cfg(windows)]
 pub(crate) const RGBA_CONVERT_HLSL: &str = include_str!("shaders/rgba_convert.hlsl");
+pub(crate) const NVENC_PLANAR_CONVERT_HLSL: &str =
+    include_str!("shaders/nvenc_planar_convert.hlsl");

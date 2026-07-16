@@ -549,8 +549,23 @@ pub(super) unsafe fn run_wgc_capture_thread(
             return Ok(());
         };
         let _guard = D3d11MultithreadGuard::enter(&wgc_multithread);
+        let keyed_mutex = slot.keyed_mutex.clone();
+        let keyed_mutex_guard = if let Some(mutex) = keyed_mutex.as_ref() {
+            Some(
+                KeyedMutexGuard::acquire(
+                    mutex,
+                    0,
+                    1,
+                    1_000,
+                    "IDXGIKeyedMutex::AcquireSync(WGC CUDA planar capture)",
+                )
+                .map_err(|err| err.to_string())?,
+            )
+        } else {
+            None
+        };
         let copy_started = std::time::Instant::now();
-        slot.converter.convert(&source).map_err(|err| {
+        let convert_result = slot.converter.convert(&source).map_err(|err| {
             format!(
                 "WGC capture route conversion failed: input_tex_format={} route_tex_format={} target={}x{}; {err}",
                 initial_source_desc.Format.0,
@@ -558,8 +573,15 @@ pub(super) unsafe fn run_wgc_capture_thread(
                 initial_snapshot_desc.Width,
                 initial_snapshot_desc.Height
             )
-        })?;
-        slot.capture_fence.mark(&context);
+        });
+        if let Some(guard) = keyed_mutex_guard {
+            guard
+                .release("IDXGIKeyedMutex::ReleaseSync(WGC CUDA planar capture)")
+                .map_err(|err| err.to_string())?;
+        } else {
+            slot.capture_fence.mark(&context);
+        }
+        convert_result?;
         let copy_duration = copy_started.elapsed();
         state.stats.copied += 1;
         let callback_frame_duration = callback_frame_started.elapsed();
@@ -598,6 +620,22 @@ pub(super) unsafe fn run_wgc_capture_thread(
             };
             if frame_tx.send(CaptureMsg::Frame(captured)).is_err() {
                 stop.store(true, Ordering::Relaxed);
+            } else if encoder_warmup_frame {
+                // Delayed encoders (NVENC Lookahead) retain the warmup texture until
+                // a later output is ready. Capture-side warmup must advance when the
+                // frame is handed to the encoder thread, not when that texture slot is
+                // eventually recycled, otherwise no further frames can be submitted.
+                state.encoder_warmup_pending = false;
+                state.post_warmup_discard_remaining = post_warmup_discard_frames;
+                if state.post_warmup_discard_remaining == 0 {
+                    state.warmup_done = true;
+                    state.pipeline_warmup_remaining = pipeline_warmup_frames;
+                    state.pipeline_warmup_stable_intervals = 0;
+                }
+                state.last_timestamp_100ns = None;
+                state.timestamp_origin_100ns = None;
+                state.last_timestamp_90k = None;
+                state.record_wall_deadline = None;
             }
             return Ok(());
         }
@@ -802,25 +840,8 @@ pub(super) unsafe fn run_wgc_capture_thread(
         let _ = frame.frame.Close();
     }
 
-    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        while let Ok(slot) = free_rx.try_recv() {
-            return_slot(slot)?;
-        }
-        let free_len = callback_state
-            .lock()
-            .map_err(|_| "WGC callback state mutex poisoned while draining".to_owned())?
-            .free_slots
-            .len();
-        if free_len >= pool_size || std::time::Instant::now() >= drain_deadline {
-            break;
-        }
-        match free_rx.recv_timeout(std::time::Duration::from_millis(1)) {
-            Ok(slot) => return_slot(slot)?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    // Lookahead 合法持有输入槽位直到 recorder 随后的 EOS flush。这里等待全部槽位
+    // 会与“先停止捕获线程、再 flush 编码器”的关闭顺序形成固定超时等待。
     let _ = session.Close();
     let _ = frame_pool.Close();
 

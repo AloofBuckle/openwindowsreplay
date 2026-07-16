@@ -4,6 +4,7 @@ use super::*;
 pub(in super::super) enum GpuRecordConverter {
     P010(GpuP010Converter),
     Nv12(GpuNv12Converter),
+    NvencPlanar(GpuNvencPlanarConverter),
     Packed(GpuPackedConverter),
     Rgb4(GpuRgb4Converter),
 }
@@ -62,6 +63,17 @@ impl GpuRecordConverter {
                 enable_compute,
                 source_srv_cache,
             )?)),
+            NVENC_FOURCC_NV16 | NVENC_FOURCC_P210 | NVENC_FOURCC_Y444 | NVENC_FOURCC_Y4P0 => {
+                Ok(Self::NvencPlanar(GpuNvencPlanarConverter::new(
+                    route,
+                    device,
+                    context,
+                    output,
+                    width,
+                    height,
+                    source_srv_cache,
+                )?))
+            }
             MFX_FOURCC_YUY2 | MFX_FOURCC_Y210 | MFX_FOURCC_AYUV | MFX_FOURCC_Y410 => {
                 Ok(Self::Packed(GpuPackedConverter::new(
                     route,
@@ -96,6 +108,7 @@ impl GpuRecordConverter {
         match self {
             Self::P010(converter) => converter.convert(source),
             Self::Nv12(converter) => converter.convert(source),
+            Self::NvencPlanar(converter) => converter.convert(source),
             Self::Packed(converter) => converter.convert(source),
             Self::Rgb4(converter) => converter.convert(source),
         }
@@ -271,6 +284,162 @@ impl GpuNv12Converter {
         let empty_uav: [Option<ID3D11UnorderedAccessView>; 2] = [None, None];
         self.context
             .CSSetUnorderedAccessViews(0, 2, Some(empty_uav.as_ptr()), None);
+        self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(in super::super) struct GpuNvencPlanarConverter {
+    device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
+    output_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
+    compute_shader: windows::Win32::Graphics::Direct3D11::ID3D11ComputeShader,
+    dispatch_width: u32,
+    dispatch_height: u32,
+}
+
+#[cfg(windows)]
+impl GpuNvencPlanarConverter {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn new(
+        route: VplRecordRoute,
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        output: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        source_srv_cache: std::sync::Arc<std::sync::Mutex<ShaderResourceViewCache>>,
+    ) -> Result<Self, BackendError> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_TEX2D_UAV1, D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC1,
+            D3D11_UNORDERED_ACCESS_VIEW_DESC1_0, ID3D11Device3, ID3D11Resource,
+            ID3D11UnorderedAccessView1,
+        };
+        use windows::core::Interface;
+
+        let chroma_422 = matches!(route.fourcc, NVENC_FOURCC_NV16 | NVENC_FOURCC_P210);
+        if chroma_422 && !width.is_multiple_of(2) {
+            return Err(BackendError::unsupported(
+                "NVENC planar GPU writer",
+                format!("{}x{}", width, height),
+                "4:2:2 平面路线要求偶数宽度",
+            ));
+        }
+        let bit_depth_10 = matches!(route.fourcc, NVENC_FOURCC_P210 | NVENC_FOURCC_Y4P0);
+        let color_mode = if route.is_hdr_pq() {
+            4
+        } else if bit_depth_10 && route.is_bt2020_sdr() {
+            3
+        } else if bit_depth_10 {
+            2
+        } else if route.is_bt2020_sdr() {
+            1
+        } else {
+            0
+        };
+
+        let device3: ID3D11Device3 = device.cast().map_err(|err| BackendError::WindowsApi {
+            func: "ID3D11Device::cast<ID3D11Device3>(NVENC planar converter)",
+            message: err.to_string(),
+        })?;
+        let output_resource: ID3D11Resource =
+            output.cast().map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Texture2D::cast<ID3D11Resource>(NVENC planar output)",
+                message: err.to_string(),
+            })?;
+        let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC1 {
+            Format: route.try_dxgi_format()?,
+            ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC1_0 {
+                Texture2D: D3D11_TEX2D_UAV1 {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        let mut output_uav1: Option<ID3D11UnorderedAccessView1> = None;
+        device3
+            .CreateUnorderedAccessView1(&output_resource, Some(&uav_desc), Some(&mut output_uav1))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device3::CreateUnorderedAccessView1(NVENC planar output)",
+                message: err.to_string(),
+            })?;
+        let output_uav = output_uav1
+            .ok_or_else(|| BackendError::WindowsApi {
+                func: "CreateUnorderedAccessView1(NVENC planar output)",
+                message: "返回空 UAV".to_owned(),
+            })?
+            .cast()
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11UnorderedAccessView1::cast(NVENC planar output)",
+                message: err.to_string(),
+            })?;
+
+        let shader_source =
+            shader_source_with_range(NVENC_PLANAR_CONVERT_HLSL, route.mp4_color.full_range)
+                .replace(
+                    "RR_BIT_DEPTH_10_PLACEHOLDER",
+                    if bit_depth_10 { "true" } else { "false" },
+                )
+                .replace(
+                    "RR_CHROMA_422_PLACEHOLDER",
+                    if chroma_422 { "true" } else { "false" },
+                )
+                .replace("RR_COLOR_MODE_PLACEHOLDER", &color_mode.to_string());
+        let cs_blob = compile_shader(&shader_source, b"cs_main\0", b"cs_5_0\0")?;
+        let mut compute_shader = None;
+        device
+            .CreateComputeShader(&cs_blob, None, Some(&mut compute_shader))
+            .map_err(|err| BackendError::WindowsApi {
+                func: "ID3D11Device::CreateComputeShader(NVENC planar converter)",
+                message: err.to_string(),
+            })?;
+
+        Ok(Self {
+            device: device.clone(),
+            context: context.clone(),
+            source_srv_cache,
+            output_uav,
+            compute_shader: compute_shader.ok_or_else(|| BackendError::WindowsApi {
+                func: "CreateComputeShader(NVENC planar converter)",
+                message: "返回空 CS".to_owned(),
+            })?,
+            dispatch_width: if chroma_422 { width.div_ceil(2) } else { width }.max(1),
+            dispatch_height: height.max(1),
+        })
+    }
+
+    unsafe fn convert(
+        &self,
+        source: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    ) -> Result<(), BackendError> {
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11ComputeShader, ID3D11ShaderResourceView, ID3D11UnorderedAccessView,
+        };
+
+        let srv = lock_srv_cache(&self.source_srv_cache)?.get_or_create(
+            &self.device,
+            &self.context,
+            source,
+            "ID3D11Device::CreateShaderResourceView(NVENC planar source)",
+        )?;
+        self.context.CSSetShader(&self.compute_shader, None);
+        self.context.CSSetShaderResources(0, Some(&[Some(srv)]));
+        let uavs = [Some(self.output_uav.clone())];
+        self.context
+            .CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
+        self.context.Dispatch(
+            self.dispatch_width.div_ceil(16),
+            self.dispatch_height.div_ceil(8),
+            1,
+        );
+        let empty_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
+        self.context.CSSetShaderResources(0, Some(&empty_srv));
+        let empty_uav: [Option<ID3D11UnorderedAccessView>; 1] = [None];
+        self.context
+            .CSSetUnorderedAccessViews(0, 1, Some(empty_uav.as_ptr()), None);
         self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
         Ok(())
     }

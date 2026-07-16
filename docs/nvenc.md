@@ -10,7 +10,7 @@
   - 枚举 HEVC encode GUID、HEVC profile、D3D11 input formats、关键 caps。
   - 探测 NV12/P010/NV16/P210/AYUV/YUV444/YUV444_10BIT 与 420/422/444、8/10-bit 的对应关系。
   - 按当前 DXGI output 的 ColorSpace/BitsPerColor 推导 NVENC current-display route，遵守和 oneVPL 相同的“不支持桌面模式”阻断原则。
-  - 为 CBR/VBR/CQP 建立 NVENC 通用码控字段能力：VBV / CONSTQP / spatial AQ / VBR targetQuality。硬件 lookahead cap 继续记录，但当前单 bitstream 同步编码器不能处理 `NV_ENC_ERR_NEED_MORE_INPUT` 的延迟输出，因此 production feature 明确为不可用并从 GUI 隐藏。
+  - 为 CBR/VBR/CQP 建立 NVENC 通用码控字段能力：VBV / CONSTQP / spatial AQ / VBR targetQuality。CBR/VBR 在硬件 lookahead cap 可用时按当前 route 的 surface 预算暴露 `LookAheadDepth`（硬上限 31）；编码器使用多 bitstream buffer、按提交顺序保留输入 surface，并处理 `NV_ENC_ERR_NEED_MORE_INPUT`、EOS drain 与源 VFR 时间戳对应。
   - 将 NVENC CBR/VBR/CQP 映射到现有 GUI 通用码控模型，并在初始化时写入 `NV_ENC_RC_PARAMS`：CBR 写入 target bitrate、VBV buffer/initial delay；VBR 额外写入 max bitrate 与 targetQuality；CQP 写入 I/P/B QP。oneVPL 专用 `BRCParamMultiplier`、AVBR/LA/ICQ/VCM/LA_ICQ/LA_HRD/QVBR 等不会在 NVENC active backend 下暴露。
   - 新增独立的“NVENC 原始调参”区域，只暴露用户指定的四类额外调参：
     - Preset GUID：驱动通过 `NvEncGetEncodePresetGUIDs` 为 HEVC session 枚举到的 P1-P7。
@@ -21,10 +21,10 @@
   - Preset 主标签直接显示 P1-P7；split/multipass 使用“人话名称 | SDK 常量 = 原始值”的格式，并在悬停说明中解释实际条带退化和二遍首遍分辨率。
   - `tuningInfo` 是另一组独立参数；SDK 13.1 还定义 HQ、Low Latency、Ultra Low Latency、Lossless 与 Ultra High Quality。本项目即时回放路径固定使用 `NV_ENC_TUNING_INFO_LOW_LATENCY (2)`，不把它加入用户指定的额外调参集合。
   - Encoder 初始化先以所选 preset 和 low-latency tuning 调用 `NvEncGetEncodePresetConfigEx` 获取驱动基线，再只覆盖本项目拥有的 profile/chroma/bit-depth、低延迟、VUI 和码控字段，避免把 preset 其余参数全部抹成零。
-  - 增加可复用 `NvencD3d11Encoder`，通过 `NvEncInitializeEncoder` / `NvEncCreateBitstreamBuffer` / `NvEncRegisterResource` / `NvEncMapInputResource` / `NvEncEncodePicture` / `NvEncLockBitstream` 从 D3D11 NV12/P010/AYUV texture 产出 HEVC Annex-B access unit。
+  - 增加统一 `NvencTextureEncoder`：NV12/P010/AYUV 使用原生 D3D11 registered resource；NV16/P210/YUV444/YUV444_10BIT 使用 D3D11 shared NT handle -> CUDA external memory -> CUDA array -> NVENC 的持久注册路径。两条路线都支持延迟输出和精确源 VFR 时间戳。
 - `ProbeCaps` 新增 `nvenc` 与 `video_encoder_selection`：
   - oneVPL 与 NVENC 都进入能力探测。
-  - oneVPL 仍保持优先；NVENC 在 NV12/P010 或 SDR AYUV current-display route 可用时成为 production-ready fallback。`pipeline` 的普通 MP4、结构化输出与 encoded-sink 入口都会按 `video_encoder_selection.active` 自动分派 oneVPL/NVENC。
+  - oneVPL 仍保持优先；NVENC 在 NV12/P010、NV16/P210、AYUV 或 planar YUV444/YUV444_10BIT current-display route 可用时成为 production-ready fallback。`pipeline` 的普通 MP4、结构化输出与 encoded-sink 入口都会按 `video_encoder_selection.active` 自动分派 oneVPL/NVENC。
 - GUI 编码器日志新增：
   - 自动编码器选择结果。
   - NVENC DLL/API 版本、adapter、HEVC/profile/input format/caps/route 候选。
@@ -72,7 +72,7 @@ cargo test --locked --target x86_64-pc-windows-msvc backend::nvenc::tests::local
 cargo test --locked --target x86_64-pc-windows-msvc
 ```
 
-通过：103 passed，12 ignored，0 failed（ignored 项为本机自动选择、NVENC 探测、registered-resource 编码、shared-fence 输入格式、三种码控、非默认调参与真实录制 smoke）。
+通过：106 passed，17 ignored，0 failed（ignored 项包含本机自动选择、NVENC 探测、registered-resource/CUDA external-memory 编码、Lookahead、shared-fence 输入格式、三种码控、非默认调参与真实录制 smoke）。
 
 ## NVENC 码控暴露与测试范围
 
@@ -80,7 +80,7 @@ cargo test --locked --target x86_64-pc-windows-msvc
 - VBR：`averageBitRate`、`maxBitRate`、`vbvBufferSize`、`vbvInitialDelay`、整数 `targetQuality`，以及公共 Spatial AQ / multiPass；RTX 5090 P010 首帧编码通过。
 - CQP：`constQP` 的 I/P/B 三个 QP，以及公共 Spatial AQ / multiPass；RTX 5090 P010 首帧编码通过。
 - `NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES` 查询失败时不暴露任何模式；当前 5090 返回 CBR/VBR，CQP 按 SDK 的 0 值规则一并可用。
-- Lookahead：硬件 cap=true，但当前同步单输出 buffer 实测返回 `NV_ENC_ERR_NEED_MORE_INPUT`；已从 production feature 隐藏，并在 encoder 入口提前拒绝非零深度。
+- Lookahead：CBR/VBR 且硬件 cap=true 时在 GUI 暴露 `0..route_max`，`route_max` 同时受 31 的 SDK 上限与 3 GiB capture-pool 预算约束。编码器为深度 `N` 分配至少 `N+1` 个 bitstream buffer，按 pending 队列保留输入 surface，接受 `NV_ENC_ERR_NEED_MORE_INPUT`，EOS 后完整 drain，并校验驱动返回时间戳与提交的源 VFR 时间戳一致。
 - 未声称完整暴露整个 `NV_ENC_RC_PARAMS`：min/max/initial QP hint、Temporal AQ、AQ strength、strict GOP、non-reference P、external lookahead、QP map、fractional targetQuality、lookahead level、alpha/MV-HEVC 字段均不属于当前允许用户修改的范围。未由本项目拥有的 preset 字段保持驱动返回值，不再无条件清零 `lowDelayKeyFrameScale`。
 
 ## 已生产化的 NVENC 链路
@@ -95,12 +95,33 @@ cargo test --locked --target x86_64-pc-windows-msvc
 - 当前 production-ready 范围：
   - SDR/8-bit current-display route -> NV12 / HEVC Main
   - HDR PQ 或 10-bit current-display route -> P010 / HEVC Main10
+  - SDR/8-bit 4:2:2 current-display route -> NV16 / HEVC FRExt
+  - HDR PQ 或 10-bit 4:2:2 current-display route -> P210 / HEVC FRExt
   - SDR/8-bit 4:4:4 current-display route -> AYUV / HEVC FRExt
-- NV16/P210 与 planar YUV444/YUV444_10BIT 仍保留 probe-only。NVIDIA 官方 D3D11 sample 没有这些 planar 格式的原生 DXGI texture 映射；不能用 NV12/P010/Y210/Y410 静默替代不同平面布局。
+  - 驱动不暴露 AYUV 时的 SDR 4:4:4 route -> planar YUV444 / HEVC FRExt
+  - HDR PQ 或 10-bit 4:4:4 current-display route -> planar YUV444_10BIT / HEVC FRExt
+- NV16/P210 与 planar YUV444/YUV444_10BIT 不伪装成其他 DXGI 视频格式。捕获 shader 直接写 R8/R16 连续平面 allocation，D3D11 与 CUDA 通过 keyed mutex 交接；共享 NT handle、CUDA external memory、NVENC CUDA array 均只创建/注册一次，不执行 GPU 内容复制。
+- 能力探测会按 adapter LUID 创建 64x64 shared keyed texture，完成一次 D3D11 -> CUDA -> D3D11 key round trip；失败的 adapter 仍保留 query 信息，但 planar route 不进入生产选择，也不显示在 GUI。
 - `ProbeCaps` 现在按 active backend 聚合 `supported_chroma`、`supported_rate_controls` 与字段可见性；oneVPL 可用时优先 oneVPL，oneVPL 不可生产时 NVENC 可自动接管。
 - `pipeline` 的三个 Windows 生产入口都根据 `video_encoder_selection.active` 分派 oneVPL 或 NVENC，GUI 会话使用 encoded-sink 入口。
 
 ## 本机新增验证结果
+
+NVENC CUDA external-memory 与 Lookahead：
+
+- NV16、P210、YUV444、YUV444_10BIT 均在 Lookahead depth 4 下完成持久注册、延迟输出、EOS drain 和时间戳顺序验证。
+- P210 synthetic 1920x1080 持久输入 120 帧约 `2.19 ms/frame`。
+- 在 4 个 P210 输入仍 pending 时直接销毁 encoder，随后 D3D11 可重新取得所有 keyed mutex key 0，快速取消不会永久占有 capture slot。
+- CUDA external semaphore FFI 按 CUDA 13.1 头文件验证为 144 字节，`flags` 偏移 72，keyed-mutex reserved 偏移 32。
+
+NVENC 4K HDR PQ 真实录制（2026-07-16，3840x2160、240 Hz）：
+
+- DDA/WGC 的 P210 与 YUV444_10BIT 均成功输出 HEVC FRExt + AAC LC MP4。
+- `ffprobe` 分别识别为 `yuv422p10le` / `yuv444p10le`、BT.2020 non-constant / SMPTE ST 2084 / full-range。
+- DDA/WGC x P210/YUV444_10BIT x Lookahead 0/8 共 8 个输出均保持包级 PTS/DTS 严格递增，并通过 ffmpeg 全流解码。
+- MP4 `hvcC` 从实际 SPS 的 profile/tier/compatibility/constraints/level/chroma/bit-depth 派生；MediaInfo 分别识别为 Main 4:2:2 10 与 Main 4:4:4 10，不再写死 Main/Main10 compatibility 或 level 5.1。
+- WGC 停止时不再等待 Lookahead 持有的输入槽位全部提前归还；3 秒 Lookahead 8 回归总耗时由约 6.6 秒降到约 3.6-3.7 秒，EOS drain 约 34-39 ms。
+- 4K240 下 P210 无 Lookahead 的 `encode_submit` 平均约 4.15-4.81 ms，Lookahead 8 约 7.6-7.8 ms；高刷新下会出现 capture slot drop，格式可用不等于所有刷新率都能无丢帧运行。
 
 NVENC P010 registered-resource 编码冒烟：
 
@@ -167,9 +188,9 @@ cargo test --release --locked --target x86_64-pc-windows-msvc backend::vpl::test
 
 ## 明确边界 / 后续可选增强
 
-1. NVENC `NV_ENC_CONFIG` 已补齐 production 必需的 HEVC profile/chroma/bit-depth、IP-only/low-latency 初始化，并写入 CBR/VBR/CQP、VBV、Spatial AQ 与 VBR targetQuality；Preset、split encode 与 multipass 已按原始 SDK 值在 GUI 暴露。Lookahead 在延迟输出队列完成前隐藏；Temporal AQ/AQ strength 不属于允许用户修改的额外调参。
-2. 4:2:2 NV16/P210 与 planar 4:4:4 缺少本项目可证明的原生 D3D11 texture layout，保持 probe-only；未来若接入 CUDA interop 或 NVIDIA 给出可验证 D3D11 layout，再单独生产化。
-3. NVENC caps 报告 async=true，但当前编码器采用同步 registered-resource 提交；捕获 snapshot pool 与编码线程已解耦，本机 240 Hz 实录 `encode_submit` 平均约 2.2 ms。后续如引入 completion event + 多 bitstream buffer，需要保持现有 VFR 时间戳与停止语义。
+1. NVENC `NV_ENC_CONFIG` 已补齐 production 必需的 HEVC profile/chroma/bit-depth、IP-only/low-latency 初始化，并写入 CBR/VBR/CQP、VBV、Spatial AQ、VBR targetQuality 与 Lookahead；Preset、split encode 与 multipass 已按原始 SDK 值在 GUI 暴露。Temporal AQ/AQ strength 不属于允许用户修改的额外调参。
+2. 4:2:2 NV16/P210 与 planar 4:4:4 已通过 CUDA external-memory 生产化，但要求 NVIDIA 驱动同时支持对应 NVENC input format/profile/caps、CUDA D3D11 external memory 和 keyed-mutex external semaphore；任一环节失败都会明确返回不支持，不回退 CPU 或伪造布局。
+3. Lookahead 已实现多 bitstream 延迟输出，但会增加输入 surface 占用和编码压力；高分辨率路线会按 3 GiB capture-pool 预算限制最大可用深度，例如 8K P010/YUV444_10BIT 当前最大为 15。性能不足时应降低 Lookahead/色度或刷新率，后端不会合成 CFR 掩盖源端丢帧。
 4. WGC 使用 500 us polling 获取 `TryGetNextFrame`，同时保留 WGC `SystemRelativeTime` 的 VFR 时间戳。短测已稳定，仍应在目标硬件上做长时间 4K/高刷新性能验证。
 5. NVENC DDA 零拷贝要求 capture/encoder device 支持 `ID3D11Device5`、`ID3D11DeviceContext4`、ordinary shared video texture 和 shared fence。缺少这些接口或资源创建失败时明确返回不支持，不退回 CPU 路径。
 6. 旋转输出当前明确不支持；多 GPU/非主输出已进入探测和 LUID 绑定，但仍需在更多真实拓扑上做生产验证。

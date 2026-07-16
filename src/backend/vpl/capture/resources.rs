@@ -193,8 +193,9 @@ pub(in super::super) unsafe fn create_route_intermediate(
     allow_uav: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, BackendError> {
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS,
+        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
 
     let mut bind_flags = if matches!(route.fourcc, MFX_FOURCC_P010 | MFX_FOURCC_RGB4) {
@@ -205,6 +206,11 @@ pub(in super::super) unsafe fn create_route_intermediate(
     if allow_uav {
         bind_flags |= D3D11_BIND_UNORDERED_ACCESS.0 as u32;
     }
+    let misc_flags = if route.is_nvenc_cuda_planar() {
+        (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32
+    } else {
+        0
+    };
     let desc = D3D11_TEXTURE2D_DESC {
         Width: target_desc.Width,
         Height: target_desc.Height,
@@ -215,7 +221,7 @@ pub(in super::super) unsafe fn create_route_intermediate(
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: bind_flags,
         CPUAccessFlags: 0,
-        MiscFlags: 0,
+        MiscFlags: misc_flags,
     };
     let mut texture = None;
     device

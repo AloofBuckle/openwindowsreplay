@@ -433,11 +433,12 @@ impl RustReplayApp {
         for item in &caps.rate_control_features_by_chroma {
             for feature in &item.features {
                 self.encoder_log.push(format!(
-                    "码控可选字段：{} {} brc_multiplier={} lookahead={} win_brc={} low_delay={} max_frame_size={} mbbrc={} nvenc_spatial_aq={} nvenc_temporal_aq={} nvenc_target_quality={}",
+                    "码控可选字段：{} {} brc_multiplier={} lookahead={} lookahead_max={} win_brc={} low_delay={} max_frame_size={} mbbrc={} nvenc_spatial_aq={} nvenc_temporal_aq={} nvenc_target_quality={}",
                     item.chroma.doc_label(),
                     feature.method.short_name(),
                     feature.brc_param_multiplier,
                     feature.look_ahead_depth,
+                    feature.look_ahead_depth_max,
                     feature.win_brc,
                     feature.low_delay_brc,
                     feature.max_frame_size,

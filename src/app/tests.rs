@@ -48,6 +48,22 @@ fn nvenc_rate_control_sanitization_obeys_feature_visibility() {
 }
 
 #[test]
+fn nvenc_lookahead_is_clamped_to_route_surface_budget() {
+    let mut cfg = RateControlConfig {
+        method: RateControlMethod::Cbr,
+        look_ahead_depth: 31,
+        ..Default::default()
+    };
+    let mut features = RateControlFeatureSupport::hidden(cfg.method);
+    features.look_ahead_depth = true;
+    features.look_ahead_depth_max = 15;
+
+    sanitize_hidden_rate_control_fields(&mut cfg, &features, Some(VideoEncoderBackend::Nvenc));
+
+    assert_eq!(cfg.look_ahead_depth, 15);
+}
+
+#[test]
 fn nvenc_tuning_sanitization_uses_only_reported_raw_values() {
     let support = NvencTuningSupport {
         presets: vec![NvencPreset::P2, NvencPreset::P5],

@@ -12,7 +12,7 @@ ChromaWriter:
   420_P010
   422_YUY2
   422_Y210
-  422_P210（Query 可见但生产录制保持 Unsupported，因 DXGI/D3D11 无安全 P210 texture layout）
+  422_P210（oneVPL 路线保持 Unsupported；NVENC 使用独立内部 N210 route，经 D3D11 shared NT handle + CUDA external memory 生产化）
   444_AYUV
   444_Y410
   444_RGB4
@@ -49,7 +49,7 @@ WASAPI 麦克风 capture
 - oneVPL implementation name/version
 - CodecId = HEVC
 - ChromaFormat: 420 / 422 / 444
-- FourCC: NV12 / P010 / YUY2 / Y210 / P210(Query 可见但生产 Unsupported) / AYUV / Y410 / RGB4
+- FourCC: oneVPL 为 NV12 / P010 / YUY2 / Y210 / P210(Query 可见但生产 Unsupported) / AYUV / Y410 / RGB4；NVENC 另有 NV16/P210/YUV444/YUV444_10BIT CUDA-array route
 - BitDepthLuma/Chroma: 8 / 10（12-bit 路线已丢弃）
 - CodecProfile: Main / Main10 / 422 / 444 相关 profile
 - RateControlMethod 支持集

@@ -804,7 +804,12 @@ fn fake_hevc_parameter_sets() -> Vec<u8> {
 fn fake_hevc_parameter_sets_with_seed(seed: u8) -> Vec<u8> {
     let mut out = Vec::new();
     append_fake_nal(&mut out, 32, &[seed, 2, 3]);
-    append_fake_nal(&mut out, 33, &[seed, 5, 6]);
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend(crate::backend::mp4_mux::synthetic_sps_nal(
+        metadata().codec,
+        0x6000_0000 | u32::from(seed),
+        120,
+    ));
     append_fake_nal(&mut out, 34, &[seed, 8, 9]);
     out
 }
