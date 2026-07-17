@@ -12,6 +12,7 @@ const OPTIONAL_RUNTIME_DEPENDENCIES: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTREPLAY_VPL_DLL");
+    build_nvfbc_shim();
 
     let source = find_vpl_dll().unwrap_or_else(|| {
         panic!(
@@ -49,6 +50,73 @@ fn main() {
     manifest.push_str("];\n");
     fs::write(out_dir.join(MANIFEST_NAME), manifest)
         .expect("failed to generate embedded oneVPL runtime manifest");
+}
+
+fn build_nvfbc_shim() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=native/nvfbc_shim.cpp");
+    println!("cargo:rerun-if-changed=native/nvfbc_shim.h");
+    let mut build = cc::Build::new();
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+        && let Some(compiler) = env::var_os("CXX")
+            .map(PathBuf::from)
+            .or_else(|| find_executable_on_path("g++.exe"))
+            .or_else(|| find_executable_on_path("clang++.exe"))
+            .or_else(|| {
+                [
+                    PathBuf::from(r"C:\msys64\mingw64\bin\g++.exe"),
+                    PathBuf::from(r"C:\msys64\ucrt64\bin\g++.exe"),
+                ]
+                .into_iter()
+                .find(|candidate| is_regular_file(candidate))
+            })
+    {
+        build.compiler(compiler);
+        if let Some(archiver) = env::var_os("AR")
+            .map(PathBuf::from)
+            .or_else(|| find_executable_on_path("ar.exe"))
+            .or_else(|| {
+                [
+                    PathBuf::from(r"C:\msys64\mingw64\bin\ar.exe"),
+                    PathBuf::from(r"C:\msys64\ucrt64\bin\ar.exe"),
+                ]
+                .into_iter()
+                .find(|candidate| is_regular_file(candidate))
+            })
+        {
+            build.archiver(archiver);
+        }
+    }
+    build
+        .cpp(true)
+        .cpp_link_stdlib(None)
+        .std("c++20")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .file("native/nvfbc_shim.cpp");
+    let compiler = build.get_compiler();
+    if compiler.is_like_msvc() {
+        build.flag("/GR-").flag("/utf-8");
+    } else {
+        build.flag("-fno-exceptions").flag("-fno-rtti");
+        if let Some(toolchain_root) = compiler.path().parent().and_then(Path::parent) {
+            let library_dir = toolchain_root.join("lib");
+            if library_dir.is_dir() {
+                println!("cargo:rustc-link-search=native={}", library_dir.display());
+            }
+        }
+    }
+    build.compile("rustreplay_nvfbc_shim");
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_regular_file(candidate))
 }
 
 fn find_vpl_dll() -> Option<PathBuf> {

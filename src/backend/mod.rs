@@ -5,6 +5,8 @@ pub mod audio;
 pub mod dxgi;
 pub mod mp4_mux;
 pub mod nvenc;
+#[cfg(windows)]
+pub mod nvfbc;
 pub mod pipeline;
 pub mod session;
 pub mod vpl;

@@ -1,0 +1,36 @@
+nvfbc_nvenc_direct frames=600 output=target\nvfbc_nvenc_420_pipeline_600f_regression.hevc chroma=420 qp=18
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description=NVIDIA GeForce RTX 5090
+d3d9_create_device hr=0x00000000
+display_refresh numerator=240 denominator=1 source=EnumDisplaySettingsW
+nvfbc_create status=0 width=3840 height=2160 interface=0x000000000743a0d0
+surface_create slot=0 format=A2B10G10R10 hr=0x00000000 ptr=0x000000000740b7f8
+surface_create slot=1 format=A2B10G10R10 hr=0x00000000 ptr=0x000000000740ad78
+surface_create slot=2 format=A2B10G10R10 hr=0x00000000 ptr=0x000000000740b998
+nvfbc_setup status=0 format=ARGB10 hdr_request=true
+nvenc_stage=get_max_supported_version status=0(NV_ENC_SUCCESS)
+nvenc_api requested=0x0000000d max_supported=0x000000d1
+nvenc_stage=create_instance status=0(NV_ENC_SUCCESS)
+nvenc_stage=open_d3d9_session status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_format_count status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_formats status=0(NV_ENC_SUCCESS)
+nvenc_input_formats count=16 abgr10_supported=true
+nvenc_stage=get_profile_count status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_profiles status=0(NV_ENC_SUCCESS)
+nvenc_stage=cap_10bit status=0(NV_ENC_SUCCESS)
+nvenc_stage=cap_yuv422 status=0(NV_ENC_SUCCESS)
+nvenc_stage=cap_yuv444 status=0(NV_ENC_SUCCESS)
+nvenc_stage=cap_width_max status=0(NV_ENC_SUCCESS)
+nvenc_stage=cap_height_max status=0(NV_ENC_SUCCESS)
+route_caps_json={"schema":1,"device_api":"D3D9Ex","codec":"HEVC","input_format":"ABGR10","hevc":true,"abgr10_input":true,"main10_profile":true,"frext_profile":true,"ten_bit":true,"yuv422":true,"yuv444":true,"max_width":8192,"max_height":8192,"advertised_routes":{"420":true,"422":true,"444":true},"lookahead":false}
+requested_route_advertised=true chroma=420 width=3840 height=2160
+nvenc_stage=get_preset_config status=0(NV_ENC_SUCCESS)
+nvenc_stage=initialize_hevc_10bit status=0(NV_ENC_SUCCESS)
+nvenc_stage=register_nvfbc_d3d9_surface status=0(NV_ENC_SUCCESS)
+nvenc_stage=create_bitstream status=0(NV_ENC_SUCCESS)
+nvenc_stage=register_nvfbc_d3d9_surface status=0(NV_ENC_SUCCESS)
+nvenc_stage=create_bitstream status=0(NV_ENC_SUCCESS)
+nvenc_stage=register_nvfbc_d3d9_surface status=0(NV_ENC_SUCCESS)
+nvenc_stage=create_bitstream status=0(NV_ENC_SUCCESS)
+nvenc_surface_pool count=3 lookahead=false
+requested_route_initialized=true chroma=420 registered_surfaces=3
+direct_encode_summary chroma=420 requested=600 completed=600 elapsed_ms=2504.351 fps=239.583 bytes=567998 mapped_format=0x20000000 first_frame_latency_us=3968 steady_source_fps=239.778 vblank_wait_p50_us=3841 vblank_wait_p95_us=3945 source_interval_p50_us=4161 source_interval_p95_us=4345 source_interval_max_us=6898 source_long_intervals=1 grab_p50_us=164 grab_p95_us=329 submit_p50_us=137 submit_p95_us=277 drain_p50_us=11 drain_p95_us=54 pipeline_work_p50_us=156 pipeline_work_p95_us=324 pipeline_work_max_us=3712 explicit_gpu_copies=0 output=target\nvfbc_nvenc_420_pipeline_600f_regression.hevc

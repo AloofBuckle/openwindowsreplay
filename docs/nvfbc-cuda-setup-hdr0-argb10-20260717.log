@@ -1,0 +1,13 @@
+nvfbc_cuda_capture_probe buffers=1 frames=4 hdr=false format=ARGB10
+cuda_stage=init status=0 name=CUDA_SUCCESS message=no error
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description=NVIDIA GeForce RTX 5090
+d3d9_create_device hr=0x00000000
+cuda_stage=d3d9_context status=0 name=CUDA_SUCCESS message=no error
+cuda_context_created=true device=0 context=0x0000000003DE7A50
+cuda_stage=context_get_current status=0 name=CUDA_SUCCESS message=no error
+nvfbc_cuda_create status=0 width=3840 height=2160 interface=0x000000000EBF8190 version=112
+nvfbc_cuda_max_buffer_size status=0 bytes=33423360
+cuda_stage=context_set_current_before_setup status=0 name=CUDA_SUCCESS message=no error
+nvfbc_cuda_setup status=-6 format=ARGB10 hdr_request=false
+nvfbc_cuda_release status=0
+cuda_stage=context_destroy status=0 name=CUDA_SUCCESS message=no error
