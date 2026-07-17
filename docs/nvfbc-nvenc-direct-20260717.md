@@ -56,7 +56,7 @@ refresh rate from the selected display, and queries the following NVENC data:
 It emits one stable machine-readable capability record:
 
 ```json
-route_caps_json={"schema":1,"device_api":"D3D9Ex","codec":"HEVC","input_format":"ABGR10","hevc":true,"abgr10_input":true,"main10_profile":true,"frext_profile":true,"ten_bit":true,"yuv422":true,"yuv444":true,"max_width":8192,"max_height":8192,"advertised_routes":{"420":true,"422":true,"444":true},"lookahead":false}
+route_caps_json={"schema":1,"device_api":"D3D9Ex","codec":"HEVC","input_format":"ABGR10","hevc":true,"abgr10_input":true,"main10_profile":true,"frext_profile":true,"ten_bit":true,"yuv422":true,"yuv444":true,"max_width":8192,"max_height":8192,"advertised_routes":{"420":true,"422":true,"444":true},"lookahead":false,"lookahead_policy":"disabled_for_nvfbc"}
 ```
 
 `advertised_routes` means the static profile/format/caps intersection for the
@@ -154,7 +154,11 @@ merge includes:
   sleep/resume, and full-screen games.
 - Resolve the unsupported private-data distribution and compatibility risk.
 
-Lookahead remains intentionally unimplemented and unexposed.
+Lookahead is intentionally excluded from the NvFBC route. A follow-up probe
+showed that D3D9Ex setup fails with four output surfaces and that the legacy
+NvFBC CUDA interface fails during Setup for every HDR/format combination. The
+route therefore remains fixed to three direct D3D9Ex surfaces and does not add
+a copy-backed analysis ring. See `docs/nvfbc-lookahead-feasibility-20260717.md`.
 
 ## Reproduction
 

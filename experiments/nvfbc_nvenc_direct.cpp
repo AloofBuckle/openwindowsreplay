@@ -110,7 +110,7 @@ struct DirectRouteCaps {
             "\"main10_profile\":%s,\"frext_profile\":%s,\"ten_bit\":%s,"
             "\"yuv422\":%s,\"yuv444\":%s,\"max_width\":%u,\"max_height\":%u,"
             "\"advertised_routes\":{\"420\":%s,\"422\":%s,\"444\":%s},"
-            "\"lookahead\":false}\n",
+            "\"lookahead\":false,\"lookahead_policy\":\"disabled_for_nvfbc\"}\n",
             hevc ? "true" : "false", abgr10_input ? "true" : "false",
             main10_profile ? "true" : "false", frext_profile ? "true" : "false",
             ten_bit ? "true" : "false", yuv422 ? "true" : "false",

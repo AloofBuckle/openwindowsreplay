@@ -1,0 +1,10 @@
+nvfbc_nvenc_direct frames=96 output=target\nvfbc_surface_probe_4.hevc chroma=420 qp=24 surfaces=4
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description=NVIDIA GeForce RTX 5090
+d3d9_create_device hr=0x00000000
+display_refresh numerator=240 denominator=1 source=EnumDisplaySettingsW
+nvfbc_create status=0 width=3840 height=2160 interface=0x00000000072b3c10
+surface_create slot=0 format=A2B10G10R10 hr=0x00000000 ptr=0x00000000073250d8
+surface_create slot=1 format=A2B10G10R10 hr=0x00000000 ptr=0x0000000007324b38
+surface_create slot=2 format=A2B10G10R10 hr=0x00000000 ptr=0x0000000007325018
+surface_create slot=3 format=A2B10G10R10 hr=0x00000000 ptr=0x0000000007325dd8
+nvfbc_setup status=-5 format=ARGB10 hdr_request=true
