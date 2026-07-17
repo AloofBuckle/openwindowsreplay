@@ -528,4 +528,52 @@ mod tests {
         assert_eq!(mixed.samples[2], [0.4, 0.4]);
         assert_eq!(mixed.samples[3], [0.0, 0.0]);
     }
+
+    #[test]
+    #[ignore = "known bug: packet-local resampling resets interpolation state at every WASAPI packet"]
+    fn packetized_44k1_resampling_matches_continuous_stream() {
+        let input_rate = 44_100u32;
+        let frequency = 10_000.0f32;
+        let input = (0..input_rate as usize)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * frequency * index as f32 / input_rate as f32;
+                let sample = phase.sin();
+                [sample, sample]
+            })
+            .collect::<Vec<_>>();
+        let continuous = resample_linear(&input, input_rate, TARGET_SAMPLE_RATE);
+        let packetized = input
+            .chunks(441)
+            .flat_map(|packet| resample_linear(packet, input_rate, TARGET_SAMPLE_RATE))
+            .collect::<Vec<_>>();
+        assert_eq!(packetized.len(), continuous.len());
+        let max_error = packetized
+            .iter()
+            .zip(&continuous)
+            .map(|(packet, whole)| (packet[0] - whole[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error < 0.005, "packet boundary max error={max_error}");
+    }
+
+    #[test]
+    #[ignore = "known bug: linear downsampling has no anti-alias filter"]
+    fn downsampling_rejects_frequencies_above_target_nyquist() {
+        let input_rate = 96_000u32;
+        let frequency = 30_000.0f32;
+        let input = (0..input_rate as usize)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * frequency * index as f32 / input_rate as f32;
+                let sample = phase.sin();
+                [sample, sample]
+            })
+            .collect::<Vec<_>>();
+        let output = resample_linear(&input, input_rate, TARGET_SAMPLE_RATE);
+        let rms = (output
+            .iter()
+            .map(|sample| sample[0] * sample[0])
+            .sum::<f32>()
+            / output.len() as f32)
+            .sqrt();
+        assert!(rms < 0.01, "aliased output rms={rms}");
+    }
 }

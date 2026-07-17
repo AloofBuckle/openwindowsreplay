@@ -429,6 +429,33 @@ fn replay_idr_requests_are_bounded_by_source_pts_not_frame_count() {
 }
 
 #[test]
+fn aligned_live_audio_chunks_keep_aac_timestamps_contiguous() {
+    let mut blocker = crate::backend::audio::AacBlocker::default();
+    let mut timestamps = Vec::new();
+    for _ in 0..3 {
+        let frame = crate::backend::audio::StereoPcmFrame {
+            start_time_100ns: 0,
+            samples: vec![[0.0, 0.0]; LIVE_AUDIO_MIX_CHUNK_TICKS as usize],
+        };
+        timestamps.extend(
+            blocker
+                .push(&frame)
+                .into_iter()
+                .map(|block| block.timestamp_ticks),
+        );
+    }
+    assert!(
+        timestamps.windows(2).all(|pair| {
+            pair[1] == pair[0] + crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64
+        })
+    );
+    assert_eq!(
+        timestamps.len() as u64 * crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64,
+        LIVE_AUDIO_MIX_CHUNK_TICKS * 3
+    );
+}
+
+#[test]
 fn bitstream_capacity_is_derived_from_route_dimensions_and_hrd_buffer() {
     let mut param: MfxVideoParam = unsafe { std::mem::zeroed() };
     param.mfx.FrameInfo.CropW = 3_840;

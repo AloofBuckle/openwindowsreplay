@@ -339,6 +339,33 @@ pub(super) type RecordAudioCaptureResult = (
 pub(super) type RecordAudioCaptureHandle = std::thread::JoinHandle<RecordAudioCaptureResult>;
 
 #[cfg(windows)]
+pub(super) const LIVE_AUDIO_MIX_CHUNK_TICKS: u64 =
+    crate::backend::audio::AAC_LC_FRAME_SAMPLES as u64 * 48;
+
+#[cfg(windows)]
+fn configured_audio_sources(
+    notes: &mut Vec<String>,
+) -> Vec<crate::backend::audio::AudioSourceKind> {
+    use crate::backend::audio::AudioSourceKind;
+
+    match std::env::var("RUST_REPLAY_AUDIO_SOURCE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("loopback" | "system") => vec![AudioSourceKind::Loopback],
+        Some("microphone" | "mic") => vec![AudioSourceKind::Microphone],
+        Some("both") | None => vec![AudioSourceKind::Loopback, AudioSourceKind::Microphone],
+        Some(value) => {
+            notes.push(format!(
+                "RUST_REPLAY_AUDIO_SOURCE={value} 无效；回退为 both（可选 loopback/microphone/both）"
+            ));
+            vec![AudioSourceKind::Loopback, AudioSourceKind::Microphone]
+        }
+    }
+}
+
+#[cfg(windows)]
 pub(super) struct RecordAudioCapture {
     pub(super) stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) handles: Vec<RecordAudioCaptureHandle>,
@@ -352,6 +379,7 @@ pub(super) struct RecordAudioCapture {
     pub(super) retain_full_pcm: bool,
     pub(super) live_access_units: u32,
     pub(super) live_encoded_bytes: u64,
+    pub(super) live_skipped_blocks: u64,
     pub(super) audio_end_abs_100ns: Option<i64>,
 }
 
@@ -372,13 +400,11 @@ impl RecordAudioCapture {
             notes.push("音频采集被 RUST_REPLAY_AUDIO=0 显式关闭".to_owned());
             return None;
         }
+        let sources = configured_audio_sources(notes);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let mut handles = Vec::new();
-        for source in [
-            crate::backend::audio::AudioSourceKind::Loopback,
-            crate::backend::audio::AudioSourceKind::Microphone,
-        ] {
+        for source in sources.iter().copied() {
             let stop_for_thread = stop.clone();
             let tx_for_thread = tx.clone();
             handles.push(std::thread::spawn(move || {
@@ -392,10 +418,14 @@ impl RecordAudioCapture {
             }));
         }
         drop(tx);
-        notes.push(
-            "音频路径已并行启动：WASAPI loopback + 默认麦克风，按 QPC/100ns 绝对时间戳流式采集；录制后端内部按首个正式视频源时间戳裁剪/重基准并实时推送 AAC 到 encoded ring"
-                .to_owned(),
-        );
+        let selected = sources
+            .iter()
+            .map(|source| format!("{source:?}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        notes.push(format!(
+            "音频路径已启动：sources={selected}，保留 WASAPI device-position/QPC 时钟元数据并流式采集；录制后端内部按首个正式视频源时间戳裁剪/重基准并实时推送 AAC 到 encoded ring"
+        ));
         Some(Self {
             stop,
             handles,
@@ -409,6 +439,7 @@ impl RecordAudioCapture {
             retain_full_pcm,
             live_access_units: 0,
             live_encoded_bytes: 0,
+            live_skipped_blocks: 0,
             audio_end_abs_100ns: None,
         })
     }
@@ -485,9 +516,7 @@ impl RecordAudioCapture {
         encode_until_ticks: u64,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     ) -> Result<(), BackendError> {
-        use crate::backend::audio::{
-            AAC_LC_FRAME_SAMPLES, TARGET_SAMPLE_RATE, mix_window_samples_to_stereo_48k,
-        };
+        use crate::backend::audio::{AAC_LC_FRAME_SAMPLES, mix_window_samples_to_stereo_48k};
 
         if encode_until_ticks <= self.live_submitted_until_ticks {
             return Ok(());
@@ -495,11 +524,10 @@ impl RecordAudioCapture {
         if self.live_encoder.is_none() {
             self.live_encoder = Some(crate::backend::aac_mf::MfAacLcEncoder::new()?);
         }
-        let chunk_ticks = u64::from(TARGET_SAMPLE_RATE);
         while self.live_submitted_until_ticks < encode_until_ticks {
             let from_ticks = self.live_submitted_until_ticks;
             let until_ticks = from_ticks
-                .saturating_add(chunk_ticks)
+                .saturating_add(LIVE_AUDIO_MIX_CHUNK_TICKS)
                 .min(encode_until_ticks);
             let window_ticks = until_ticks.saturating_sub(from_ticks);
             let window_start_offset_100ns = audio_ticks_to_100ns(from_ticks);
@@ -518,6 +546,7 @@ impl RecordAudioCapture {
                 if block.timestamp_ticks < submitted_until_ticks
                     || block.timestamp_ticks >= until_ticks
                 {
+                    self.live_skipped_blocks = self.live_skipped_blocks.saturating_add(1);
                     continue;
                 }
                 let samples = encoder.encode_block(block)?;
@@ -645,8 +674,11 @@ impl RecordAudioCapture {
         }
         let duration_ticks = self.live_pushed_until_ticks.max(target_ticks).max(1);
         notes.push(format!(
-            "流式 AAC 完成：access_units={} encoded_bytes={} duration_ticks={}，未保留整段 PCM/AU 副本",
-            self.live_access_units, self.live_encoded_bytes, duration_ticks
+            "流式 AAC 完成：access_units={} encoded_bytes={} duration_ticks={} skipped_blocks={}，未保留整段 PCM/AU 副本",
+            self.live_access_units,
+            self.live_encoded_bytes,
+            duration_ticks,
+            self.live_skipped_blocks,
         ));
         Ok(Some(crate::backend::mp4_mux::AacLcMp4Track {
             sample_rate: crate::backend::audio::TARGET_SAMPLE_RATE,
@@ -671,8 +703,35 @@ impl RecordAudioCapture {
             match handle.join() {
                 Ok((source, Ok(stats))) => {
                     notes.push(format!(
-                        "WASAPI {:?} {}：packet={} pcm_frames={}",
-                        source, phase, stats.packet_count, stats.pcm_frames
+                        "WASAPI {:?} {}：format={}Hz/{}ch container_bits={} valid_bits={} block_align={} clock={} packet={} pcm_frames={} silent={} discontinuity={} timestamp_error={} device_gap={}/{}frames device_overlap={}/{}frames qpc_timeline_gap={}/{}frames qpc_timeline_overlap={}/{}frames qpc_delta_error={}/sum{}frames/max{}frames",
+                        source,
+                        phase,
+                        stats.sample_rate,
+                        stats.channels,
+                        stats.bits_per_sample,
+                        stats.valid_bits_per_sample,
+                        stats.block_align,
+                        if stats.timestamp_from_device_position {
+                            "device_position"
+                        } else {
+                            "packet_qpc"
+                        },
+                        stats.packet_count,
+                        stats.pcm_frames,
+                        stats.silent_packets,
+                        stats.discontinuity_packets,
+                        stats.timestamp_error_packets,
+                        stats.device_gap_packets,
+                        stats.device_gap_frames,
+                        stats.device_overlap_packets,
+                        stats.device_overlap_frames,
+                        stats.qpc_timeline_gap_packets,
+                        stats.qpc_timeline_gap_frames,
+                        stats.qpc_timeline_overlap_packets,
+                        stats.qpc_timeline_overlap_frames,
+                        stats.qpc_delta_error_packets,
+                        stats.qpc_delta_error_abs_frames,
+                        stats.qpc_delta_error_max_frames,
                     ));
                 }
                 Ok((source, Err(err))) => {
@@ -691,8 +750,34 @@ impl RecordAudioCapture {
         while let Some(handle) = self.handles.pop() {
             match handle.join() {
                 Ok((source, Ok(stats))) => notes.push(format!(
-                    "WASAPI {:?} 快速停止：packet={} pcm_frames={}",
-                    source, stats.packet_count, stats.pcm_frames
+                    "WASAPI {:?} 快速停止：format={}Hz/{}ch container_bits={} valid_bits={} block_align={} clock={} packet={} pcm_frames={} silent={} discontinuity={} timestamp_error={} device_gap={}/{}frames device_overlap={}/{}frames qpc_timeline_gap={}/{}frames qpc_timeline_overlap={}/{}frames qpc_delta_error={}/sum{}frames/max{}frames",
+                    source,
+                    stats.sample_rate,
+                    stats.channels,
+                    stats.bits_per_sample,
+                    stats.valid_bits_per_sample,
+                    stats.block_align,
+                    if stats.timestamp_from_device_position {
+                        "device_position"
+                    } else {
+                        "packet_qpc"
+                    },
+                    stats.packet_count,
+                    stats.pcm_frames,
+                    stats.silent_packets,
+                    stats.discontinuity_packets,
+                    stats.timestamp_error_packets,
+                    stats.device_gap_packets,
+                    stats.device_gap_frames,
+                    stats.device_overlap_packets,
+                    stats.device_overlap_frames,
+                    stats.qpc_timeline_gap_packets,
+                    stats.qpc_timeline_gap_frames,
+                    stats.qpc_timeline_overlap_packets,
+                    stats.qpc_timeline_overlap_frames,
+                    stats.qpc_delta_error_packets,
+                    stats.qpc_delta_error_abs_frames,
+                    stats.qpc_delta_error_max_frames,
                 )),
                 Ok((source, Err(err))) => {
                     notes.push(format!("WASAPI {:?} 快速停止时不可用：{err}", source));
