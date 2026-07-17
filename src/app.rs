@@ -7,7 +7,9 @@ use crate::backend::session::{ReplayController, ReplaySaveReadiness, ReplayState
 use crate::backend::{
     NvencTuningSupport, ProbeCaps, RateControlFeatureSupport, VideoEncoderBackend,
 };
-use crate::config::{AppConfig, CaptureBackend, HotkeyConfig, HotkeyKey, ReplayBufferMode};
+use crate::config::{
+    AppConfig, CaptureBackend, CaptureMode, HotkeyConfig, HotkeyKey, ReplayBufferMode,
+};
 use crate::hotkey::{HotkeyEvent, HotkeyRuntime};
 use crate::indicator_overlay::{IndicatorOverlayRuntime, NativeIndicatorImage};
 use crate::rate_control::{RateControlConfig, RateControlMethod};

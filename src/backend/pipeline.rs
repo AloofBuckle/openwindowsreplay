@@ -6,7 +6,7 @@
 //! 内部分配 surface，但仍禁止任何 raw frame CPU 回读/Map/Staging 回退。
 
 use super::ProbeCaps;
-use crate::config::ChromaSampling;
+use crate::config::{CaptureMode, ChromaSampling};
 use crate::error::BackendError;
 use crate::rate_control::RateControlConfig;
 use std::path::Path;
@@ -58,6 +58,7 @@ impl ChromaWriterKind {
 
 #[derive(Debug, Clone)]
 pub struct RecordingRequest {
+    pub capture_mode: CaptureMode,
     pub capture_backend: CaptureBackendKind,
     pub color_transform: ColorTransformKind,
     pub chroma_writer: ChromaWriterKind,
@@ -124,6 +125,13 @@ pub fn record_once_gpu_only_cancelable(
 
     #[cfg(not(windows))]
     {
+        if request.capture_mode == CaptureMode::DedicatedNvFbc {
+            return Err(BackendError::unsupported(
+                "录制流水线",
+                "NvFBC 专用捕获",
+                "NvFBC 仅在 Windows 生产后端可用",
+            ));
+        }
         if !caps.d3d11_texture_input_supported {
             return Err(BackendError::unsupported(
                 "oneVPL 编码",
@@ -177,6 +185,16 @@ pub fn record_once_gpu_only_output_cancelable(
 ) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
     validate_record_request(request, caps)?;
     let requested_chroma = request.chroma_writer.chroma();
+    if request.capture_mode == CaptureMode::DedicatedNvFbc {
+        return super::vpl::record_nvfbc_mp4_output_cancelable(
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+            &caps.nvfbc,
+        );
+    }
     match caps.video_encoder_selection.active {
         Some(super::VideoEncoderBackend::Nvenc) => {
             let route_plan = caps
@@ -276,6 +294,17 @@ pub fn record_once_gpu_only_memory_output_with_sink_cancelable(
 ) -> Result<super::vpl::VplOneCopyRecordOutput, BackendError> {
     validate_record_request(request, caps)?;
     let requested_chroma = request.chroma_writer.chroma();
+    if request.capture_mode == CaptureMode::DedicatedNvFbc {
+        return super::vpl::record_nvfbc_memory_output_with_sink_cancelable(
+            output,
+            duration_seconds,
+            &request.rate_control,
+            requested_chroma,
+            external_stop,
+            encoded_sink,
+            &caps.nvfbc,
+        );
+    }
     match caps.video_encoder_selection.active {
         Some(super::VideoEncoderBackend::Nvenc) => {
             let route_plan = caps
@@ -351,6 +380,43 @@ fn validate_record_request(
     request: &RecordingRequest,
     caps: &ProbeCaps,
 ) -> Result<(), BackendError> {
+    let requested_chroma = request.chroma_writer.chroma();
+    if request.capture_mode == CaptureMode::DedicatedNvFbc {
+        #[cfg(not(windows))]
+        {
+            return Err(BackendError::unsupported(
+                "NvFBC 录制流水线",
+                "Windows NvFBC",
+                "当前操作系统不支持 NvFBC 专用捕获",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            if !caps.nvfbc_usable() {
+                return Err(BackendError::unsupported(
+                    "NvFBC 录制流水线",
+                    "本次启动 NvFBC 探测",
+                    "没有可用专用捕获 route；不得使用配置文件中的历史能力结果",
+                ));
+            }
+            if !caps
+                .supported_chroma_for_capture_mode(request.capture_mode)
+                .contains(&requested_chroma)
+            {
+                return Err(BackendError::unsupported(
+                    "NvFBC 录制流水线",
+                    requested_chroma.doc_label(),
+                    "本次启动 NvFBC/NVENC D3D9Ex 探测未确认该色度路线",
+                ));
+            }
+            return caps.validate_rate_control_config_for_capture_mode(
+                request.capture_mode,
+                requested_chroma,
+                &request.rate_control,
+                "NvFBC 录制流水线",
+            );
+        }
+    }
     if !caps.d3d11_texture_input_supported {
         return Err(BackendError::unsupported(
             "GPU 视频编码",
@@ -358,7 +424,6 @@ fn validate_record_request(
             "active oneVPL/NVENC 后端能力探测未确认 D3D11 texture 输入",
         ));
     }
-    let requested_chroma = request.chroma_writer.chroma();
     if !caps.supported_chroma.contains(&requested_chroma) {
         let reason = caps
             .route_blocker_summary_for_chroma(requested_chroma)

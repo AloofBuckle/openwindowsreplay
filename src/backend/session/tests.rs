@@ -1,4 +1,5 @@
 use super::*;
+use crate::rate_control::RateControlMethod;
 
 #[test]
 fn disk_segment_sidecar_roundtrips_tracks() {
@@ -501,6 +502,87 @@ fn disk_open_segment_ring_can_save_a_static_first_idr_before_any_rotation() {
         1
     );
     assert_eq!(snapshot.audio_track.unwrap().samples.len(), 1);
+}
+
+#[test]
+#[ignore = "需要现代 NVIDIA 驱动、NvFBC V3、HDR PQ 桌面、WASAPI 与 Media Foundation AAC"]
+fn local_nvfbc_controller_memory_ring_saves_hevc_aac_mp4() {
+    let caps = crate::backend::probe_all();
+    assert!(
+        caps.nvfbc_usable(),
+        "NvFBC unavailable: {:?}",
+        caps.nvfbc.error
+    );
+    let chroma = caps
+        .supported_chroma_for_capture_mode(CaptureMode::DedicatedNvFbc)
+        .into_iter()
+        .next()
+        .expect("NvFBC production chroma");
+    let method = if caps.nvfbc.rate_controls.contains(&RateControlMethod::Cqp) {
+        RateControlMethod::Cqp
+    } else {
+        *caps
+            .nvfbc
+            .rate_controls
+            .first()
+            .expect("NvFBC rate control")
+    };
+    let preset = *caps.nvfbc.presets.first().expect("NvFBC preset");
+    let output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("nvfbc-controller-{}", timestamp_for_filename()));
+    let mut config = AppConfig {
+        capture_mode: CaptureMode::DedicatedNvFbc,
+        replay_buffer_mode: ReplayBufferMode::Memory,
+        chroma: Some(chroma),
+        replay_minutes: 0.1,
+        save_dir: output_dir.display().to_string(),
+        ..AppConfig::default()
+    };
+    config.rate_control.method = method;
+    config.rate_control.look_ahead_depth = 0;
+    config.rate_control.nvenc_preset = preset;
+
+    let mut controller = ReplayController::default();
+    controller
+        .start(&config, &caps)
+        .expect("start NvFBC replay");
+    let ready_deadline = Instant::now() + Duration::from_secs(20);
+    while controller.save_readiness() != ReplaySaveReadiness::Ready {
+        for message in controller.drain_log_messages() {
+            eprintln!("nvfbc_controller={message}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "NvFBC encoded ring did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Cross the production source-timed IDR interval so the saved ring proves
+    // that periodic keyframes, not only the first frame, reach the controller.
+    std::thread::sleep(Duration::from_millis(5_300));
+    controller.save(&config).expect("save NvFBC replay");
+    let saved = std::fs::read_dir(&output_dir)
+        .expect("read NvFBC output directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "mp4"))
+        .expect("saved NvFBC MP4");
+    eprintln!("nvfbc_controller_output={}", saved.display());
+
+    controller.stop().expect("stop NvFBC replay");
+    let stop_deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(controller.state(), ReplayState::Idle) {
+        for message in controller.drain_log_messages() {
+            eprintln!("nvfbc_controller={message}");
+        }
+        assert!(
+            Instant::now() < stop_deadline,
+            "NvFBC replay did not stop promptly"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(saved.metadata().expect("saved MP4 metadata").len() > 0);
 }
 
 #[test]

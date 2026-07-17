@@ -25,6 +25,8 @@ mod probe;
 mod record;
 mod record_loop;
 mod record_nvenc;
+#[cfg(windows)]
+mod record_nvfbc;
 mod route;
 mod shaders;
 mod timing;
@@ -64,6 +66,10 @@ pub use record_nvenc::{
     record_nvenc_d3d11_onecopy_mp4_output_cancelable,
     record_nvenc_wgc_d3d11_onecopy_memory_output_with_sink_cancelable,
     record_nvenc_wgc_d3d11_onecopy_mp4_output_cancelable,
+};
+#[cfg(windows)]
+pub use record_nvfbc::{
+    record_nvfbc_memory_output_with_sink_cancelable, record_nvfbc_mp4_output_cancelable,
 };
 
 #[cfg(test)]

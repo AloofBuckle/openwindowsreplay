@@ -1,5 +1,16 @@
 use super::*;
 
+pub(super) const fn capture_mode_switch_target(
+    effective_mode: CaptureMode,
+    nvfbc_usable: bool,
+) -> Option<CaptureMode> {
+    match effective_mode {
+        CaptureMode::Generic if nvfbc_usable => Some(CaptureMode::DedicatedNvFbc),
+        CaptureMode::Generic => None,
+        CaptureMode::DedicatedNvFbc => Some(CaptureMode::Generic),
+    }
+}
+
 impl eframe::App for RustReplayApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
@@ -285,12 +296,12 @@ impl RustReplayApp {
             let supported = self
                 .caps
                 .as_ref()
-                .map(|c| c.supported_chroma.as_slice())
-                .unwrap_or(&[]);
+                .map(|caps| caps.supported_chroma_for_capture_mode(self.effective_capture_mode))
+                .unwrap_or_default();
             if supported.is_empty() {
                 ui.small("当前没有完整桌面同步路径，已隐藏不可用色度字段；详情见编码器日志。");
             } else {
-                for &chroma in supported {
+                for chroma in supported {
                     ui.radio_value(
                         &mut self.config.chroma,
                         Some(chroma),
@@ -327,7 +338,11 @@ impl RustReplayApp {
                     let backend = self
                         .caps
                         .as_ref()
-                        .and_then(|caps| caps.video_encoder_selection.active);
+                        .and_then(|caps| {
+                            caps.video_encoder_backend_for_capture_mode(
+                                self.effective_capture_mode,
+                            )
+                        });
                     rate_control_fields(ui, &mut self.config.rate_control, &features, backend);
                 } else if let Some(first) = supported.first() {
                     self.config.rate_control.method = *first;
@@ -336,16 +351,20 @@ impl RustReplayApp {
                     let backend = self
                         .caps
                         .as_ref()
-                        .and_then(|caps| caps.video_encoder_selection.active);
+                        .and_then(|caps| {
+                            caps.video_encoder_backend_for_capture_mode(
+                                self.effective_capture_mode,
+                            )
+                        });
                     rate_control_fields(ui, &mut self.config.rate_control, &features, backend);
                 }
             }
         });
 
         let nvenc_tuning = self.config.chroma.and_then(|chroma| {
-            self.caps
-                .as_ref()
-                .and_then(|caps| caps.nvenc_tuning_support_for_chroma(chroma))
+            self.caps.as_ref().and_then(|caps| {
+                caps.nvenc_tuning_support_for_capture_mode(self.effective_capture_mode, chroma)
+            })
         });
         if let Some(tuning) = nvenc_tuning {
             ui.add_space(8.0);
@@ -363,7 +382,8 @@ impl RustReplayApp {
         let Some(chroma) = self.config.chroma else {
             return Vec::new();
         };
-        caps.rate_controls_for_chroma(chroma).to_vec()
+        caps.rate_controls_for_capture_mode(self.effective_capture_mode, chroma)
+            .to_vec()
     }
 
     pub(super) fn current_rate_control_features(
@@ -376,20 +396,45 @@ impl RustReplayApp {
         let Some(chroma) = self.config.chroma else {
             return RateControlFeatureSupport::hidden(method);
         };
-        caps.rate_control_features_for(chroma, method)
+        caps.rate_control_features_for_capture_mode(self.effective_capture_mode, chroma, method)
     }
 
     pub(super) fn right_loop_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("录制循环器参数");
         ui.group(|ui| {
             ui.label("捕获后端");
-            for backend in CaptureBackend::all() {
-                ui.radio_value(&mut self.config.capture_backend, backend, backend.label());
+            match self.effective_capture_mode {
+                CaptureMode::Generic => {
+                    for backend in CaptureBackend::all() {
+                        ui.radio_value(&mut self.config.capture_backend, backend, backend.label());
+                    }
+                    ui.small(format!(
+                        "当前选择：{}；DDA 不录制鼠标光标，WGC 录制鼠标光标。",
+                        self.config.capture_backend.short_name()
+                    ));
+                    let switch_target = capture_mode_switch_target(
+                        self.effective_capture_mode,
+                        self.caps.as_ref().is_some_and(ProbeCaps::nvfbc_usable),
+                    );
+                    if let Some(target) = switch_target
+                        && ui.button("切换到专用捕获（重启）").clicked()
+                    {
+                        self.restart_with_capture_mode(ui.ctx(), target);
+                    }
+                }
+                CaptureMode::DedicatedNvFbc => {
+                    ui.label("当前使用 NvFBC 专用捕获");
+                    let switch_target = capture_mode_switch_target(
+                        self.effective_capture_mode,
+                        self.caps.as_ref().is_some_and(ProbeCaps::nvfbc_usable),
+                    );
+                    if ui.button("切换到通用捕获（重启）").clicked()
+                        && let Some(target) = switch_target
+                    {
+                        self.restart_with_capture_mode(ui.ctx(), target);
+                    }
+                }
             }
-            ui.small(format!(
-                "当前选择：{}；DDA 不录制鼠标光标，WGC 录制鼠标光标。",
-                self.config.capture_backend.short_name()
-            ));
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 let mut disk_mode = self.config.replay_buffer_mode.is_disk();

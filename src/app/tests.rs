@@ -1,5 +1,22 @@
+use super::ui::capture_mode_switch_target;
 use super::*;
 use crate::rate_control::{NvencMultiPass, NvencPreset, NvencSplitEncodeMode};
+
+#[test]
+fn capture_mode_controls_hide_unavailable_dedicated_switch_and_preserve_return_path() {
+    assert_eq!(
+        capture_mode_switch_target(CaptureMode::Generic, false),
+        None
+    );
+    assert_eq!(
+        capture_mode_switch_target(CaptureMode::Generic, true),
+        Some(CaptureMode::DedicatedNvFbc)
+    );
+    assert_eq!(
+        capture_mode_switch_target(CaptureMode::DedicatedNvFbc, true),
+        Some(CaptureMode::Generic)
+    );
+}
 
 #[test]
 fn switching_from_nvenc_clears_nvenc_only_rate_control_fields() {

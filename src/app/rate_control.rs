@@ -150,17 +150,22 @@ pub(super) fn rate_control_fields(
     }
 }
 
-pub(super) fn sanitize_config_against_caps(config: &mut AppConfig, caps: &ProbeCaps) {
+pub(super) fn sanitize_config_against_caps(
+    config: &mut AppConfig,
+    caps: &ProbeCaps,
+    capture_mode: CaptureMode,
+) {
+    let supported_chroma = caps.supported_chroma_for_capture_mode(capture_mode);
     if config.chroma.is_none()
         || config
             .chroma
-            .is_some_and(|chroma| !caps.supported_chroma.contains(&chroma))
+            .is_some_and(|chroma| !supported_chroma.contains(&chroma))
     {
-        config.chroma = caps.supported_chroma.first().copied();
+        config.chroma = supported_chroma.first().copied();
     }
     let supported_rate_controls = config
         .chroma
-        .map(|chroma| caps.rate_controls_for_chroma(chroma))
+        .map(|chroma| caps.rate_controls_for_capture_mode(capture_mode, chroma))
         .unwrap_or(&[]);
     if !supported_rate_controls.is_empty()
         && !supported_rate_controls.contains(&config.rate_control.method)
@@ -168,13 +173,17 @@ pub(super) fn sanitize_config_against_caps(config: &mut AppConfig, caps: &ProbeC
         config.rate_control.method = supported_rate_controls[0];
     }
     if let Some(chroma) = config.chroma {
-        let features = caps.rate_control_features_for(chroma, config.rate_control.method);
+        let features = caps.rate_control_features_for_capture_mode(
+            capture_mode,
+            chroma,
+            config.rate_control.method,
+        );
         sanitize_hidden_rate_control_fields(
             &mut config.rate_control,
             &features,
-            caps.video_encoder_selection.active,
+            caps.video_encoder_backend_for_capture_mode(capture_mode),
         );
-        let tuning = caps.nvenc_tuning_support_for_chroma(chroma);
+        let tuning = caps.nvenc_tuning_support_for_capture_mode(capture_mode, chroma);
         sanitize_nvenc_tuning_fields(&mut config.rate_control, tuning.as_ref());
     } else {
         sanitize_nvenc_tuning_fields(&mut config.rate_control, None);

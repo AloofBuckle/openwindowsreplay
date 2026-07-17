@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub capture_mode: CaptureMode,
     pub capture_backend: CaptureBackend,
     pub replay_buffer_mode: ReplayBufferMode,
     pub chroma: Option<ChromaSampling>,
@@ -28,6 +29,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            capture_mode: CaptureMode::Generic,
             capture_backend: CaptureBackend::Wgc,
             replay_buffer_mode: ReplayBufferMode::Memory,
             chroma: None,
@@ -39,6 +41,22 @@ impl Default for AppConfig {
             start_minimized_to_tray: false,
             save_hotkey: HotkeyConfig::default(),
             indicator: IndicatorConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureMode {
+    #[default]
+    Generic,
+    DedicatedNvFbc,
+}
+
+impl CaptureMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "通用捕获",
+            Self::DedicatedNvFbc => "NvFBC 专用捕获",
         }
     }
 }
@@ -412,5 +430,41 @@ impl ChromaSampling {
             Self::Yuv422 => &["YUY2", "Y210", "P210"],
             Self::Yuv444 => &["AYUV", "Y410", "RGB4"],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_without_capture_mode_defaults_to_generic_and_keeps_backend() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+                "capture_backend": "Dda",
+                "cache_dir": "legacy-cache",
+                "save_dir": "legacy-save"
+            }"#,
+        )
+        .expect("deserialize legacy config");
+
+        assert_eq!(config.capture_mode, CaptureMode::Generic);
+        assert_eq!(config.capture_backend, CaptureBackend::Dda);
+        assert_eq!(config.cache_dir, "legacy-cache");
+        assert_eq!(config.save_dir, "legacy-save");
+    }
+
+    #[test]
+    fn dedicated_capture_preference_is_serialized_independently_from_generic_backend() {
+        let config = AppConfig {
+            capture_mode: CaptureMode::DedicatedNvFbc,
+            capture_backend: CaptureBackend::Dda,
+            ..AppConfig::default()
+        };
+        let restored: AppConfig =
+            serde_json::from_str(&config.stable_json()).expect("round-trip config");
+
+        assert_eq!(restored.capture_mode, CaptureMode::DedicatedNvFbc);
+        assert_eq!(restored.capture_backend, CaptureBackend::Dda);
     }
 }

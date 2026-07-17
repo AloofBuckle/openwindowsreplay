@@ -26,6 +26,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    wait_for_relaunch_parent();
     set_process_dpi_awareness();
     let Some(single_instance) =
         single_instance::SingleInstance::acquire().map_err(|err| anyhow::anyhow!(err))?
@@ -57,6 +58,33 @@ fn run() -> anyhow::Result<()> {
     )
     .map_err(|err| anyhow::anyhow!(err.to_string()))
 }
+
+#[cfg(windows)]
+fn wait_for_relaunch_parent() {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--rustreplay-relaunch-after-pid") {
+        return;
+    }
+    let Some(parent_pid) = args.next().and_then(|value| value.parse::<u32>().ok()) else {
+        return;
+    };
+    let Ok(parent) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }) else {
+        // The old process may already have exited before the helper opened it.
+        return;
+    };
+    unsafe {
+        let _ = WaitForSingleObject(parent, INFINITE);
+        let _ = CloseHandle(parent);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_relaunch_parent() {}
 
 #[cfg(windows)]
 fn set_process_dpi_awareness() {

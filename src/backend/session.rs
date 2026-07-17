@@ -11,7 +11,7 @@ use crate::backend::mp4_mux::{
     HevcIndexedSample, HevcMp4Track, HevcParameterSets, HevcPreparedMp4Track, HevcPreparedSample,
     Mp4SampleFileRange, NclxColorMetadata,
 };
-use crate::config::{AppConfig, CaptureBackend, ChromaSampling, ReplayBufferMode};
+use crate::config::{AppConfig, CaptureBackend, CaptureMode, ChromaSampling, ReplayBufferMode};
 use crate::error::BackendError;
 use crate::ring::{EncodedReplayMetadata, EncodedReplayRing};
 use std::collections::VecDeque;

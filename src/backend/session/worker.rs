@@ -27,18 +27,23 @@ pub(super) fn run_recording_worker(
     let mut run_index = 0u64;
     let mut terminal_error = None;
     'recording: while !stop_flag.load(Ordering::Relaxed) {
-        let Some(record_target) = caps.record_target_for_chroma(requested_chroma) else {
+        let Some(record_target) =
+            caps.record_target_for_capture_mode(request.capture_mode, requested_chroma)
+        else {
             terminal_error = Some(format!(
-                "能力探测没有为 active 编码后端选出 {} 的 adapter/output 录制目标",
-                requested_chroma.doc_label()
+                "能力探测没有为 {}选出 {} 的 adapter/output 录制目标",
+                request.capture_mode.label(),
+                requested_chroma.doc_label(),
             ));
             break;
         };
         let _ = tx.send(ReplayEvent::BackendStatus {
             index: run_index,
             message: format!(
-                "录制目标来自能力探测：adapter={} output={}",
-                record_target.adapter_index, record_target.output_index
+                "录制目标来自能力探测：mode={} adapter={} output={}",
+                request.capture_mode.label(),
+                record_target.adapter_index,
+                record_target.output_index
             ),
         });
         let output_dir = cache_dir.as_ref().unwrap_or(&save_dir);

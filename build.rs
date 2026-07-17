@@ -101,14 +101,41 @@ fn build_nvfbc_shim() {
         build.flag("/GR-").flag("/utf-8");
     } else {
         build.flag("-fno-exceptions").flag("-fno-rtti");
-        if let Some(toolchain_root) = compiler.path().parent().and_then(Path::parent) {
-            let library_dir = toolchain_root.join("lib");
-            if library_dir.is_dir() {
-                println!("cargo:rustc-link-search=native={}", library_dir.display());
-            }
-        }
     }
     build.compile("rustreplay_nvfbc_shim");
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        stage_gnu_import_library("libshlwapi.a", compiler.path());
+    }
+}
+
+fn stage_gnu_import_library(name: &str, compiler: &Path) {
+    let mut candidates = Vec::new();
+    if let Some(toolchain_root) = compiler.parent().and_then(Path::parent) {
+        candidates.push(toolchain_root.join("lib").join(name));
+        candidates.push(
+            toolchain_root
+                .join("x86_64-w64-mingw32")
+                .join("lib")
+                .join(name),
+        );
+    }
+    candidates.extend([
+        PathBuf::from(r"C:\msys64\mingw64\lib").join(name),
+        PathBuf::from(r"C:\msys64\ucrt64\lib").join(name),
+    ]);
+    let Some(source) = candidates
+        .iter()
+        .find(|candidate| is_regular_file(candidate))
+    else {
+        return;
+    };
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
+    fs::copy(source, out_dir.join(name)).unwrap_or_else(|err| {
+        panic!(
+            "failed to stage GNU Windows import library {}: {err}",
+            source.display()
+        )
+    });
 }
 
 fn find_executable_on_path(name: &str) -> Option<PathBuf> {

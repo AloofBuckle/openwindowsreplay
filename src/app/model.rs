@@ -69,6 +69,9 @@ impl IndicatorImages {
 
 pub struct RustReplayApp {
     pub(super) config: AppConfig,
+    /// 本次启动实际使用的捕获模式。NvFBC 偏好不可用时仅此字段回退，
+    /// 不覆盖配置文件中的专用捕获偏好。
+    pub(super) effective_capture_mode: CaptureMode,
     pub(super) caps: Option<ProbeCaps>,
     pub(super) probe_rx: Option<Receiver<ProbeCaps>>,
     pub(super) controller: ReplayController,
@@ -116,6 +119,7 @@ impl RustReplayApp {
         let startup_hidden_to_tray = config.start_minimized_to_tray;
         let mut this = Self {
             config,
+            effective_capture_mode: CaptureMode::Generic,
             caps: None,
             probe_rx: None,
             controller: ReplayController::default(),
@@ -453,7 +457,60 @@ impl RustReplayApp {
             self.encoder_log.push(format!("路径阻断：{reason}"));
         }
 
-        sanitize_config_against_caps(&mut self.config, &caps);
+        #[cfg(windows)]
+        if caps.nvfbc.available {
+            self.encoder_log.push(format!(
+                "NvFBC 本次启动探测：available=true version={} display={}x{} routes=[{}] rate=[{}] presets=[{}] engines={}",
+                caps.nvfbc.nvfbc_version,
+                caps.nvfbc.capture_width,
+                caps.nvfbc.capture_height,
+                caps.nvfbc
+                    .routes
+                    .iter()
+                    .filter(|route| route.supported)
+                    .map(|route| route.chroma.doc_label())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                caps.nvfbc
+                    .rate_controls
+                    .iter()
+                    .map(|method| method.short_name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                caps.nvfbc
+                    .presets
+                    .iter()
+                    .map(|preset| preset.raw_name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                caps.nvfbc.encoder_engines,
+            ));
+        } else {
+            self.encoder_log.push(format!(
+                "NvFBC 本次启动探测：不可用；{}",
+                caps.nvfbc
+                    .error
+                    .as_deref()
+                    .unwrap_or("未形成支持的专用捕获 route")
+            ));
+        }
+
+        self.effective_capture_mode = caps.effective_capture_mode(self.config.capture_mode);
+        if self.config.capture_mode == CaptureMode::DedicatedNvFbc
+            && self.effective_capture_mode == CaptureMode::Generic
+        {
+            self.encoder_log.push(
+                "配置请求 NvFBC 专用捕获，但本次启动探测不可用；仅本次运行回退到配置中保留的 DDA/WGC 通用捕获，专用偏好未被覆盖。"
+                    .to_owned(),
+            );
+        } else {
+            self.encoder_log.push(format!(
+                "本次启动有效捕获模式：{}",
+                self.effective_capture_mode.label()
+            ));
+        }
+
+        sanitize_config_against_caps(&mut self.config, &caps, self.effective_capture_mode);
         self.caps = Some(caps);
         if self.startup_auto_start_pending && self.config.start_recording_on_launch {
             self.loop_log
@@ -718,7 +775,8 @@ impl RustReplayApp {
 
         self.config = AppConfig::default();
         if let Some(caps) = &self.caps {
-            sanitize_config_against_caps(&mut self.config, caps);
+            self.effective_capture_mode = caps.effective_capture_mode(self.config.capture_mode);
+            sanitize_config_against_caps(&mut self.config, caps, self.effective_capture_mode);
         }
         self.rebuild_indicator_images();
         self.configuring_indicator_position = false;
@@ -729,6 +787,47 @@ impl RustReplayApp {
         self.hotkey.set_hotkey(Some(self.config.save_hotkey));
         self.last_saved_config_json.clear();
         self.persist_config_if_changed();
+    }
+
+    pub(super) fn restart_with_capture_mode(
+        &mut self,
+        ctx: &egui::Context,
+        capture_mode: CaptureMode,
+    ) {
+        if self.config_read_only() || self.is_initializing() {
+            self.loop_log
+                .push("录制运行或能力探测期间不能切换捕获模式。".to_owned());
+            return;
+        }
+        let previous = self.config.capture_mode;
+        self.config.capture_mode = capture_mode;
+        let current = self.config.stable_json();
+        if let Err(err) = self.config.save_to_disk() {
+            self.config.capture_mode = previous;
+            self.loop_log
+                .push(format!("切换捕获模式前保存配置失败：{err}"));
+            return;
+        }
+        self.last_saved_config_json = current;
+        if let Err(err) = spawn_relaunch_after_exit() {
+            self.config.capture_mode = previous;
+            if let Err(rollback_err) = self.config.save_to_disk() {
+                self.loop_log.push(format!(
+                    "重启失败：{err}；恢复原捕获模式时写配置也失败：{rollback_err}"
+                ));
+            } else {
+                self.last_saved_config_json = self.config.stable_json();
+                self.loop_log
+                    .push(format!("重启失败，已恢复原捕获模式：{err}"));
+            }
+            return;
+        }
+        self.loop_log.push(format!(
+            "已保存捕获模式为 {}，正在重启应用。",
+            capture_mode.label()
+        ));
+        self.allow_exit = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     pub(super) fn update_indicator_runtime(&mut self, ctx: &egui::Context) {

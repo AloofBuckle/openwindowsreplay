@@ -77,6 +77,16 @@ pub(super) fn restore_root_window_from_tray_start() {
 #[cfg(not(windows))]
 pub(super) fn restore_root_window_from_tray_start() {}
 
+pub(super) fn spawn_relaunch_after_exit() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|err| format!("定位当前 EXE 失败：{err}"))?;
+    std::process::Command::new(&executable)
+        .arg("--rustreplay-relaunch-after-pid")
+        .arg(std::process::id().to_string())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("启动重启等待进程 {} 失败：{err}", executable.display()))
+}
+
 #[cfg(windows)]
 pub(super) fn find_root_window() -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;

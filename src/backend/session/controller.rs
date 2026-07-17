@@ -244,7 +244,8 @@ impl ReplayController {
             ));
         }
 
-        let chroma = validate_config(config, caps)?;
+        let capture_mode = caps.effective_capture_mode(config.capture_mode);
+        let chroma = validate_config(config, caps, capture_mode)?;
         let save_dir = PathBuf::from(&config.save_dir);
         fs::create_dir_all(&save_dir).map_err(|err| BackendError::Io(err.to_string()))?;
         cleanup_stale_replay_parts(&save_dir)?;
@@ -260,6 +261,7 @@ impl ReplayController {
         };
 
         let request = pipeline::RecordingRequest {
+            capture_mode,
             capture_backend: capture_backend_for_config(config.capture_backend),
             color_transform: pipeline::ColorTransformKind::AutoFromDisplay,
             chroma_writer: chroma_writer_for_chroma(chroma),
@@ -540,22 +542,34 @@ fn cleanup_stale_replay_parts(save_dir: &Path) -> Result<(), BackendError> {
 pub(super) fn validate_config(
     config: &AppConfig,
     caps: &ProbeCaps,
+    capture_mode: CaptureMode,
 ) -> Result<ChromaSampling, BackendError> {
     let chroma = config.chroma.ok_or_else(|| {
         BackendError::unsupported("GUI 参数", "色度采样", "没有已验证的色度采样可选项")
     })?;
 
-    if !caps.supported_chroma.contains(&chroma) {
+    if !caps
+        .supported_chroma_for_capture_mode(capture_mode)
+        .contains(&chroma)
+    {
         return Err(BackendError::unsupported(
             "创建录制会话",
             format!("色度采样 {}", chroma.doc_label()),
-            "后端未报告该色度采样存在完整 GPU-only 路径，GUI 正常情况下会隐藏它",
+            format!(
+                "{}后端未报告该色度采样存在完整生产路径，GUI 正常情况下会隐藏它",
+                capture_mode.label()
+            ),
         ));
     }
 
-    caps.validate_rate_control_config(chroma, &config.rate_control, "创建录制会话")?;
+    caps.validate_rate_control_config_for_capture_mode(
+        capture_mode,
+        chroma,
+        &config.rate_control,
+        "创建录制会话",
+    )?;
 
-    if !caps.desktop_sync_path_available {
+    if capture_mode == CaptureMode::Generic && !caps.desktop_sync_path_available {
         return Err(BackendError::unsupported(
             "创建录制会话",
             "当前显示器状态 + 捕获 + GPU 转换 + HEVC 硬编完整路径",
@@ -563,6 +577,13 @@ pub(super) fn validate_config(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "没有可用桌面同步录制路径".to_owned()),
+        ));
+    }
+    if capture_mode == CaptureMode::DedicatedNvFbc && !caps.nvfbc_usable() {
+        return Err(BackendError::unsupported(
+            "创建录制会话",
+            "NvFBC 专用捕获",
+            "本次启动未探测到可用 NvFBC route；应回退通用捕获且隐藏专用切换按钮",
         ));
     }
     Ok(chroma)

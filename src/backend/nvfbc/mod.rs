@@ -15,7 +15,7 @@ use crate::config::ChromaSampling;
 use crate::error::BackendError;
 use crate::rate_control::{NvencPreset, RateControlConfig, RateControlMethod};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 const SURFACE_COUNT: usize = 3;
 
@@ -92,9 +92,12 @@ impl Default for NvFbcOptions {
 
 #[derive(Debug)]
 pub struct NvFbcCaptureResult {
-    /// Arrival timestamp of the successful NvFBC grab, relative to the first
-    /// captured frame. NvFBC V3 exposes no independent source-QPC timestamp.
+    /// 成功 NvFBC Grab 后采样的到达时间，相对首个捕获帧映射到 90kHz。
+    /// NvFBC V3 不提供独立源 QPC，因此不能把它描述为应用呈现时间。
     pub capture_timestamp_90k: u64,
+    /// 与 WASAPI `IAudioCaptureClient::GetBuffer` QPCPosition 相同的
+    /// 100ns 绝对时基，用于音画同步，不能由相对视频时间线反推。
+    pub capture_timestamp_100ns: i64,
     pub source_pid: u32,
     pub wait_mode_used: u32,
     pub access_units: Vec<HevcAccessUnit>,
@@ -126,7 +129,8 @@ pub struct NvFbcRecorder {
     height: u32,
     chroma: ChromaSampling,
     color: NclxColorMetadata,
-    timeline_origin: Option<Instant>,
+    qpc_frequency: i64,
+    timeline_origin_qpc: Option<i64>,
     last_timestamp_90k: Option<u64>,
 }
 
@@ -199,6 +203,7 @@ impl NvFbcRecorder {
             capture.device.display().refresh_numerator,
             capture.device.display().refresh_denominator,
         )?;
+        let qpc_frequency = query_qpc_frequency()?;
 
         Ok(Self {
             encoder: Some(encoder),
@@ -207,7 +212,8 @@ impl NvFbcRecorder {
             height: create_info.height,
             chroma: options.chroma,
             color: display_color.mp4_color,
-            timeline_origin: None,
+            qpc_frequency,
+            timeline_origin_qpc: None,
             last_timestamp_90k: None,
         })
     }
@@ -225,6 +231,13 @@ impl NvFbcRecorder {
     }
 
     pub fn capture_next(&mut self) -> Result<NvFbcCaptureResult, BackendError> {
+        self.capture_next_with_force_idr(false)
+    }
+
+    pub fn capture_next_with_force_idr(
+        &mut self,
+        force_idr: bool,
+    ) -> Result<NvFbcCaptureResult, BackendError> {
         let slot_index = self.encoder()?.next_surface_index()?;
         let capture = self.capture.as_mut().ok_or_else(|| {
             BackendError::unsupported("NvFBC recorder", "capture stack", "recorder 已关闭")
@@ -237,7 +250,7 @@ impl NvFbcRecorder {
                 BackendError::unsupported("NvFBC recorder", "capture session", "session 已关闭")
             })?
             .grab(slot_index)?;
-        let arrival = Instant::now();
+        let qpc = query_qpc_counter()?;
 
         if info.width != self.width
             || info.height != self.height
@@ -267,14 +280,16 @@ impl NvFbcRecorder {
             ));
         }
 
-        let timestamp_90k = self.arrival_timestamp_90k(arrival)?;
-        let force_idr = self.last_timestamp_90k.is_none();
+        let timestamp_100ns = qpc_counter_to_100ns(qpc, self.qpc_frequency)?;
+        let timestamp_90k = self.arrival_timestamp_90k(qpc)?;
+        let force_idr = force_idr || self.last_timestamp_90k.is_none();
         let access_units =
             self.encoder()?
                 .submit_surface(slot_index, timestamp_90k, force_idr, false)?;
         self.last_timestamp_90k = Some(timestamp_90k);
         Ok(NvFbcCaptureResult {
             capture_timestamp_90k: timestamp_90k,
+            capture_timestamp_100ns: timestamp_100ns,
             source_pid: info.source_pid,
             wait_mode_used: info.wait_mode_used,
             access_units,
@@ -299,11 +314,12 @@ impl NvFbcRecorder {
         })
     }
 
-    fn arrival_timestamp_90k(&mut self, arrival: Instant) -> Result<u64, BackendError> {
-        let origin = *self.timeline_origin.get_or_insert(arrival);
-        let elapsed = arrival.saturating_duration_since(origin);
-        let timestamp = (elapsed.as_nanos().saturating_mul(90_000) / 1_000_000_000)
-            .min(u128::from(u64::MAX)) as u64;
+    fn arrival_timestamp_90k(&mut self, qpc: i64) -> Result<u64, BackendError> {
+        let origin = *self.timeline_origin_qpc.get_or_insert(qpc);
+        let timestamp = ((i128::from(qpc.saturating_sub(origin).max(0)) * 90_000
+            + i128::from(self.qpc_frequency / 2))
+            / i128::from(self.qpc_frequency))
+        .min(i128::from(u64::MAX)) as u64;
         if let Some(previous) = self.last_timestamp_90k
             && timestamp <= previous
         {
@@ -315,6 +331,47 @@ impl NvFbcRecorder {
         }
         Ok(timestamp)
     }
+}
+
+fn query_qpc_frequency() -> Result<i64, BackendError> {
+    let mut frequency = 0i64;
+    unsafe { QueryPerformanceFrequency(&mut frequency) }.map_err(|err| {
+        BackendError::WindowsApi {
+            func: "QueryPerformanceFrequency(NvFBC)",
+            message: err.to_string(),
+        }
+    })?;
+    if frequency <= 0 {
+        return Err(BackendError::unsupported(
+            "NvFBC timestamp",
+            format!("QPC frequency={frequency}"),
+            "系统没有返回有效 QPC 频率",
+        ));
+    }
+    Ok(frequency)
+}
+
+fn query_qpc_counter() -> Result<i64, BackendError> {
+    let mut counter = 0i64;
+    unsafe { QueryPerformanceCounter(&mut counter) }.map_err(|err| BackendError::WindowsApi {
+        func: "QueryPerformanceCounter(NvFBC)",
+        message: err.to_string(),
+    })?;
+    Ok(counter)
+}
+
+fn qpc_counter_to_100ns(counter: i64, frequency: i64) -> Result<i64, BackendError> {
+    if counter <= 0 || frequency <= 0 {
+        return Err(BackendError::unsupported(
+            "NvFBC timestamp",
+            format!("QPC counter={counter} frequency={frequency}"),
+            "无法构造与 WASAPI 对齐的绝对 100ns 时间戳",
+        ));
+    }
+    Ok(
+        ((i128::from(counter) * 10_000_000 + i128::from(frequency / 2)) / i128::from(frequency))
+            as i64,
+    )
 }
 
 fn probe_impl(adapter_index: Option<u32>) -> Result<NvFbcProbeInfo, BackendError> {

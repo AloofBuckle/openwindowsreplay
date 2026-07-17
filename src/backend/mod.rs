@@ -12,7 +12,7 @@ pub mod session;
 pub mod vpl;
 pub mod wasapi;
 
-use crate::config::ChromaSampling;
+use crate::config::{CaptureMode, ChromaSampling};
 use crate::error::BackendError;
 use crate::rate_control::{
     NvencMultiPass, NvencPreset, NvencSplitEncodeMode, RateControlConfig, RateControlMethod,
@@ -29,6 +29,10 @@ pub struct ProbeCaps {
     /// NVIDIA NVENC 驱动/SDK 运行时探测。NVENC fork 保留 oneVPL 探测，同时
     /// 独立枚举 NVENC D3D11 HEVC 能力，后续由自动后端选择器按 adapter/route 决定。
     pub nvenc: nvenc::NvencProbeInfo,
+    /// 本次进程启动时实时探测的 NvFBC/NVENC D3D9Ex 专用捕获能力。
+    /// 该值只存在于运行时能力对象中，绝不写入用户配置。
+    #[cfg(windows)]
+    pub nvfbc: nvfbc::NvFbcProbeInfo,
     /// 自动视频编码器选择结果。oneVPL 生产路径仍优先；当 oneVPL 不能形成当前
     /// 显示器 GPU-only HEVC 路径而 NVENC NV12/P010 或 SDR AYUV route 可用时，
     /// NVENC 会作为 production-ready fallback 被选中。
@@ -250,6 +254,109 @@ impl RateControlFeatureSupport {
 }
 
 impl ProbeCaps {
+    #[cfg(windows)]
+    pub fn nvfbc_usable(&self) -> bool {
+        self.nvfbc.available
+            && !self.nvfbc.rate_controls.is_empty()
+            && !self.nvfbc.presets.is_empty()
+            && self.nvfbc.routes.iter().any(|route| route.supported)
+    }
+
+    #[cfg(not(windows))]
+    pub const fn nvfbc_usable(&self) -> bool {
+        false
+    }
+
+    pub fn effective_capture_mode(&self, preferred: CaptureMode) -> CaptureMode {
+        resolve_capture_mode(preferred, self.nvfbc_usable())
+    }
+
+    pub fn supported_chroma_for_capture_mode(&self, mode: CaptureMode) -> Vec<ChromaSampling> {
+        match mode {
+            CaptureMode::Generic => self.supported_chroma.clone(),
+            CaptureMode::DedicatedNvFbc => {
+                #[cfg(windows)]
+                {
+                    self.nvfbc
+                        .routes
+                        .iter()
+                        .filter(|route| route.supported)
+                        .map(|route| route.chroma)
+                        .collect()
+                }
+                #[cfg(not(windows))]
+                {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    pub fn rate_controls_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+        chroma: ChromaSampling,
+    ) -> &[RateControlMethod] {
+        match mode {
+            CaptureMode::Generic => self.rate_controls_for_chroma(chroma),
+            CaptureMode::DedicatedNvFbc => {
+                #[cfg(windows)]
+                {
+                    if self
+                        .nvfbc
+                        .routes
+                        .iter()
+                        .any(|route| route.chroma == chroma && route.supported)
+                    {
+                        self.nvfbc.rate_controls.as_slice()
+                    } else {
+                        &[]
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    &[]
+                }
+            }
+        }
+    }
+
+    pub fn rate_control_features_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+        chroma: ChromaSampling,
+        method: RateControlMethod,
+    ) -> RateControlFeatureSupport {
+        match mode {
+            CaptureMode::Generic => self.rate_control_features_for(chroma, method),
+            CaptureMode::DedicatedNvFbc => {
+                if !self
+                    .rate_controls_for_capture_mode(mode, chroma)
+                    .contains(&method)
+                {
+                    return RateControlFeatureSupport::hidden(method);
+                }
+                let mut support = RateControlFeatureSupport::hidden(method);
+                // NvFBC 的三表面直连路线明确禁止 Lookahead。其余可见字段
+                // 直接对应已接线的 NV_ENC_RC_PARAMS，而不是 oneVPL 扩展字段。
+                support.nvenc_spatial_aq = true;
+                support.nvenc_target_quality = matches!(method, RateControlMethod::Vbr);
+                support
+            }
+        }
+    }
+
+    pub fn video_encoder_backend_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+    ) -> Option<VideoEncoderBackend> {
+        match mode {
+            CaptureMode::Generic => self.video_encoder_selection.active,
+            CaptureMode::DedicatedNvFbc if self.nvfbc_usable() => Some(VideoEncoderBackend::Nvenc),
+            CaptureMode::DedicatedNvFbc => None,
+        }
+    }
+
     pub fn preferred_vpl_route_for_chroma(
         &self,
         chroma: ChromaSampling,
@@ -311,6 +418,36 @@ impl ProbeCaps {
                     })
             }
             None => None,
+        }
+    }
+
+    pub fn record_target_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+        chroma: ChromaSampling,
+    ) -> Option<RecordTarget> {
+        match mode {
+            CaptureMode::Generic => self.record_target_for_chroma(chroma),
+            CaptureMode::DedicatedNvFbc => {
+                #[cfg(windows)]
+                {
+                    let route_supported = self
+                        .nvfbc
+                        .routes
+                        .iter()
+                        .any(|route| route.chroma == chroma && route.supported);
+                    route_supported.then(|| {
+                        self.nvfbc.display.as_ref().map(|display| RecordTarget {
+                            adapter_index: display.dxgi_adapter_index,
+                            output_index: display.output_index,
+                        })
+                    })?
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            }
         }
     }
 
@@ -458,25 +595,78 @@ impl ProbeCaps {
         })
     }
 
+    pub fn nvenc_tuning_support_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+        chroma: ChromaSampling,
+    ) -> Option<NvencTuningSupport> {
+        match mode {
+            CaptureMode::Generic => self.nvenc_tuning_support_for_chroma(chroma),
+            CaptureMode::DedicatedNvFbc => {
+                #[cfg(windows)]
+                {
+                    if !self
+                        .nvfbc
+                        .routes
+                        .iter()
+                        .any(|route| route.chroma == chroma && route.supported)
+                    {
+                        return None;
+                    }
+                    Some(NvencTuningSupport {
+                        presets: self.nvfbc.presets.clone(),
+                        split_encode_modes: NvencSplitEncodeMode::all().to_vec(),
+                        multi_pass_modes: NvencMultiPass::all().to_vec(),
+                        spatial_aq: true,
+                        encoder_engines: self.nvfbc.encoder_engines.max(1),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            }
+        }
+    }
+
     pub fn validate_rate_control_config(
         &self,
         chroma: ChromaSampling,
         cfg: &RateControlConfig,
         context: &'static str,
     ) -> Result<(), BackendError> {
-        if !self.rate_controls_for_chroma(chroma).contains(&cfg.method) {
+        self.validate_rate_control_config_for_capture_mode(
+            CaptureMode::Generic,
+            chroma,
+            cfg,
+            context,
+        )
+    }
+
+    pub fn validate_rate_control_config_for_capture_mode(
+        &self,
+        mode: CaptureMode,
+        chroma: ChromaSampling,
+        cfg: &RateControlConfig,
+        context: &'static str,
+    ) -> Result<(), BackendError> {
+        if !self
+            .rate_controls_for_capture_mode(mode, chroma)
+            .contains(&cfg.method)
+        {
             return Err(BackendError::unsupported(
                 context,
                 format!("{} + {}", chroma.doc_label(), cfg.method.short_name()),
-                "active 编码后端能力探测未确认该 RateControlMethod 在当前色度生产 route 上可用",
+                format!(
+                    "{}能力探测未确认该 RateControlMethod 在当前色度生产 route 上可用",
+                    mode.label()
+                ),
             ));
         }
-        if matches!(
-            self.video_encoder_selection.active,
-            Some(VideoEncoderBackend::Nvenc)
-        ) {
+        let encoder_backend = self.video_encoder_backend_for_capture_mode(mode);
+        if matches!(encoder_backend, Some(VideoEncoderBackend::Nvenc)) {
             let tuning = self
-                .nvenc_tuning_support_for_chroma(chroma)
+                .nvenc_tuning_support_for_capture_mode(mode, chroma)
                 .ok_or_else(|| {
                     BackendError::unsupported(
                         context,
@@ -535,11 +725,8 @@ impl ProbeCaps {
             cfg.to_nvenc_fields()
                 .map_err(|err| BackendError::unsupported(context, "NVENC RateControl", err))?;
         }
-        let features = self.rate_control_features_for(chroma, cfg.method);
-        if matches!(
-            self.video_encoder_selection.active,
-            Some(VideoEncoderBackend::Nvenc)
-        ) {
+        let features = self.rate_control_features_for_capture_mode(mode, chroma, cfg.method);
+        if matches!(encoder_backend, Some(VideoEncoderBackend::Nvenc)) {
             if cfg.nvenc_spatial_aq && !features.nvenc_spatial_aq {
                 return Err(BackendError::unsupported(
                     context,
@@ -569,7 +756,14 @@ impl ProbeCaps {
                 "External BRC 需要 mfxExtBRC 回调；当前生产后端未接入，GUI 隐藏该字段",
             ));
         }
-        let uses_lookahead = match self.video_encoder_selection.active {
+        if mode == CaptureMode::DedicatedNvFbc && cfg.look_ahead_depth != 0 {
+            return Err(BackendError::unsupported(
+                context,
+                format!("LookAheadDepth={}", cfg.look_ahead_depth),
+                "NvFBC 三表面直连路线明确禁用 Lookahead；前端应隐藏并清零该字段",
+            ));
+        }
+        let uses_lookahead = match encoder_backend {
             Some(VideoEncoderBackend::Nvenc) => {
                 matches!(cfg.method, RateControlMethod::Cbr | RateControlMethod::Vbr)
                     && cfg.look_ahead_depth > 0
@@ -627,6 +821,14 @@ impl ProbeCaps {
             ));
         }
         Ok(())
+    }
+}
+
+const fn resolve_capture_mode(preferred: CaptureMode, nvfbc_usable: bool) -> CaptureMode {
+    if matches!(preferred, CaptureMode::DedicatedNvFbc) && nvfbc_usable {
+        CaptureMode::DedicatedNvFbc
+    } else {
+        CaptureMode::Generic
     }
 }
 
@@ -707,6 +909,8 @@ pub fn probe_all() -> ProbeCaps {
 
     let vpl = vpl::probe_vpl();
     let nvenc = nvenc::probe_nvenc_adapters(&dxgi_adapters);
+    #[cfg(windows)]
+    let nvfbc = nvfbc::probe();
     reasons.extend(vpl.warnings.iter().cloned());
     reasons.extend(
         nvenc
@@ -1018,6 +1222,8 @@ pub fn probe_all() -> ProbeCaps {
             note: "oneVPL dispatcher 及其用户态运行库内嵌于 EXE，启动时校验并释放到 ProgramData 配置目录；发布目录不携带 DLL。GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提".to_owned(),
         },
         path_blockers: reasons,
+        #[cfg(windows)]
+        nvfbc,
         nvenc,
         video_encoder_selection,
         vpl,
@@ -1190,6 +1396,17 @@ mod tests {
                 NvencSplitEncodeMode::Disabled,
             ]
         );
+    }
+
+    #[test]
+    fn dedicated_capture_preference_falls_back_without_overwriting_the_preference() {
+        let preferred = CaptureMode::DedicatedNvFbc;
+        assert_eq!(resolve_capture_mode(preferred, false), CaptureMode::Generic);
+        assert_eq!(
+            resolve_capture_mode(preferred, true),
+            CaptureMode::DedicatedNvFbc
+        );
+        assert_eq!(preferred, CaptureMode::DedicatedNvFbc);
     }
 
     #[test]
