@@ -19,6 +19,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::Arc;
 
 #[cfg(windows)]
 #[path = "nvenc/cuda.rs"]
@@ -858,7 +859,7 @@ impl NvencD3d11Encoder {
         let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
         Ok(HevcAccessUnit {
             timestamp_90k,
-            data: output.bytes.into(),
+            data: output.bytes,
             is_sync,
             discard_from_track,
         })
@@ -3243,7 +3244,7 @@ unsafe fn submit_encoder_eos_with_completion(
 
 #[cfg(windows)]
 struct NvencLockedOutput {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     annex_b_start_code_seen: bool,
     output_timestamp_90k: u64,
 }
@@ -3297,14 +3298,12 @@ unsafe fn lock_and_copy_bitstream_with_mode(
             "返回空 bitstreamBufferPtr",
         ));
     }
-    let bytes = std::slice::from_raw_parts(
+    let bytes: Arc<[u8]> = Arc::from(std::slice::from_raw_parts(
         params.bitstreamBufferPtr as *const u8,
         params.bitstreamSizeInBytes as usize,
-    )
-    .to_vec();
-    let annex_b_start_code_seen = bytes
-        .windows(4)
-        .any(|window| window == [0x00, 0x00, 0x00, 0x01]);
+    ));
+    let annex_b_start_code_seen =
+        bytes.starts_with(&[0x00, 0x00, 0x01]) || bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]);
     nvenc_check("NvEncUnlockBitstream", locked.unlock_now())?;
     Ok(NvencLockedOutput {
         bytes,

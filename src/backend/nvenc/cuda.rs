@@ -1007,7 +1007,7 @@ impl NvencCudaInteropEncoder {
         let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
         Ok(HevcAccessUnit {
             timestamp_90k,
-            data: output.bytes.into(),
+            data: output.bytes,
             is_sync,
             discard_from_track,
         })

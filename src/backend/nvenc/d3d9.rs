@@ -156,6 +156,7 @@ impl Drop for NvencAsyncEvent {
 struct PendingFrame {
     timestamp_90k: u64,
     discard_from_track: bool,
+    expect_sync: bool,
     submitted_at: Instant,
 }
 
@@ -459,6 +460,7 @@ impl NvencD3d9Encoder {
             .as_ref()
             .map(NvencAsyncEvent::raw)
             .unwrap_or(ptr::null_mut());
+        let expect_sync = force_idr || self.frame_index == 0;
         let status = submit_d3d9_picture(
             &self.api,
             self.session.encoder(),
@@ -468,7 +470,7 @@ impl NvencD3d9Encoder {
             self.height,
             self.frame_index,
             timestamp_90k,
-            force_idr || self.frame_index == 0,
+            expect_sync,
             completion_event,
         );
         if let Err(err) = status {
@@ -480,6 +482,7 @@ impl NvencD3d9Encoder {
         slot.pending = Some(PendingFrame {
             timestamp_90k,
             discard_from_track,
+            expect_sync,
             submitted_at: Instant::now(),
         });
         self.pending_order.push_back(slot_index);
@@ -547,9 +550,9 @@ impl NvencD3d9Encoder {
     }
 
     fn drain_one(&mut self, wait: bool) -> Result<Option<HevcAccessUnit>, BackendError> {
-        let slot_index = *self.pending_order.front().ok_or_else(|| {
-            BackendError::unsupported("NvFBC NVENC drain", "pending queue", "输出队列为空")
-        })?;
+        let Some(slot_index) = pending_slot_for_drain(&self.pending_order, wait)? else {
+            return Ok(None);
+        };
         let slot = &mut self.slots[slot_index];
         if let Some(completion) = slot.completion.as_ref()
             && !slot.completion_seen
@@ -630,10 +633,18 @@ impl NvencD3d9Encoder {
             verify_hevc_vui_matches(&output.bytes, self.expected_color)?;
             self.vui_verified = true;
         }
-        let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
+        let is_sync = pending.expect_sync
+            && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
+        if pending.expect_sync && !is_sync {
+            return Err(BackendError::unsupported(
+                "NvFBC NVENC random access",
+                format!("timestamp_90k={}", pending.timestamp_90k),
+                "请求 IDR 后 NVENC 输出中没有随机访问 NAL",
+            ));
+        }
         Ok(Some(HevcAccessUnit {
             timestamp_90k: pending.timestamp_90k,
-            data: output.bytes.into(),
+            data: output.bytes,
             is_sync,
             discard_from_track: pending.discard_from_track,
         }))
@@ -651,6 +662,23 @@ impl NvencD3d9Encoder {
             completion_latency_max_us: self.completion_latency_max_us,
         }
     }
+}
+
+fn pending_slot_for_drain(
+    pending_order: &VecDeque<usize>,
+    wait: bool,
+) -> Result<Option<usize>, BackendError> {
+    if let Some(&slot_index) = pending_order.front() {
+        return Ok(Some(slot_index));
+    }
+    if wait {
+        return Err(BackendError::unsupported(
+            "NvFBC NVENC drain",
+            "pending queue",
+            "阻塞 drain 请求没有对应的 pending frame",
+        ));
+    }
+    Ok(None)
 }
 
 fn chroma_label(chroma: ChromaSampling) -> &'static str {
@@ -889,4 +917,16 @@ fn submit_d3d9_picture(
     nvenc_check("NvEncEncodePicture(NvFBC D3D9Ex surface)", unsafe {
         encode(encoder, &mut params)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_nonblocking_drain_is_not_an_error() {
+        let pending = VecDeque::new();
+        assert_eq!(pending_slot_for_drain(&pending, false).unwrap(), None);
+        assert!(pending_slot_for_drain(&pending, true).is_err());
+    }
 }
