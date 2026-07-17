@@ -11,9 +11,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "nvFBC.h"
@@ -30,6 +34,102 @@ constexpr uint32_t kPrivateData[4] = {
     0x9ed0ceba,
 };
 
+enum class ChromaSampling : uint32_t {
+    Yuv420 = 1,
+    Yuv422 = 2,
+    Yuv444 = 3,
+};
+
+const char* chroma_label(ChromaSampling chroma) {
+    switch (chroma) {
+    case ChromaSampling::Yuv420:
+        return "420";
+    case ChromaSampling::Yuv422:
+        return "422";
+    case ChromaSampling::Yuv444:
+        return "444";
+    }
+    return "unknown";
+}
+
+bool parse_chroma(const char* value, ChromaSampling& chroma) {
+    if (std::strcmp(value, "420") == 0) {
+        chroma = ChromaSampling::Yuv420;
+        return true;
+    }
+    if (std::strcmp(value, "422") == 0) {
+        chroma = ChromaSampling::Yuv422;
+        return true;
+    }
+    if (std::strcmp(value, "444") == 0) {
+        chroma = ChromaSampling::Yuv444;
+        return true;
+    }
+    return false;
+}
+
+struct EncodeOptions {
+    ChromaSampling chroma = ChromaSampling::Yuv420;
+    uint32_t frame_rate_num = 60;
+    uint32_t frame_rate_den = 1;
+    uint32_t qp_intra = 24;
+    uint32_t qp_inter_p = 27;
+    uint32_t qp_inter_b = 27;
+};
+
+struct DirectRouteCaps {
+    bool hevc = false;
+    bool abgr10_input = false;
+    bool main10_profile = false;
+    bool frext_profile = false;
+    bool ten_bit = false;
+    bool yuv422 = false;
+    bool yuv444 = false;
+    uint32_t max_width = 0;
+    uint32_t max_height = 0;
+
+    bool advertises(ChromaSampling chroma, uint32_t width, uint32_t height) const {
+        if (!hevc || !abgr10_input || !ten_bit || width > max_width || height > max_height) {
+            return false;
+        }
+        switch (chroma) {
+        case ChromaSampling::Yuv420:
+            return main10_profile;
+        case ChromaSampling::Yuv422:
+            return frext_profile && yuv422;
+        case ChromaSampling::Yuv444:
+            return frext_profile && yuv444;
+        }
+        return false;
+    }
+
+    void print_json(uint32_t width, uint32_t height) const {
+        std::printf(
+            "route_caps_json={\"schema\":1,\"device_api\":\"D3D9Ex\",\"codec\":\"HEVC\","
+            "\"input_format\":\"ABGR10\",\"hevc\":%s,\"abgr10_input\":%s,"
+            "\"main10_profile\":%s,\"frext_profile\":%s,\"ten_bit\":%s,"
+            "\"yuv422\":%s,\"yuv444\":%s,\"max_width\":%u,\"max_height\":%u,"
+            "\"advertised_routes\":{\"420\":%s,\"422\":%s,\"444\":%s},"
+            "\"lookahead\":false}\n",
+            hevc ? "true" : "false", abgr10_input ? "true" : "false",
+            main10_profile ? "true" : "false", frext_profile ? "true" : "false",
+            ten_bit ? "true" : "false", yuv422 ? "true" : "false",
+            yuv444 ? "true" : "false", max_width, max_height,
+            advertises(ChromaSampling::Yuv420, width, height) ? "true" : "false",
+            advertises(ChromaSampling::Yuv422, width, height) ? "true" : "false",
+            advertises(ChromaSampling::Yuv444, width, height) ? "true" : "false");
+    }
+};
+
+struct DirectEncodeSlot {
+    NV_ENC_REGISTERED_PTR registered = nullptr;
+    NV_ENC_INPUT_PTR mapped = nullptr;
+    NV_ENC_OUTPUT_PTR bitstream = nullptr;
+    bool in_flight = false;
+    uint32_t frame_index = 0;
+    uint64_t timestamp = 0;
+};
+
 template <typename T>
 class ComPtr {
 public:
@@ -39,6 +139,13 @@ public:
     }
     ComPtr(const ComPtr&) = delete;
     ComPtr& operator=(const ComPtr&) = delete;
+    ComPtr(ComPtr&& other) noexcept : value_(std::exchange(other.value_, nullptr)) {}
+    ComPtr& operator=(ComPtr&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.value_, nullptr));
+        }
+        return *this;
+    }
 
     T* get() const {
         return value_;
@@ -134,6 +241,10 @@ bool check_nvenc(const char* stage, NVENCSTATUS status) {
     return status == NV_ENC_SUCCESS;
 }
 
+bool guid_equal(const GUID& left, const GUID& right) {
+    return std::memcmp(&left, &right, sizeof(GUID)) == 0;
+}
+
 uint64_t percentile_us(std::vector<uint64_t> values, double percentile) {
     if (values.empty()) {
         return 0;
@@ -218,14 +329,37 @@ bool find_matching_output(IDirect3D9Ex* d3d, UINT d3d_adapter, ComPtr<IDXGIOutpu
     return false;
 }
 
+bool query_output_refresh(IDXGIOutput* output, uint32_t& numerator, uint32_t& denominator) {
+    DXGI_OUTPUT_DESC desc{};
+    if (FAILED(output->GetDesc(&desc))) {
+        return false;
+    }
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) ||
+        mode.dmDisplayFrequency <= 1) {
+        return false;
+    }
+    numerator = mode.dmDisplayFrequency;
+    denominator = 1;
+    std::printf("display_refresh numerator=%u denominator=%u source=EnumDisplaySettingsW\n",
+                numerator, denominator);
+    return true;
+}
+
 class NvencDirectD3d9 {
 public:
     ~NvencDirectD3d9() {
         close();
     }
 
-    bool open(IDirect3DDevice9Ex* device, IDirect3DSurface9* surface, uint32_t width,
-              uint32_t height, uint32_t frame_rate) {
+    bool open(IDirect3DDevice9Ex* device, const std::vector<IDirect3DSurface9*>& surfaces,
+              uint32_t width, uint32_t height, const EncodeOptions& options) {
+        if (surfaces.empty() || surfaces.size() > 3) {
+            std::printf("invalid_surface_count=%llu expected=1..3\n",
+                        static_cast<unsigned long long>(surfaces.size()));
+            return false;
+        }
         module_ = std::make_unique<Module>(L"nvEncodeAPI64.dll");
         if (!*module_) {
             std::printf("nvenc_load=false error=%lu\n", GetLastError());
@@ -270,6 +404,7 @@ public:
             return false;
         }
 
+        caps_ = {};
         uint32_t format_count = 0;
         if (!check_nvenc("get_input_format_count",
                          functions_.nvEncGetInputFormatCount(encoder_, NV_ENC_CODEC_HEVC_GUID,
@@ -284,14 +419,72 @@ public:
                                                          &returned_count))) {
             return false;
         }
-        const bool abgr10_supported =
+        caps_.hevc = true;
+        caps_.abgr10_input =
             std::find(formats.begin(), formats.begin() + returned_count,
                       NV_ENC_BUFFER_FORMAT_ABGR10) != formats.begin() + returned_count;
         std::printf("nvenc_input_formats count=%u abgr10_supported=%s\n", returned_count,
-                    abgr10_supported ? "true" : "false");
-        if (!abgr10_supported) {
+                    caps_.abgr10_input ? "true" : "false");
+
+        uint32_t profile_count = 0;
+        if (!check_nvenc("get_profile_count",
+                         functions_.nvEncGetEncodeProfileGUIDCount(
+                             encoder_, NV_ENC_CODEC_HEVC_GUID, &profile_count))) {
             return false;
         }
+        std::vector<GUID> profiles(profile_count);
+        uint32_t returned_profiles = 0;
+        if (!check_nvenc("get_profiles",
+                         functions_.nvEncGetEncodeProfileGUIDs(
+                             encoder_, NV_ENC_CODEC_HEVC_GUID, profiles.data(), profile_count,
+                             &returned_profiles))) {
+            return false;
+        }
+        caps_.main10_profile =
+            std::any_of(profiles.begin(), profiles.begin() + returned_profiles,
+                        [](const GUID& profile) {
+                            return guid_equal(profile, NV_ENC_HEVC_PROFILE_MAIN10_GUID);
+                        });
+        caps_.frext_profile =
+            std::any_of(profiles.begin(), profiles.begin() + returned_profiles,
+                        [](const GUID& profile) {
+                            return guid_equal(profile, NV_ENC_HEVC_PROFILE_FREXT_GUID);
+                        });
+
+        const auto query_cap = [&](NV_ENC_CAPS cap, const char* stage, int& value) {
+            NV_ENC_CAPS_PARAM parameter{};
+            parameter.version = NV_ENC_CAPS_PARAM_VER;
+            parameter.capsToQuery = cap;
+            return check_nvenc(
+                stage,
+                functions_.nvEncGetEncodeCaps(encoder_, NV_ENC_CODEC_HEVC_GUID, &parameter,
+                                              &value));
+        };
+        int ten_bit = 0;
+        int yuv422 = 0;
+        int yuv444 = 0;
+        int max_width = 0;
+        int max_height = 0;
+        if (!query_cap(NV_ENC_CAPS_SUPPORT_10BIT_ENCODE, "cap_10bit", ten_bit) ||
+            !query_cap(NV_ENC_CAPS_SUPPORT_YUV422_ENCODE, "cap_yuv422", yuv422) ||
+            !query_cap(NV_ENC_CAPS_SUPPORT_YUV444_ENCODE, "cap_yuv444", yuv444) ||
+            !query_cap(NV_ENC_CAPS_WIDTH_MAX, "cap_width_max", max_width) ||
+            !query_cap(NV_ENC_CAPS_HEIGHT_MAX, "cap_height_max", max_height)) {
+            return false;
+        }
+        caps_.ten_bit = ten_bit != 0;
+        caps_.yuv422 = yuv422 != 0;
+        caps_.yuv444 = yuv444 != 0;
+        caps_.max_width = max_width > 0 ? static_cast<uint32_t>(max_width) : 0;
+        caps_.max_height = max_height > 0 ? static_cast<uint32_t>(max_height) : 0;
+        caps_.print_json(width, height);
+        if (!caps_.advertises(options.chroma, width, height)) {
+            std::printf("requested_route_advertised=false chroma=%s width=%u height=%u\n",
+                        chroma_label(options.chroma), width, height);
+            return false;
+        }
+        std::printf("requested_route_advertised=true chroma=%s width=%u height=%u\n",
+                    chroma_label(options.chroma), width, height);
 
         NV_ENC_PRESET_CONFIG preset{};
         preset.version = NV_ENC_PRESET_CONFIG_VER;
@@ -306,16 +499,23 @@ public:
 
         NV_ENC_CONFIG config = preset.presetCfg;
         config.version = NV_ENC_CONFIG_VER;
-        config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN10_GUID;
-        config.gopLength = frame_rate * 2;
+        config.profileGUID = options.chroma == ChromaSampling::Yuv420
+                                 ? NV_ENC_HEVC_PROFILE_MAIN10_GUID
+                                 : NV_ENC_HEVC_PROFILE_FREXT_GUID;
+        const uint32_t nominal_fps =
+            std::max(1u, (options.frame_rate_num + options.frame_rate_den - 1) /
+                             std::max(1u, options.frame_rate_den));
+        config.gopLength = nominal_fps * 2;
         config.frameIntervalP = 1;
         config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-        config.rcParams.constQP.qpIntra = 24;
-        config.rcParams.constQP.qpInterP = 27;
-        config.rcParams.constQP.qpInterB = 27;
+        config.rcParams.constQP.qpIntra = options.qp_intra;
+        config.rcParams.constQP.qpInterP = options.qp_inter_p;
+        config.rcParams.constQP.qpInterB = options.qp_inter_b;
+        config.rcParams.enableLookahead = 0;
+        config.rcParams.lookaheadDepth = 0;
 
         auto& hevc = config.encodeCodecConfig.hevcConfig;
-        hevc.chromaFormatIDC = 1;
+        hevc.chromaFormatIDC = static_cast<uint32_t>(options.chroma);
         hevc.idrPeriod = config.gopLength;
         hevc.repeatSPSPPS = 1;
         hevc.outputBitDepth = NV_ENC_BIT_DEPTH_10;
@@ -337,8 +537,8 @@ public:
         initialize.encodeHeight = height;
         initialize.darWidth = width;
         initialize.darHeight = height;
-        initialize.frameRateNum = frame_rate;
-        initialize.frameRateDen = 1;
+        initialize.frameRateNum = options.frame_rate_num;
+        initialize.frameRateDen = std::max(1u, options.frame_rate_den);
         initialize.enableEncodeAsync = 0;
         initialize.enablePTD = 1;
         initialize.encodeConfig = &config;
@@ -346,54 +546,92 @@ public:
         initialize.maxEncodeHeight = height;
         initialize.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
         initialize.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR10;
-        if (!check_nvenc("initialize_hevc_main10",
+        if (!check_nvenc("initialize_hevc_10bit",
                          functions_.nvEncInitializeEncoder(encoder_, &initialize))) {
             return false;
         }
 
-        NV_ENC_REGISTER_RESOURCE registration{};
-        registration.version = NV_ENC_REGISTER_RESOURCE_VER;
-        registration.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-        registration.width = width;
-        registration.height = height;
-        registration.pitch = 0;
-        registration.subResourceIndex = 0;
-        registration.resourceToRegister = surface;
-        registration.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR10;
-        registration.bufferUsage = NV_ENC_INPUT_IMAGE;
-        if (!check_nvenc("register_nvfbc_d3d9_surface",
-                         functions_.nvEncRegisterResource(encoder_, &registration))) {
-            return false;
-        }
-        registered_ = registration.registeredResource;
-        if (!registered_) {
-            std::printf("nvenc_registered_resource_null=true\n");
-            return false;
-        }
+        slots_.clear();
+        slots_.reserve(surfaces.size());
+        for (size_t index = 0; index < surfaces.size(); ++index) {
+            NV_ENC_REGISTER_RESOURCE registration{};
+            registration.version = NV_ENC_REGISTER_RESOURCE_VER;
+            registration.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+            registration.width = width;
+            registration.height = height;
+            registration.pitch = 0;
+            registration.subResourceIndex = 0;
+            registration.resourceToRegister = surfaces[index];
+            registration.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR10;
+            registration.bufferUsage = NV_ENC_INPUT_IMAGE;
+            if (!check_nvenc("register_nvfbc_d3d9_surface",
+                             functions_.nvEncRegisterResource(encoder_, &registration))) {
+                return false;
+            }
+            if (!registration.registeredResource) {
+                std::printf("nvenc_registered_resource_null=true slot=%llu\n",
+                            static_cast<unsigned long long>(index));
+                return false;
+            }
 
-        NV_ENC_CREATE_BITSTREAM_BUFFER create_bitstream{};
-        create_bitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-        if (!check_nvenc("create_bitstream",
-                         functions_.nvEncCreateBitstreamBuffer(encoder_, &create_bitstream))) {
-            return false;
+            NV_ENC_CREATE_BITSTREAM_BUFFER create_bitstream{};
+            create_bitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+            if (!check_nvenc("create_bitstream",
+                             functions_.nvEncCreateBitstreamBuffer(encoder_,
+                                                                   &create_bitstream))) {
+                return false;
+            }
+            if (!create_bitstream.bitstreamBuffer) {
+                std::printf("nvenc_bitstream_null=true slot=%llu\n",
+                            static_cast<unsigned long long>(index));
+                return false;
+            }
+            slots_.push_back(DirectEncodeSlot{
+                registration.registeredResource,
+                nullptr,
+                create_bitstream.bitstreamBuffer,
+                false,
+                0,
+                0,
+            });
         }
-        bitstream_ = create_bitstream.bitstreamBuffer;
         width_ = width;
         height_ = height;
-        return bitstream_ != nullptr;
+        std::printf("nvenc_surface_pool count=%llu lookahead=false\n",
+                    static_cast<unsigned long long>(slots_.size()));
+        std::printf("requested_route_initialized=true chroma=%s registered_surfaces=%llu\n",
+                    chroma_label(options.chroma),
+                    static_cast<unsigned long long>(slots_.size()));
+        return true;
     }
 
-    bool encode(uint32_t frame_index, uint64_t timestamp, std::ofstream& output,
-                uint64_t& output_bytes, uint32_t& mapped_format) {
+    const DirectRouteCaps& capabilities() const {
+        return caps_;
+    }
+
+    size_t slot_count() const {
+        return slots_.size();
+    }
+
+    bool submit(size_t slot_index, uint32_t frame_index, uint64_t timestamp,
+                uint32_t& mapped_format) {
+        if (slot_index >= slots_.size() || slots_[slot_index].in_flight) {
+            std::printf("nvenc_submit_invalid_slot slot=%llu in_flight=%s\n",
+                        static_cast<unsigned long long>(slot_index),
+                        slot_index < slots_.size() && slots_[slot_index].in_flight ? "true"
+                                                                                  : "false");
+            return false;
+        }
+        DirectEncodeSlot& slot = slots_[slot_index];
         NV_ENC_MAP_INPUT_RESOURCE map{};
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        map.registeredResource = registered_;
+        map.registeredResource = slot.registered;
         const NVENCSTATUS map_status = functions_.nvEncMapInputResource(encoder_, &map);
         if (map_status != NV_ENC_SUCCESS) {
             check_nvenc("map_input", map_status);
             return false;
         }
-        mapped_ = map.mappedResource;
+        slot.mapped = map.mappedResource;
         mapped_format = static_cast<uint32_t>(map.mappedBufferFmt);
 
         NV_ENC_PIC_PARAMS picture{};
@@ -407,30 +645,53 @@ public:
         picture.frameIdx = frame_index;
         picture.inputTimeStamp = timestamp;
         picture.inputDuration = 1;
-        picture.inputBuffer = mapped_;
-        picture.outputBitstream = bitstream_;
+        picture.inputBuffer = slot.mapped;
+        picture.outputBitstream = slot.bitstream;
         picture.bufferFmt = map.mappedBufferFmt;
         picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         const NVENCSTATUS encode_status = functions_.nvEncEncodePicture(encoder_, &picture);
         if (encode_status != NV_ENC_SUCCESS) {
             check_nvenc("encode_picture", encode_status);
-            unmap();
+            unmap_slot(slot);
             return false;
         }
+        slot.in_flight = true;
+        slot.frame_index = frame_index;
+        slot.timestamp = timestamp;
+        return true;
+    }
 
+    bool drain(size_t slot_index, std::ofstream& output, uint64_t& output_bytes) {
+        if (slot_index >= slots_.size() || !slots_[slot_index].in_flight) {
+            std::printf("nvenc_drain_invalid_slot slot=%llu\n",
+                        static_cast<unsigned long long>(slot_index));
+            return false;
+        }
+        DirectEncodeSlot& slot = slots_[slot_index];
         NV_ENC_LOCK_BITSTREAM lock{};
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lock.outputBitstream = bitstream_;
+        lock.outputBitstream = slot.bitstream;
         const NVENCSTATUS lock_status = functions_.nvEncLockBitstream(encoder_, &lock);
         if (lock_status != NV_ENC_SUCCESS) {
             check_nvenc("lock_bitstream", lock_status);
-            unmap();
+            unmap_slot(slot);
+            slot.in_flight = false;
             return false;
         }
         if (!lock.bitstreamBufferPtr || lock.bitstreamSizeInBytes == 0) {
-            std::printf("nvenc_empty_bitstream frame=%u\n", frame_index);
-            functions_.nvEncUnlockBitstream(encoder_, bitstream_);
-            unmap();
+            std::printf("nvenc_empty_bitstream frame=%u\n", slot.frame_index);
+            functions_.nvEncUnlockBitstream(encoder_, slot.bitstream);
+            unmap_slot(slot);
+            slot.in_flight = false;
+            return false;
+        }
+        if (lock.outputTimeStamp != slot.timestamp) {
+            std::printf("nvenc_timestamp_mismatch frame=%u submitted=%llu returned=%llu\n",
+                        slot.frame_index, static_cast<unsigned long long>(slot.timestamp),
+                        static_cast<unsigned long long>(lock.outputTimeStamp));
+            functions_.nvEncUnlockBitstream(encoder_, slot.bitstream);
+            unmap_slot(slot);
+            slot.in_flight = false;
             return false;
         }
         output.write(static_cast<const char*>(lock.bitstreamBufferPtr),
@@ -438,8 +699,9 @@ public:
         output_bytes += lock.bitstreamSizeInBytes;
         const bool write_ok = output.good();
         const NVENCSTATUS unlock_status =
-            functions_.nvEncUnlockBitstream(encoder_, bitstream_);
-        const bool unmap_ok = unmap();
+            functions_.nvEncUnlockBitstream(encoder_, slot.bitstream);
+        const bool unmap_ok = unmap_slot(slot);
+        slot.in_flight = false;
         if (unlock_status != NV_ENC_SUCCESS) {
             check_nvenc("unlock_bitstream", unlock_status);
             return false;
@@ -448,12 +710,12 @@ public:
     }
 
 private:
-    bool unmap() {
-        if (!mapped_) {
+    bool unmap_slot(DirectEncodeSlot& slot) {
+        if (!slot.mapped) {
             return true;
         }
-        const NVENCSTATUS status = functions_.nvEncUnmapInputResource(encoder_, mapped_);
-        mapped_ = nullptr;
+        const NVENCSTATUS status = functions_.nvEncUnmapInputResource(encoder_, slot.mapped);
+        slot.mapped = nullptr;
         if (status != NV_ENC_SUCCESS) {
             check_nvenc("unmap_input", status);
             return false;
@@ -462,15 +724,18 @@ private:
     }
 
     void close() {
-        unmap();
-        if (encoder_ && registered_) {
-            functions_.nvEncUnregisterResource(encoder_, registered_);
-            registered_ = nullptr;
+        for (auto& slot : slots_) {
+            unmap_slot(slot);
+            if (encoder_ && slot.registered) {
+                functions_.nvEncUnregisterResource(encoder_, slot.registered);
+                slot.registered = nullptr;
+            }
+            if (encoder_ && slot.bitstream) {
+                functions_.nvEncDestroyBitstreamBuffer(encoder_, slot.bitstream);
+                slot.bitstream = nullptr;
+            }
         }
-        if (encoder_ && bitstream_) {
-            functions_.nvEncDestroyBitstreamBuffer(encoder_, bitstream_);
-            bitstream_ = nullptr;
-        }
+        slots_.clear();
         if (encoder_) {
             functions_.nvEncDestroyEncoder(encoder_);
             encoder_ = nullptr;
@@ -481,11 +746,10 @@ private:
     std::unique_ptr<Module> module_;
     NV_ENCODE_API_FUNCTION_LIST functions_{};
     void* encoder_ = nullptr;
-    NV_ENC_REGISTERED_PTR registered_ = nullptr;
-    NV_ENC_INPUT_PTR mapped_ = nullptr;
-    NV_ENC_OUTPUT_PTR bitstream_ = nullptr;
+    std::vector<DirectEncodeSlot> slots_;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    DirectRouteCaps caps_{};
 };
 
 class NvFbcSession {
@@ -506,7 +770,8 @@ private:
     NvFBCToDx9Vid* interface_ = nullptr;
 };
 
-int run(uint32_t requested_frames, const char* output_path) {
+int run(uint32_t requested_frames, const char* output_path, ChromaSampling chroma,
+        uint32_t qp) {
     ComPtr<IDirect3D9Ex> d3d;
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, d3d.put());
     if (FAILED(hr) || !d3d) {
@@ -526,6 +791,16 @@ int run(uint32_t requested_frames, const char* output_path) {
     ComPtr<IDXGIOutput> dxgi_output;
     if (!find_matching_output(d3d.get(), adapter, dxgi_output)) {
         std::printf("matching_dxgi_output=false\n");
+        return 1;
+    }
+    EncodeOptions encode_options{};
+    encode_options.chroma = chroma;
+    encode_options.qp_intra = qp;
+    encode_options.qp_inter_p = qp;
+    encode_options.qp_inter_b = qp;
+    if (!query_output_refresh(dxgi_output.get(), encode_options.frame_rate_num,
+                              encode_options.frame_rate_den)) {
+        std::printf("display_refresh_available=false\n");
         return 1;
     }
 
@@ -563,23 +838,31 @@ int run(uint32_t requested_frames, const char* output_path) {
     *nvfbc.put() = static_cast<NvFBCToDx9Vid*>(create.pNvFBC);
     const uint32_t width = create.dwMaxDisplayWidth;
     const uint32_t height = create.dwMaxDisplayHeight;
-    ComPtr<IDirect3DSurface9> surface;
-    hr = device->CreateRenderTarget(width, height, D3DFMT_A2B10G10R10,
-                                    D3DMULTISAMPLE_NONE, 0, FALSE, surface.put(), nullptr);
-    std::printf("surface_create format=A2B10G10R10 hr=0x%08lx ptr=0x%p\n",
-                static_cast<unsigned long>(hr), surface.get());
-    if (FAILED(hr) || !surface) {
-        return 1;
+    constexpr size_t surface_count = 3;
+    std::vector<ComPtr<IDirect3DSurface9>> surfaces(surface_count);
+    std::vector<IDirect3DSurface9*> surface_ptrs;
+    std::vector<NVFBC_TODX9VID_OUT_BUF> output_buffers(surface_count);
+    surface_ptrs.reserve(surface_count);
+    for (size_t index = 0; index < surface_count; ++index) {
+        hr = device->CreateRenderTarget(width, height, D3DFMT_A2B10G10R10,
+                                        D3DMULTISAMPLE_NONE, 0, FALSE,
+                                        surfaces[index].put(), nullptr);
+        std::printf("surface_create slot=%llu format=A2B10G10R10 hr=0x%08lx ptr=0x%p\n",
+                    static_cast<unsigned long long>(index), static_cast<unsigned long>(hr),
+                    surfaces[index].get());
+        if (FAILED(hr) || !surfaces[index]) {
+            return 1;
+        }
+        surface_ptrs.push_back(surfaces[index].get());
+        output_buffers[index].pPrimary = surfaces[index].get();
     }
 
-    NVFBC_TODX9VID_OUT_BUF output_buffer{};
-    output_buffer.pPrimary = surface.get();
     NVFBC_TODX9VID_SETUP_PARAMS setup{};
     setup.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
     setup.bHDRRequest = TRUE;
     setup.eMode = NVFBC_TODX9VID_ARGB10;
-    setup.dwNumBuffers = 1;
-    setup.ppBuffer = &output_buffer;
+    setup.dwNumBuffers = static_cast<NvU32>(output_buffers.size());
+    setup.ppBuffer = output_buffers.data();
     const NVFBCRESULT setup_result = nvfbc.get()->NvFBCToDx9VidSetUp(&setup);
     std::printf("nvfbc_setup status=%d format=ARGB10 hdr_request=true\n",
                 static_cast<int>(setup_result));
@@ -587,9 +870,8 @@ int run(uint32_t requested_frames, const char* output_path) {
         return 1;
     }
 
-    constexpr uint32_t frame_rate = 240;
     NvencDirectD3d9 encoder;
-    if (!encoder.open(device.get(), surface.get(), width, height, frame_rate)) {
+    if (!encoder.open(device.get(), surface_ptrs, width, height, encode_options)) {
         std::printf("direct_d3d9_nvenc_open=false\n");
         return 1;
     }
@@ -609,40 +891,109 @@ int run(uint32_t requested_frames, const char* output_path) {
     grab.pNvFBCFrameGrabInfo = &frame_info;
 
     std::vector<uint64_t> grab_us;
-    std::vector<uint64_t> encode_us;
+    std::vector<uint64_t> submit_us;
+    std::vector<uint64_t> drain_us;
+    std::vector<uint64_t> pipeline_work_us;
+    std::vector<uint64_t> vblank_wait_us;
+    std::vector<uint64_t> source_interval_us;
     grab_us.reserve(requested_frames);
-    encode_us.reserve(requested_frames);
+    submit_us.reserve(requested_frames);
+    drain_us.reserve(requested_frames);
+    pipeline_work_us.reserve(requested_frames);
+    vblank_wait_us.reserve(requested_frames);
+    source_interval_us.reserve(requested_frames);
     uint64_t output_bytes = 0;
     uint32_t completed_frames = 0;
     uint32_t mapped_format = 0;
+    bool failed = false;
+    std::deque<size_t> pending_slots;
+    std::optional<std::chrono::steady_clock::time_point> last_grab_return;
+    std::optional<std::chrono::steady_clock::time_point> first_grab_return;
     const auto run_start = std::chrono::steady_clock::now();
     for (uint32_t frame = 0; frame < requested_frames; ++frame) {
+        const size_t slot_index = frame % encoder.slot_count();
+        grab.dwBufferIdx = static_cast<NvU32>(slot_index);
+        const auto vblank_start = std::chrono::steady_clock::now();
         hr = dxgi_output->WaitForVBlank();
+        const auto vblank_end = std::chrono::steady_clock::now();
+        vblank_wait_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(vblank_end - vblank_start)
+                .count()));
         if (FAILED(hr)) {
             std::printf("wait_vblank_failed frame=%u hr=0x%08lx\n", frame,
                         static_cast<unsigned long>(hr));
+            failed = true;
             break;
         }
         const auto grab_start = std::chrono::steady_clock::now();
         const NVFBCRESULT grab_result = nvfbc.get()->NvFBCToDx9VidGrabFrame(&grab);
         const auto grab_end = std::chrono::steady_clock::now();
+        if (last_grab_return) {
+            source_interval_us.push_back(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(grab_end - *last_grab_return)
+                    .count()));
+        }
+        if (!first_grab_return) {
+            first_grab_return = grab_end;
+        }
+        last_grab_return = grab_end;
         grab_us.push_back(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(grab_end - grab_start).count()));
         if (grab_result != NVFBC_SUCCESS) {
             std::printf("nvfbc_grab_failed frame=%u status=%d driver=0x%08lx recreate=%d\n",
                         frame, static_cast<int>(grab_result), frame_info.dwDriverInternalError,
                         frame_info.bMustRecreate);
+            failed = true;
             break;
         }
 
-        const auto encode_start = std::chrono::steady_clock::now();
-        if (!encoder.encode(frame, frame, output, output_bytes, mapped_format)) {
-            std::printf("nvenc_encode_failed frame=%u\n", frame);
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        const auto submit_start = pipeline_start;
+        if (!encoder.submit(slot_index, frame, frame, mapped_format)) {
+            std::printf("nvenc_submit_failed frame=%u slot=%llu\n", frame,
+                        static_cast<unsigned long long>(slot_index));
+            failed = true;
             break;
         }
-        const auto encode_end = std::chrono::steady_clock::now();
-        encode_us.push_back(static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(encode_end - encode_start)
+        const auto submit_end = std::chrono::steady_clock::now();
+        submit_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(submit_end - submit_start)
+                .count()));
+        pending_slots.push_back(slot_index);
+        if (pending_slots.size() >= encoder.slot_count()) {
+            const size_t drain_slot = pending_slots.front();
+            pending_slots.pop_front();
+            const auto drain_start = std::chrono::steady_clock::now();
+            if (!encoder.drain(drain_slot, output, output_bytes)) {
+                std::printf("nvenc_drain_failed frame=%u slot=%llu\n", frame,
+                            static_cast<unsigned long long>(drain_slot));
+                failed = true;
+                break;
+            }
+            const auto drain_end = std::chrono::steady_clock::now();
+            drain_us.push_back(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(drain_end - drain_start)
+                    .count()));
+            ++completed_frames;
+        }
+        const auto pipeline_end = std::chrono::steady_clock::now();
+        pipeline_work_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(pipeline_end - pipeline_start)
+                .count()));
+    }
+    while (!failed && !pending_slots.empty()) {
+        const size_t drain_slot = pending_slots.front();
+        pending_slots.pop_front();
+        const auto drain_start = std::chrono::steady_clock::now();
+        if (!encoder.drain(drain_slot, output, output_bytes)) {
+            std::printf("nvenc_final_drain_failed slot=%llu\n",
+                        static_cast<unsigned long long>(drain_slot));
+            failed = true;
+            break;
+        }
+        const auto drain_end = std::chrono::steady_clock::now();
+        drain_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(drain_end - drain_start)
                 .count()));
         ++completed_frames;
     }
@@ -651,20 +1002,59 @@ int run(uint32_t requested_frames, const char* output_path) {
     const double elapsed_seconds =
         std::chrono::duration<double>(run_end - run_start).count();
     const double fps = elapsed_seconds > 0.0 ? completed_frames / elapsed_seconds : 0.0;
+    const uint64_t expected_interval_us =
+        (1'000'000ull * encode_options.frame_rate_den) / encode_options.frame_rate_num;
+    const uint64_t long_interval_threshold_us = expected_interval_us * 3 / 2;
+    const size_t long_intervals = static_cast<size_t>(std::count_if(
+        source_interval_us.begin(), source_interval_us.end(),
+        [&](uint64_t interval) { return interval > long_interval_threshold_us; }));
+    const uint64_t first_frame_latency_us = first_grab_return
+                                                ? static_cast<uint64_t>(
+                                                      std::chrono::duration_cast<
+                                                          std::chrono::microseconds>(
+                                                          *first_grab_return - run_start)
+                                                          .count())
+                                                : 0;
+    const uint64_t steady_interval_sum_us =
+        std::accumulate(source_interval_us.begin(), source_interval_us.end(), 0ull);
+    const double steady_source_fps = steady_interval_sum_us > 0
+                                         ? source_interval_us.size() * 1'000'000.0 /
+                                               static_cast<double>(steady_interval_sum_us)
+                                         : 0.0;
     std::printf(
-        "direct_encode_summary requested=%u completed=%u elapsed_ms=%.3f fps=%.3f bytes=%llu "
-        "mapped_format=0x%08x grab_p50_us=%llu grab_p95_us=%llu encode_p50_us=%llu "
-        "encode_p95_us=%llu encode_max_us=%llu explicit_gpu_copies=0 output=%s\n",
-        requested_frames, completed_frames, elapsed_seconds * 1000.0, fps,
+        "direct_encode_summary chroma=%s requested=%u completed=%u elapsed_ms=%.3f fps=%.3f bytes=%llu "
+        "mapped_format=0x%08x first_frame_latency_us=%llu steady_source_fps=%.3f "
+        "vblank_wait_p50_us=%llu vblank_wait_p95_us=%llu "
+        "source_interval_p50_us=%llu source_interval_p95_us=%llu source_interval_max_us=%llu "
+        "source_long_intervals=%llu grab_p50_us=%llu grab_p95_us=%llu submit_p50_us=%llu "
+        "submit_p95_us=%llu drain_p50_us=%llu drain_p95_us=%llu pipeline_work_p50_us=%llu "
+        "pipeline_work_p95_us=%llu pipeline_work_max_us=%llu explicit_gpu_copies=0 output=%s\n",
+        chroma_label(chroma), requested_frames, completed_frames, elapsed_seconds * 1000.0, fps,
         static_cast<unsigned long long>(output_bytes), mapped_format,
+        static_cast<unsigned long long>(first_frame_latency_us), steady_source_fps,
+        static_cast<unsigned long long>(percentile_us(vblank_wait_us, 0.50)),
+        static_cast<unsigned long long>(percentile_us(vblank_wait_us, 0.95)),
+        static_cast<unsigned long long>(percentile_us(source_interval_us, 0.50)),
+        static_cast<unsigned long long>(percentile_us(source_interval_us, 0.95)),
+        static_cast<unsigned long long>(source_interval_us.empty()
+                                            ? 0
+                                            : *std::max_element(source_interval_us.begin(),
+                                                                source_interval_us.end())),
+        static_cast<unsigned long long>(long_intervals),
         static_cast<unsigned long long>(percentile_us(grab_us, 0.50)),
         static_cast<unsigned long long>(percentile_us(grab_us, 0.95)),
-        static_cast<unsigned long long>(percentile_us(encode_us, 0.50)),
-        static_cast<unsigned long long>(percentile_us(encode_us, 0.95)),
+        static_cast<unsigned long long>(percentile_us(submit_us, 0.50)),
+        static_cast<unsigned long long>(percentile_us(submit_us, 0.95)),
+        static_cast<unsigned long long>(percentile_us(drain_us, 0.50)),
+        static_cast<unsigned long long>(percentile_us(drain_us, 0.95)),
+        static_cast<unsigned long long>(percentile_us(pipeline_work_us, 0.50)),
+        static_cast<unsigned long long>(percentile_us(pipeline_work_us, 0.95)),
         static_cast<unsigned long long>(
-            encode_us.empty() ? 0 : *std::max_element(encode_us.begin(), encode_us.end())),
+            pipeline_work_us.empty()
+                ? 0
+                : *std::max_element(pipeline_work_us.begin(), pipeline_work_us.end())),
         output_path);
-    return completed_frames == requested_frames && output_bytes > 0 ? 0 : 1;
+    return !failed && completed_frames == requested_frames && output_bytes > 0 ? 0 : 1;
 }
 
 } // namespace
@@ -672,12 +1062,27 @@ int run(uint32_t requested_frames, const char* output_path) {
 int main(int argc, char** argv) {
     uint32_t frames = 600;
     const char* output = "nvfbc_nvenc_direct.hevc";
+    ChromaSampling chroma = ChromaSampling::Yuv420;
+    uint32_t qp = 27;
     if (argc >= 2) {
         frames = static_cast<uint32_t>(std::strtoul(argv[1], nullptr, 10));
     }
     if (argc >= 3) {
         output = argv[2];
     }
-    std::printf("nvfbc_nvenc_direct frames=%u output=%s\n", frames, output);
-    return run(frames, output);
+    if (argc >= 4 && !parse_chroma(argv[3], chroma)) {
+        std::printf("invalid_chroma=%s expected=420|422|444\n", argv[3]);
+        return 2;
+    }
+    if (argc >= 5) {
+        qp = static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 10));
+    }
+    if (frames == 0 || qp > 51) {
+        std::printf("invalid_parameters frames=%u qp=%u expected=frames>0,qp=0..51\n", frames,
+                    qp);
+        return 2;
+    }
+    std::printf("nvfbc_nvenc_direct frames=%u output=%s chroma=%s qp=%u\n", frames, output,
+                chroma_label(chroma), qp);
+    return run(frames, output, chroma, qp);
 }

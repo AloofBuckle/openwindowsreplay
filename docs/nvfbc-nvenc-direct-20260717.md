@@ -3,104 +3,169 @@
 ## Scope
 
 This experiment remains isolated on `codex/nvfbc-modern-probe`; it does not
-modify the production RustReplay recording backend or GUI. Its purpose is to
-answer one question: can the D3D9Ex surface written by NvFBC be registered and
-encoded by modern NVENC without an application-issued GPU copy?
+modify the RustReplay production backend or GUI. It validates HDR/PQ 10-bit
+HEVC 4:2:0, 4:2:2, and 4:4:4 from the same NvFBC ARGB10 capture route without
+an application-issued post-capture GPU copy.
 
-The probe uses the current NVENC 13 header and the Capture SDK 7.1 NvFBC ABI.
-It runs on the same Buckle system as the preceding DDA exclusion tests:
+Lookahead is deliberately out of scope. The probe always sets
+`enableLookahead=0` and `lookaheadDepth=0`, and the capability interface reports
+`lookahead=false`.
+
+Test system:
 
 - NVIDIA GeForce RTX 5090
 - `NvFBC64.dll` file version `6.14.16.1074`
-- 3840x2160, 240 Hz, Windows HDR/PQ enabled
+- 3840x2160 at 240 Hz, Windows HDR/PQ enabled
 - NvFBC V3 ARGB10 capture
-- HEVC Main10, 4:2:0, full-range BT.2020/PQ output
+- NVENC 13 headers and HEVC encoder
 
 ## Direct resource path
 
 The tested path is:
 
-1. Create one `D3DFMT_A2B10G10R10` render target on the NvFBC D3D9Ex device.
-2. Pass that exact `IDirect3DSurface9*` to NvFBC V3 setup as ARGB10/HDR.
-3. Open the NVENC session on the same `IDirect3DDevice9Ex*` with
-   `NV_ENC_DEVICE_TYPE_DIRECTX`.
-4. Register the same surface pointer with
-   `NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX` and
-   `NV_ENC_BUFFER_FORMAT_ABGR10`.
-5. For each frame, call NvFBC Grab, map the registered surface, encode, lock
-   the bitstream, unlock, and unmap before NvFBC overwrites the surface.
+1. Select the NVIDIA D3D9Ex adapter and its matching DXGI output.
+2. Obtain the active refresh rate from `EnumDisplaySettingsW`.
+3. Create three `D3DFMT_A2B10G10R10` render targets on the NvFBC D3D9Ex
+   device and give those exact surfaces to NvFBC V3.
+4. Open NVENC on the same `IDirect3DDevice9Ex*`.
+5. Query HEVC input formats, profiles, chroma/bit-depth caps, and maximum
+   dimensions before selecting a route.
+6. Register all three NvFBC surfaces directly as `NV_ENC_BUFFER_FORMAT_ABGR10`.
+7. Rotate capture, mapped NVENC input, and bitstream slots; drain in submission
+   order and verify every returned timestamp before reusing a surface.
 
 The loop contains no `CopyResource`, `StretchRect`, shared handle, staging
-surface, readback, D3D11 device, or cross-device synchronization. D3D9 command
-ordering on the single device provides producer/consumer ordering for this
-synchronous single-surface test.
+surface, readback, D3D11 device, or application shader conversion. NVENC still
+performs its internal RGB10-to-YUV conversion and may use driver-private
+storage. The accurate claim is therefore "no application-issued post-capture
+GPU copy," not absolute zero-copy inside the driver.
 
-Modern NVENC reports 16 HEVC input formats on this session and explicitly
-includes ABGR10. Session creation, HEVC Main10 initialization, D3D9 surface
-registration, mapping, and encoding all return `NV_ENC_SUCCESS`. The mapped
-format is `0x20000000` (`NV_ENC_BUFFER_FORMAT_ABGR10`).
+## Capability interface
+
+Route selection is not tied to the RTX 5090 result. The probe accepts chroma
+sampling and QP as caller options, obtains dimensions from NvFBC, obtains the
+refresh rate from the selected display, and queries the following NVENC data:
+
+- HEVC `ABGR10` input format support
+- Main10 and FRExt profile GUIDs
+- `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE`
+- `NV_ENC_CAPS_SUPPORT_YUV422_ENCODE`
+- `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`
+- maximum encode width and height
+
+It emits one stable machine-readable capability record:
+
+```json
+route_caps_json={"schema":1,"device_api":"D3D9Ex","codec":"HEVC","input_format":"ABGR10","hevc":true,"abgr10_input":true,"main10_profile":true,"frext_profile":true,"ten_bit":true,"yuv422":true,"yuv444":true,"max_width":8192,"max_height":8192,"advertised_routes":{"420":true,"422":true,"444":true},"lookahead":false}
+```
+
+`advertised_routes` means the static profile/format/caps intersection for the
+current dimensions. It is intentionally distinct from runtime validation. A
+selected route must also pass `nvEncInitializeEncoder`, registration of every
+NvFBC surface, submission, timestamp-ordered drain, and external strict decode.
+The probe prints `requested_route_initialized=true` only after Init and all
+resource registrations succeed.
+
+For a future mainline integration, this record maps directly to a backend
+`ProbeCaps` result. The GUI/automatic selector may expose only advertised
+routes, while recording startup must still validate the selected route and
+return `Unsupported desktop mode` if runtime initialization fails. No adapter,
+chroma route, display size, refresh rate, or QP is inferred from this machine's
+test result.
+
+The current mainline types already provide the required landing points:
+
+- width, height, 10-bit, 4:2:2, and 4:4:4 caps map to `NvencCapsInfo`;
+- ABGR10 and Main10/FRExt enumeration map to `NvencProbeInfo.input_formats`
+  and `hevc_profiles`;
+- each advertised chroma choice maps to an `NvencRouteProbe` with
+  `input_format=ABGR10`, bit depth 10, and the selected Main10/FRExt profile;
+- adapter/output identity and nclx values continue to come from the existing
+  `NvencCurrentDisplayRouteInfo` / `IDXGIOutput6` display probe.
+
+Until the complete NvFBC capture backend is integrated, those future route
+entries must keep `production_record_supported=false`; passing this standalone
+probe must not make the current D3D11 backend claim it owns the D3D9Ex route.
+
+## HEVC route configuration
+
+All three routes use the NvFBC-written ABGR10 surface as NVENC input. The
+requested output sampling determines profile and `chromaFormatIDC`:
+
+| Requested route | Profile | `chromaFormatIDC` | Expected decoded format |
+| --- | --- | ---: | --- |
+| 4:2:0 10-bit | Main10 | 1 | `yuv420p10le` |
+| 4:2:2 10-bit | FRExt | 2 | `yuv422p10le` |
+| 4:4:4 10-bit | FRExt | 3 | `yuv444p10le` |
+
+BT.2020 primaries, PQ transfer, BT.2020 non-constant matrix, and full range are
+written for this HDR probe. A production route must take those values from the
+display/capture route plan rather than assume every NvFBC session is HDR.
 
 ## Results
 
-| Run | Frames | Elapsed | FPS | Grab P50/P95 | Encode P50/P95 | Encode max | Result |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Smoke | 10 | 50.294 ms | 198.830 | 0.191/0.979 ms | 2.172/8.660 ms | 8.660 ms | Pass; includes first-frame warmup |
-| Steady | 600 | 2512.167 ms | 238.838 | 0.196/0.311 ms | 1.927/2.111 ms | 9.520 ms | Pass |
-| Stability | 2400 | 10026.547 ms | 239.365 | 0.225/0.332 ms | 1.931/2.296 ms | 9.599 ms | Pass |
+The original single-surface loop showed why a small no-Lookahead pool is still
+needed. 4:4:4 encode work approached the 4.167 ms refresh interval and missed
+47 source intervals over ten seconds. The three-surface pipeline separates
+submit from ordered bitstream drain without allowing NvFBC to overwrite an
+in-flight input.
 
-The 2400-frame elementary stream contains exactly 2400 decodable frames.
-`ffprobe` reports:
+| Route | Surfaces | Frames | FPS | Source long intervals | Submit P50/P95 | Pipeline P50/P95 | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4:2:2 | 1 | 2400/2400 | 239.385 | 5 | 2.445/2.803 ms combined encode | n/a | Pass |
+| 4:4:4 | 1 | 2400/2400 | 235.146 | 47 | 3.516/3.756 ms combined encode | n/a | Pass, below refresh cadence |
+| 4:2:2 | 3 | 2400/2400 | 239.838 | 1 | 0.164/0.294 ms | 0.184/0.333 ms | Pass |
+| 4:4:4 | 3 | 2400/2400 | 239.856 | 1 | 0.153/0.261 ms | 0.171/0.296 ms | Pass |
+
+The final 4:2:2 and 4:4:4 runs each contain exactly 2400 frames. `ffprobe`
+reports:
 
 ```text
-codec_name=hevc
-profile=Main 10
-width=3840
-height=2160
-pix_fmt=yuv420p10le
-color_range=pc
-color_space=bt2020nc
-color_transfer=smpte2084
-color_primaries=bt2020
-r_frame_rate=240/1
-nb_read_frames=2400
+4:2:2: profile=Rext pix_fmt=yuv422p10le nb_read_frames=2400
+4:4:4: profile=Rext pix_fmt=yuv444p10le nb_read_frames=2400
+both: 3840x2160, pc, bt2020nc, smpte2084, bt2020, 240/1
 ```
 
-`ffmpeg -err_detect explode` decodes all frames without an error.
+`ffmpeg -err_detect explode` decodes both complete streams without an error.
+A 600-frame 4:2:0 Main10 regression run also reports 600 frames and decodes
+without an error after the three-surface refactor.
+The final evidence logs are:
 
-## Conclusion
+- `docs/nvfbc-nvenc-422-pipeline-2400f-run1-20260717.log`
+- `docs/nvfbc-nvenc-444-pipeline-2400f-run1-20260717.log`
 
-The direct D3D9Ex NvFBC-to-NVENC resource path is feasible on the tested modern
-GeForce driver. The previously suspected API/device ownership conflict does
-not apply when NVENC is opened on the same D3D9Ex device: NVENC accepts the
-actual NvFBC output surface and sustains the 4K240 capture cadence.
+## Status and remaining work
 
-This proves zero additional application-issued GPU copies after NvFBC. It does
-not prove that NVENC performs no internal work: encoding 4:2:0 HEVC from ABGR10
-necessarily includes an internal RGB10-to-YUV420 conversion, and the driver may
-use private intermediate storage. The useful production claim is therefore
-"no explicit post-capture copy or shader conversion in RustReplay," not
-"absolute zero-copy inside the NVIDIA driver."
+Within this isolated probe, HDR/PQ HEVC 10-bit 4:2:0, 4:2:2, and 4:4:4 are
+functional direct-resource routes. 4:2:2 and 4:4:4 have passed actual Init,
+registration, 2400-frame encode, exact frame count, metadata inspection, and
+strict decode; they are not caps-only branches.
 
-## Remaining production work
+This is not yet a production NvFBC backend. Remaining work before any mainline
+merge includes:
 
-- Port the D3D9 NVENC session/resource registration into the Rust backend.
-- Replace the synchronous single surface with an in-flight surface/bitstream
-  pool before enabling lookahead, B frames, or delayed output.
-- Preserve source timestamps in MP4; the elementary-stream probe uses a fixed
-  240 Hz initialization value only to validate the encoder.
-- Add unchanged-frame detection/diff-map handling for the project's VFR design.
+- Port the D3D9/NVENC session and the `ProbeCaps` mapping into Rust ownership.
+- Derive HDR/SDR and color metadata from the mainline display route plan.
+- Preserve source timestamps in MP4 and implement unchanged-frame handling for
+  the project's VFR design.
 - Integrate audio, encoded ring, save, cursor policy, mode-change recreation,
-  and error recovery.
-- Validate SDR, other NVIDIA generations/drivers, multi-monitor, sleep/resume,
-  and full-screen game behavior.
+  and device-loss recovery.
+- Validate older NVIDIA generations/drivers, multi-monitor selection,
+  sleep/resume, and full-screen games.
 - Resolve the unsupported private-data distribution and compatibility risk.
+
+Lookahead remains intentionally unimplemented and unexposed.
 
 ## Reproduction
 
 ```powershell
 experiments\build_nvfbc_nvenc_direct.ps1
-target\release\nvfbc_nvenc_direct.exe 2400 target\nvfbc_nvenc_direct.hevc
-ffprobe -v error -count_frames -show_streams target\nvfbc_nvenc_direct.hevc
-ffmpeg -v error -err_detect explode -r 240 `
-  -i target\nvfbc_nvenc_direct.hevc -map 0:v:0 -fps_mode passthrough -f null NUL
+target\release\nvfbc_nvenc_direct.exe 2400 target\nvfbc_422.hevc 422 18
+target\release\nvfbc_nvenc_direct.exe 2400 target\nvfbc_444.hevc 444 18
+ffprobe -v error -count_frames -show_streams target\nvfbc_422.hevc
+ffprobe -v error -count_frames -show_streams target\nvfbc_444.hevc
+ffmpeg -v error -err_detect explode -r 240 -i target\nvfbc_422.hevc `
+  -map 0:v:0 -fps_mode passthrough -f null NUL
+ffmpeg -v error -err_detect explode -r 240 -i target\nvfbc_444.hevc `
+  -map 0:v:0 -fps_mode passthrough -f null NUL
 ```
