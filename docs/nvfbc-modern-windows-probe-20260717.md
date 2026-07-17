@@ -39,8 +39,10 @@ and multi-client support.
 
 With the explicit private-data flag, both interface IDs succeed:
 
-- `0x2002`: `NvFBCToDx9Vid_v2`, also observed in NVIDIA Replay logs.
-- `0x2003`: `NvFBCToDx9Vid_v3`, Capture SDK 7.1 interface.
+- `0x2002`: `NvFBCToDx9Vid_v2`, also observed in NVIDIA Replay logs. Its
+  public setup ABI supports 8-bit ARGB/NV12 and has no HDR request field.
+- `0x2003`: `NvFBCToDx9Vid_v3`, Capture SDK 7.1 interface. It adds ARGB10
+  and the HDR request field used by the probe's HDR route.
 
 The driver reports a maximum capture surface of 3840x2160. V3 setup succeeds
 with three D3D9Ex `A2B10G10R10` render targets, `ARGB10`, and `bHDRRequest=1`.
@@ -86,20 +88,23 @@ found across all enumerated DXGI outputs. The hooks are installed before
 both patched entry points and verifies that they return
 `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` before the counters are reset.
 
-Two independent 10-second V3 HDR captures then completed while DDA creation was
-denied:
+Two independent 10-second captures for each interface then completed while DDA
+creation was denied. V2 used its public 8-bit ARGB setup; V3 used ARGB10 with
+the HDR request enabled:
 
-| Run | Frames | FPS | HDR frames | `DuplicateOutput` calls | `DuplicateOutput1` calls | Readback |
+| Interface/run | Frames | FPS | HDR frames | `DuplicateOutput` calls | `DuplicateOutput1` calls | Readback |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Early deny 1 | 2401 | 240.029 | 2400 | 0 | 0 | 8,294,400 non-zero pixels |
-| Early deny 2 | 2401 | 240.068 | 2398 | 0 | 0 | 8,294,400 non-zero pixels |
+| V2 ARGB deny 1 | 2401 | 240.055 | 0 | 0 | 0 | 8,294,400 non-zero pixels |
+| V2 ARGB deny 2 | 2401 | 240.032 | 0 | 0 | 0 | 8,294,400 non-zero pixels |
+| V3 ARGB10 HDR deny 1 | 2401 | 240.029 | 2400 | 0 | 0 | 8,294,400 non-zero pixels |
+| V3 ARGB10 HDR deny 2 | 2401 | 240.068 | 2398 | 0 | 0 | 8,294,400 non-zero pixels |
 
-This excludes the public DXGI Desktop Duplication path for the tested RTX 5090,
-driver `6.14.16.1074`, V3 ARGB10 HDR route. A DDA duplication object cannot be
-created without one of the denied entry points, and none existed before the
-DLL was loaded. The result does not prove that every NVIDIA driver, output
-mode, or failure recovery path avoids DDA; the DLL demonstrably retains that
-fallback code.
+This excludes the public DXGI Desktop Duplication path for both the V2 ARGB and
+V3 ARGB10 HDR routes on the tested RTX 5090 and driver `6.14.16.1074`. A DDA
+duplication object cannot be created without one of the denied entry points,
+and none existed before the DLL was loaded. The result does not prove that
+every NVIDIA driver, output mode, or failure recovery path avoids DDA; the DLL
+demonstrably retains that fallback code.
 
 ## GPU A/B
 
@@ -121,9 +126,15 @@ Modern Windows GeForce NvFBC is technically callable by a third-party process
 on this driver. 4K240 HDR ARGB10 capture works, and its GPU cost is materially
 lower than the existing explicit WGC color-conversion path.
 
-For the exact tested route, the capture is not a wrapper around the public
+For both tested interface routes, capture is not a wrapper around the public
 DXGI Desktop Duplication API. Both DDA creation methods can be made unavailable
 for the whole NvFBC lifetime without affecting capture success or cadence.
+
+The NVIDIA Replay log naming `NvFBCToDx9Vid_v2` identifies its created interface
+version; it does not imply that the earlier V3 probe reproduced Replay exactly.
+The new V2 run now covers that interface for DDA exclusion. Its public output
+was 8-bit ARGB with no HDR frame flag, so reproducing Replay's exact HDR setup,
+if Replay was recording HDR in that log, remains a separate question.
 
 The useful scheduler is `DXGI WaitForVBlank -> NvFBC NOWAIT`. Calling the NvFBC
 blocking Grab path directly wastes roughly half a CPU core at 240 Hz.
@@ -158,6 +169,10 @@ target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
 # Exclude the standard DDA fallback for the complete NvFBC lifetime.
 target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
   --sunshine-private-data --capture --vblank-grab --deny-dda
+
+# Run the same exclusion test through the V2 interface observed in Replay logs.
+target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
+  --sunshine-private-data --capture --capture-v2 --vblank-grab --deny-dda
 ```
 
 Without `--sunshine-private-data`, the probe remains a native-access control

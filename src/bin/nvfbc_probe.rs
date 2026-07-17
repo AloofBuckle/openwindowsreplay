@@ -29,8 +29,8 @@ use windows::{
         Graphics::Direct3D9::{
             D3D_SDK_VERSION, D3DADAPTER_IDENTIFIER9, D3DCREATE_FPU_PRESERVE,
             D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DDEVTYPE_HAL,
-            D3DFMT_A2B10G10R10, D3DFMT_X8R8G8B8, D3DLOCK_READONLY, D3DLOCKED_RECT,
-            D3DMULTISAMPLE_NONE, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE,
+            D3DFMT_A2B10G10R10, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, D3DFORMAT, D3DLOCK_READONLY,
+            D3DLOCKED_RECT, D3DMULTISAMPLE_NONE, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE,
             D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_VIDEO, D3DSWAPEFFECT_COPY, Direct3DCreate9Ex,
             IDirect3D9Ex, IDirect3DDevice9Ex, IDirect3DSurface9,
         },
@@ -64,8 +64,7 @@ type NvFbcCreateEx = unsafe extern "system" fn(*mut c_void) -> NvFbcResult;
 type NvFbcRelease = unsafe extern "system" fn(*mut c_void) -> NvFbcResult;
 
 #[cfg(windows)]
-type NvFbcSetupV3 =
-    unsafe extern "system" fn(*mut c_void, *mut NvFbcToDx9VidSetupV3) -> NvFbcResult;
+type NvFbcSetup = unsafe extern "system" fn(*mut c_void, *mut c_void) -> NvFbcResult;
 
 #[cfg(windows)]
 type NvFbcGrabV1 = unsafe extern "system" fn(*mut c_void, *mut NvFbcToDx9VidGrabV1) -> NvFbcResult;
@@ -91,6 +90,9 @@ const STATUS_FLAG_MULTI_CLIENT: u32 = 1 << 4;
 const NVFBC_TO_DX9_VID_V2: u32 = 0x2002;
 #[cfg(windows)]
 const NVFBC_TO_DX9_VID_V3: u32 = 0x2003;
+
+#[cfg(windows)]
+const NVFBC_TODX9VID_ARGB: u32 = 0;
 
 #[cfg(windows)]
 const NVFBC_TODX9VID_ARGB10: u32 = 2;
@@ -372,6 +374,7 @@ impl GrabStrategy {
 struct CaptureRunConfig<'a> {
     device: &'a IDirect3DDevice9Ex,
     dxgi_output: Option<&'a IDXGIOutput>,
+    interface_type: u32,
     width: u32,
     height: u32,
     version: u32,
@@ -474,6 +477,41 @@ impl NvFbcCreateParams {
 struct NvFbcToDx9VidOutBuf {
     primary: *mut c_void,
     secondary: *mut c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NvFbcToDx9VidSetupV2 {
+    dw_version: u32,
+    flags: u32,
+    mode: u32,
+    buffer_count: u32,
+    buffers: *mut NvFbcToDx9VidOutBuf,
+    stereo_format: u32,
+    diff_map_buffer_size: u32,
+    diff_maps: *mut *mut c_void,
+    cursor_capture_event: *mut c_void,
+    reserved: [u32; 26],
+    reserved_ptrs: [*mut c_void; 13],
+}
+
+#[cfg(windows)]
+impl NvFbcToDx9VidSetupV2 {
+    fn argb(buffers: &mut [NvFbcToDx9VidOutBuf], version: u32) -> Self {
+        Self {
+            dw_version: struct_version::<Self>(version, 1),
+            flags: 0,
+            mode: NVFBC_TODX9VID_ARGB,
+            buffer_count: buffers.len() as u32,
+            buffers: buffers.as_mut_ptr(),
+            stereo_format: 0,
+            diff_map_buffer_size: 0,
+            diff_maps: ptr::null_mut(),
+            cursor_capture_event: ptr::null_mut(),
+            reserved: [0; 26],
+            reserved_ptrs: [ptr::null_mut(); 13],
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -725,6 +763,7 @@ fn create_capture_surfaces(
     width: u32,
     height: u32,
     count: usize,
+    format: D3DFORMAT,
 ) -> windows::core::Result<Vec<IDirect3DSurface9>> {
     let mut surfaces = Vec::with_capacity(count);
     for _ in 0..count {
@@ -733,7 +772,7 @@ fn create_capture_surfaces(
             device.CreateRenderTarget(
                 width,
                 height,
-                D3DFMT_A2B10G10R10,
+                format,
                 D3DMULTISAMPLE_NONE,
                 0,
                 false,
@@ -752,13 +791,14 @@ fn readback_hash(
     surface: &IDirect3DSurface9,
     width: u32,
     height: u32,
+    format: D3DFORMAT,
 ) -> windows::core::Result<(u64, u64, u32, u32)> {
     let mut staging = None;
     unsafe {
         device.CreateOffscreenPlainSurface(
             width,
             height,
-            D3DFMT_A2B10G10R10,
+            format,
             D3DPOOL_SYSTEMMEM,
             &mut staging,
             ptr::null_mut(),
@@ -836,20 +876,23 @@ fn process_cpu_time_100ns() -> windows::core::Result<u64> {
 }
 
 #[cfg(windows)]
-unsafe fn run_hdr_capture(
-    interface: *mut c_void,
-    config: CaptureRunConfig<'_>,
-) -> anyhow::Result<()> {
+unsafe fn run_capture(interface: *mut c_void, config: CaptureRunConfig<'_>) -> anyhow::Result<()> {
     let CaptureRunConfig {
         device,
         dxgi_output,
+        interface_type,
         width,
         height,
         version,
         duration,
         strategy,
     } = config;
-    let surfaces = create_capture_surfaces(device, width, height, 3)?;
+    let (surface_format, format_label, hdr_request) = match interface_type {
+        NVFBC_TO_DX9_VID_V2 => (D3DFMT_A8R8G8B8, "ARGB", false),
+        NVFBC_TO_DX9_VID_V3 => (D3DFMT_A2B10G10R10, "ARGB10", true),
+        other => anyhow::bail!("unsupported capture interface 0x{other:04x}"),
+    };
+    let surfaces = create_capture_surfaces(device, width, height, 3, surface_format)?;
     let mut output_buffers = surfaces
         .iter()
         .map(|surface| NvFbcToDx9VidOutBuf {
@@ -858,27 +901,47 @@ unsafe fn run_hdr_capture(
         })
         .collect::<Vec<_>>();
 
-    let mut setup = NvFbcToDx9VidSetupV3::hdr_argb10(&mut output_buffers, version);
     let vtable = unsafe { *(interface.cast::<*mut *mut c_void>()) };
-    let setup_method: NvFbcSetupV3 = unsafe { std::mem::transmute(*vtable.add(0)) };
+    let setup_method: NvFbcSetup = unsafe { std::mem::transmute(*vtable.add(0)) };
     let grab_method: NvFbcGrabV1 = unsafe { std::mem::transmute(*vtable.add(1)) };
     let gpu_sleep_method: NvFbcGpuSleep = unsafe { std::mem::transmute(*vtable.add(2)) };
 
+    let (setup_result, setup_size, setup_version) = match interface_type {
+        NVFBC_TO_DX9_VID_V2 => {
+            let mut setup = NvFbcToDx9VidSetupV2::argb(&mut output_buffers, version);
+            let result = unsafe {
+                setup_method(interface, (&mut setup as *mut NvFbcToDx9VidSetupV2).cast())
+            };
+            (result, size_of::<NvFbcToDx9VidSetupV2>(), setup.dw_version)
+        }
+        NVFBC_TO_DX9_VID_V3 => {
+            let mut setup = NvFbcToDx9VidSetupV3::hdr_argb10(&mut output_buffers, version);
+            let result = unsafe {
+                setup_method(interface, (&mut setup as *mut NvFbcToDx9VidSetupV3).cast())
+            };
+            (result, size_of::<NvFbcToDx9VidSetupV3>(), setup.dw_version)
+        }
+        _ => unreachable!(),
+    };
+
     println!(
         concat!(
-            "capture_setup width={width} height={height} buffers={buffers} format=ARGB10 hdr_request=true ",
+            "capture_setup interface=0x{interface_type:04x} width={width} height={height} buffers={buffers} ",
+            "format={format_label} hdr_request={hdr_request} ",
             "setup_struct_size={setup_size} setup_version=0x{setup_version:08x} ",
             "grab_struct_size={grab_size} grab_wait={grab_wait}"
         ),
         width = width,
         height = height,
         buffers = output_buffers.len(),
-        setup_size = size_of::<NvFbcToDx9VidSetupV3>(),
-        setup_version = setup.dw_version,
+        interface_type = interface_type,
+        format_label = format_label,
+        hdr_request = hdr_request,
+        setup_size = setup_size,
+        setup_version = setup_version,
         grab_size = size_of::<NvFbcToDx9VidGrabV1>(),
         grab_wait = strategy.label(),
     );
-    let setup_result = unsafe { setup_method(interface, &mut setup) };
     println!(
         "capture_setup_result={setup_result}({})",
         result_name(setup_result)
@@ -1025,8 +1088,13 @@ unsafe fn run_hdr_capture(
 
     if success_count > 0 {
         let readback_started = Instant::now();
-        let (hash, nonzero_words, minimum, maximum) =
-            readback_hash(device, &surfaces[last_buffer_index], width, height)?;
+        let (hash, nonzero_words, minimum, maximum) = readback_hash(
+            device,
+            &surfaces[last_buffer_index],
+            width,
+            height,
+            surface_format,
+        )?;
         println!(
             concat!(
                 "capture_readback buffer={last_buffer_index} hash=0x{hash:016x} ",
@@ -1050,6 +1118,12 @@ fn main() -> anyhow::Result<()> {
     let use_sunshine_private_data = std::env::args_os().any(|arg| arg == "--sunshine-private-data");
     let capture_mode = std::env::args_os().any(|arg| arg == "--capture");
     let deny_dda = std::env::args_os().any(|arg| arg == "--deny-dda");
+    let capture_v2 = std::env::args_os().any(|arg| arg == "--capture-v2");
+    let capture_interface = if capture_v2 {
+        NVFBC_TO_DX9_VID_V2
+    } else {
+        NVFBC_TO_DX9_VID_V3
+    };
     let event_blocking_grab = std::env::args_os().any(|arg| arg == "--event-blocking-grab");
     let gpu_sleep_grab = std::env::args_os().any(|arg| arg == "--gpu-sleep-grab");
     let vblank_grab = std::env::args_os().any(|arg| arg == "--vblank-grab");
@@ -1071,6 +1145,7 @@ fn main() -> anyhow::Result<()> {
     println!("nvfbc_probe=status_and_create");
     println!("sunshine_private_data={use_sunshine_private_data}");
     println!("capture_mode={capture_mode}");
+    println!("capture_interface=0x{capture_interface:04x}");
     println!("deny_dda={deny_dda}");
     println!("grab_strategy={}", grab_strategy.label());
     println!("dll={}", dll_path.display());
@@ -1179,7 +1254,7 @@ fn main() -> anyhow::Result<()> {
                 None
             };
         let interface_types: &[u32] = if deny_dda {
-            &[NVFBC_TO_DX9_VID_V3]
+            std::slice::from_ref(&capture_interface)
         } else {
             &[NVFBC_TO_DX9_VID_V2, NVFBC_TO_DX9_VID_V3]
         };
@@ -1213,13 +1288,14 @@ fn main() -> anyhow::Result<()> {
             );
 
             if result == NVFBC_SUCCESS && !create.nvfbc.is_null() {
-                let capture_result = if capture_mode && interface_type == NVFBC_TO_DX9_VID_V3 {
+                let capture_result = if capture_mode && interface_type == capture_interface {
                     unsafe {
-                        run_hdr_capture(
+                        run_capture(
                             create.nvfbc,
                             CaptureRunConfig {
                                 device: &device,
                                 dxgi_output: dxgi_output.as_ref(),
+                                interface_type,
                                 width: create.dw_max_display_width,
                                 height: create.dw_max_display_height,
                                 version: sdk_version & 0xff,
