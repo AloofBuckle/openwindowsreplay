@@ -27,6 +27,8 @@ mod record_loop;
 mod record_nvenc;
 #[cfg(windows)]
 mod record_nvfbc;
+#[cfg(windows)]
+mod record_nvfbc_workers;
 mod route;
 mod shaders;
 mod timing;

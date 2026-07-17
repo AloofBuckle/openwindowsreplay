@@ -27,10 +27,11 @@ mod cuda;
 #[path = "nvenc/d3d9.rs"]
 mod d3d9;
 #[cfg(windows)]
-pub(crate) use d3d9::{NvencD3d9Caps, NvencD3d9Encoder};
+pub(crate) use d3d9::{NvencD3d9Caps, NvencD3d9Encoder, NvencD3d9RuntimeStats};
 
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 const NV_ENC_SUCCESS: i32 = 0;
+const NV_ENC_ERR_LOCK_BUSY: i32 = 13;
 const NV_ENC_ERR_NEED_MORE_INPUT: i32 = 17;
 
 // Video Codec SDK 13.1 header encoding. The official driver entry point also
@@ -54,6 +55,7 @@ const NV_ENC_REGISTER_RESOURCE_VER: u32 = nvencapi_struct_version(5);
 const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = nvencapi_struct_version(4);
 const NV_ENC_PIC_PARAMS_VER: u32 = nvencapi_struct_version(7) | (1u32 << 31);
 const NV_ENC_LOCK_BITSTREAM_VER: u32 = nvencapi_struct_version(2) | (1u32 << 31);
+const NV_ENC_EVENT_PARAMS_VER: u32 = nvencapi_struct_version(2);
 
 const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0;
 const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
@@ -2346,6 +2348,7 @@ unsafe fn initialize_low_latency_hevc_encoder(
         rate_control,
         frame_rate_num,
         frame_rate_den,
+        false,
         "NvEncInitializeEncoder(HEVC D3D11 low-latency)",
     )
 }
@@ -2362,6 +2365,7 @@ unsafe fn initialize_low_latency_hevc_encoder_for_route(
     rate_control: &RateControlConfig,
     frame_rate_num: u32,
     frame_rate_den: u32,
+    enable_async: bool,
     stage: &'static str,
 ) -> Result<(), BackendError> {
     let initialize = api
@@ -2379,7 +2383,7 @@ unsafe fn initialize_low_latency_hevc_encoder_for_route(
     params.darHeight = height;
     params.frameRateNum = frame_rate_num.max(1);
     params.frameRateDen = frame_rate_den.max(1);
-    params.enableEncodeAsync = 0;
+    params.enableEncodeAsync = u32::from(enable_async);
     params.enablePTD = 1;
     params.bitfields = split_encode_initialize_bitfields(rate_control.nvenc_split_encode_mode);
     let preset_config = query_preset_config(api, encoder, preset_guid)?;
@@ -3217,6 +3221,15 @@ unsafe fn encode_one_d3d11_frame(
 
 #[cfg(windows)]
 unsafe fn submit_encoder_eos(api: &NvencApi, encoder: *mut c_void) -> Result<(), BackendError> {
+    submit_encoder_eos_with_completion(api, encoder, ptr::null_mut())
+}
+
+#[cfg(windows)]
+unsafe fn submit_encoder_eos_with_completion(
+    api: &NvencApi,
+    encoder: *mut c_void,
+    completion_event: *mut c_void,
+) -> Result<(), BackendError> {
     let encode = api
         .functions
         .nvEncEncodePicture
@@ -3224,6 +3237,7 @@ unsafe fn submit_encoder_eos(api: &NvencApi, encoder: *mut c_void) -> Result<(),
     let mut params: NvEncPicParams = std::mem::zeroed();
     params.version = NV_ENC_PIC_PARAMS_VER;
     params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+    params.completionEvent = completion_event;
     nvenc_check("NvEncEncodePicture(EOS)", encode(encoder, &mut params))
 }
 
@@ -3240,6 +3254,16 @@ unsafe fn lock_and_copy_bitstream(
     encoder: *mut c_void,
     bitstream: &NvencBitstreamBuffer,
 ) -> Result<NvencLockedOutput, BackendError> {
+    lock_and_copy_bitstream_with_mode(api, encoder, bitstream, false)
+}
+
+#[cfg(windows)]
+unsafe fn lock_and_copy_bitstream_with_mode(
+    api: &NvencApi,
+    encoder: *mut c_void,
+    bitstream: &NvencBitstreamBuffer,
+    do_not_wait: bool,
+) -> Result<NvencLockedOutput, BackendError> {
     let lock = api
         .functions
         .nvEncLockBitstream
@@ -3250,8 +3274,17 @@ unsafe fn lock_and_copy_bitstream(
         .ok_or_else(|| nvenc_missing("NvEncUnlockBitstream"))?;
     let mut params: NvEncLockBitstream = std::mem::zeroed();
     params.version = NV_ENC_LOCK_BITSTREAM_VER;
+    params.bitfields = u32::from(do_not_wait);
     params.outputBitstream = bitstream.buffer;
-    nvenc_check("NvEncLockBitstream", lock(encoder, &mut params))?;
+    let status = lock(encoder, &mut params);
+    if status == NV_ENC_ERR_LOCK_BUSY && do_not_wait {
+        return Err(BackendError::unsupported(
+            "NVENC async output",
+            "NvEncLockBitstream(doNotWait=1)",
+            "完成事件已触发但 bitstream 仍返回 NV_ENC_ERR_LOCK_BUSY",
+        ));
+    }
+    nvenc_check("NvEncLockBitstream", status)?;
     let mut locked = NvencLockedBitstream {
         encoder,
         buffer: bitstream,
@@ -3698,6 +3731,16 @@ struct NvEncMapInputResource {
 
 #[cfg(windows)]
 #[repr(C)]
+struct NvEncEventParams {
+    version: u32,
+    reserved: u32,
+    completionEvent: *mut c_void,
+    reserved1: [u32; 254],
+    reserved2: [*mut c_void; 64],
+}
+
+#[cfg(windows)]
+#[repr(C)]
 struct NvEncPicParams {
     version: u32,
     inputWidth: u32,
@@ -3797,8 +3840,10 @@ struct NvEncodeApiFunctionList {
     nvEncUnlockInputBuffer: *const c_void,
     nvEncGetEncodeStats: *const c_void,
     nvEncGetSequenceParams: *const c_void,
-    nvEncRegisterAsyncEvent: *const c_void,
-    nvEncUnregisterAsyncEvent: *const c_void,
+    nvEncRegisterAsyncEvent:
+        Option<unsafe extern "system" fn(*mut c_void, *mut NvEncEventParams) -> i32>,
+    nvEncUnregisterAsyncEvent:
+        Option<unsafe extern "system" fn(*mut c_void, *mut NvEncEventParams) -> i32>,
     nvEncMapInputResource:
         Option<unsafe extern "system" fn(*mut c_void, *mut NvEncMapInputResource) -> i32>,
     nvEncUnmapInputResource: Option<unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32>,
@@ -4748,6 +4793,11 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(NvEncInitializeParams, tuningInfo), 136);
         assert_eq!(std::mem::offset_of!(NvEncInitializeParams, reserved1), 152);
+
+        assert_eq!(std::mem::size_of::<NvEncEventParams>(), 1_544);
+        assert_eq!(std::mem::offset_of!(NvEncEventParams, completionEvent), 8);
+        assert_eq!(std::mem::offset_of!(NvEncEventParams, reserved1), 16);
+        assert_eq!(std::mem::offset_of!(NvEncEventParams, reserved2), 1_032);
     }
 
     #[test]

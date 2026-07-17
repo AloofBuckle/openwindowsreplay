@@ -41,7 +41,7 @@ pub struct VplOutputTrackInfo {
     pub codec: crate::backend::mp4_mux::HevcCodecMetadata,
 }
 
-pub trait VplOneCopyRecordSink {
+pub trait VplOneCopyRecordSink: Send {
     fn status(&mut self, _message: &str) {}
     fn video_track_started(&mut self, info: VplOutputTrackInfo);
     fn hevc_access_unit(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit);

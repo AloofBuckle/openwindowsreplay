@@ -52,7 +52,80 @@ fn record_nvfbc_impl(
     rate_control: &RateControlConfig,
     requested_chroma: ChromaSampling,
     external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    encoded_sink: Option<&mut dyn VplOneCopyRecordSink>,
+    probe: &crate::backend::nvfbc::NvFbcProbeInfo,
+    write_output_mp4: bool,
+) -> Result<VplOneCopyRecordOutput, BackendError> {
+    let Some(encoded_sink) = encoded_sink else {
+        return record_nvfbc_inner(
+            output,
+            duration_seconds,
+            rate_control,
+            requested_chroma,
+            external_stop,
+            None,
+            None,
+            None,
+            probe,
+            write_output_mp4,
+        );
+    };
+
+    std::thread::scope(|scope| {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel(super::record_nvfbc_workers::NVFBC_SINK_QUEUE_CAPACITY);
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut channel_sink =
+            super::record_nvfbc_workers::NvFbcChannelSink::new(tx, failure.clone());
+        let queue_stats = channel_sink.queue_stats();
+        let publisher = scope.spawn(move || {
+            super::record_nvfbc_workers::run_nvfbc_sink_publisher(rx, encoded_sink, queue_stats)
+        });
+        let audio_sink = channel_sink.clone();
+        let sink_monitor = channel_sink.clone();
+        let result = record_nvfbc_inner(
+            output,
+            duration_seconds,
+            rate_control,
+            requested_chroma,
+            external_stop,
+            Some(&mut channel_sink),
+            Some(audio_sink),
+            Some(sink_monitor),
+            probe,
+            write_output_mp4,
+        );
+        let queue_failure = channel_sink.failure();
+        drop(channel_sink);
+        publisher.join().map_err(|_| {
+            BackendError::unsupported(
+                "NvFBC encoded sink",
+                "publisher thread",
+                "有界发布线程 panic",
+            )
+        })?;
+        if let Some(message) = queue_failure {
+            return Err(BackendError::unsupported(
+                "NvFBC encoded sink",
+                "bounded publisher queue",
+                message,
+            ));
+        }
+        result
+    })
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn record_nvfbc_inner(
+    output: &Path,
+    duration_seconds: f32,
+    rate_control: &RateControlConfig,
+    requested_chroma: ChromaSampling,
+    external_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut encoded_sink: Option<&mut dyn VplOneCopyRecordSink>,
+    audio_sink: Option<super::record_nvfbc_workers::NvFbcChannelSink>,
+    sink_monitor: Option<super::record_nvfbc_workers::NvFbcChannelSink>,
     probe: &crate::backend::nvfbc::NvFbcProbeInfo,
     write_output_mp4: bool,
 ) -> Result<VplOneCopyRecordOutput, BackendError> {
@@ -159,19 +232,36 @@ fn record_nvfbc_impl(
         ),
     );
 
-    let mut audio_capture = RecordAudioCapture::start(
+    let audio_worker = super::record_nvfbc_workers::NvFbcAudioWorker::spawn(
         capture_duration + Duration::from_secs(5),
         retain_output_samples,
-        &mut notes,
-    );
+        audio_sink,
+    )?;
+    let mut audio_worker = Some(audio_worker);
     let mut samples = Vec::new();
     let mut encoded_stats = RecordHevcStats::default();
     let mut captured_frames = 0u32;
     let mut first_video_timestamp_100ns = None;
     let mut last_capture_timestamp_90k = None;
+    let mut last_capture_interval_90k = None;
     let mut last_forced_idr_timestamp_90k = None;
     let mut last_source_pid = 0u32;
     let mut last_wait_mode = 0u32;
+    let mut vblank_skips = 0u64;
+    let mut max_vblank_ticks = 0u64;
+    let mut cadence_one = 0u64;
+    let mut cadence_two = 0u64;
+    let mut cadence_three_plus = 0u64;
+    let expected_interval_90k = probe
+        .display
+        .as_ref()
+        .filter(|display| display.refresh_numerator > 0)
+        .map(|display| {
+            (VIDEO_CLOCK_HZ * u64::from(display.refresh_denominator.max(1)))
+                .div_ceil(u64::from(display.refresh_numerator))
+                .max(1)
+        })
+        .unwrap_or(1);
 
     while !stop.load(Ordering::Relaxed) {
         let force_idr = last_capture_timestamp_90k.is_none_or(|timestamp| {
@@ -183,6 +273,9 @@ fn record_nvfbc_impl(
         }
         if first_video_timestamp_100ns.is_none() {
             first_video_timestamp_100ns = Some(frame.capture_timestamp_100ns);
+            if let Some(worker) = audio_worker.as_ref() {
+                worker.set_video_start(frame.capture_timestamp_100ns)?;
+            }
             sink_status(
                 &mut encoded_sink,
                 format!(
@@ -191,7 +284,23 @@ fn record_nvfbc_impl(
                 ),
             );
         }
+        if let Some(previous) = last_capture_timestamp_90k {
+            let delta = frame.capture_timestamp_90k.saturating_sub(previous);
+            last_capture_interval_90k = Some(delta.max(1));
+            let multiple = delta
+                .saturating_add(expected_interval_90k / 2)
+                .checked_div(expected_interval_90k)
+                .unwrap_or(1)
+                .max(1);
+            match multiple {
+                1 => cadence_one = cadence_one.saturating_add(1),
+                2 => cadence_two = cadence_two.saturating_add(1),
+                _ => cadence_three_plus = cadence_three_plus.saturating_add(1),
+            }
+        }
         last_capture_timestamp_90k = Some(frame.capture_timestamp_90k);
+        vblank_skips = vblank_skips.saturating_add(frame.vblank_ticks.saturating_sub(1));
+        max_vblank_ticks = max_vblank_ticks.max(frame.vblank_ticks);
         last_source_pid = frame.source_pid;
         last_wait_mode = frame.wait_mode_used;
         captured_frames = captured_frames.saturating_add(1);
@@ -204,13 +313,15 @@ fn record_nvfbc_impl(
                 &mut encoded_stats,
             );
         }
-        if let Some(capture) = audio_capture.as_mut() {
-            capture.poll_live_aac(
-                first_video_timestamp_100ns,
-                last_capture_timestamp_90k,
-                &mut encoded_sink,
-                &mut notes,
-            )?;
+        if let Some(message) = sink_monitor.as_ref().and_then(|sink| sink.failure()) {
+            return Err(BackendError::unsupported(
+                "NvFBC encoded sink",
+                "bounded publisher queue",
+                message,
+            ));
+        }
+        if let Some(worker) = audio_worker.as_ref() {
+            worker.check()?;
         }
         if frame.capture_timestamp_90k >= requested_duration_90k {
             break;
@@ -218,8 +329,8 @@ fn record_nvfbc_impl(
     }
 
     if stop.load(Ordering::Relaxed) {
-        if let Some(capture) = audio_capture.as_mut() {
-            capture.stop_without_reencode(&mut notes);
+        if let Some(worker) = audio_worker.take() {
+            worker.abort();
         }
         drop(recorder);
         sink_status(
@@ -233,7 +344,8 @@ fn record_nvfbc_impl(
         return Err(BackendError::cancelled("NvFBC 录制循环"));
     }
 
-    for sample in recorder.finish()? {
+    let (finish_samples, nvenc_stats) = recorder.finish_with_stats()?;
+    for sample in finish_samples {
         push_record_hevc_sample(
             &mut samples,
             sample,
@@ -249,57 +361,41 @@ fn record_nvfbc_impl(
             "录制结束后没有可封装 HEVC access unit",
         ));
     }
-    let duration_90k = encoded_timeline_duration_90k(
-        &samples,
-        encoded_stats.last_timestamp_90k,
-        requested_duration_90k,
-        false,
-    );
-    let (audio_track, audio_access_units, audio_encoded_bytes) =
-        if let Some(capture) = audio_capture.as_mut() {
-            if retain_output_samples {
-                capture.finish_live_aac(&mut encoded_sink, &mut notes)?;
-                let sink_push_from_ticks = capture.live_pushed_until_ticks();
-                let audio_frames = capture.finish(&mut notes);
-                let track = build_record_aac_track(
-                    audio_frames,
-                    first_video_timestamp_100ns,
-                    duration_90k,
-                    &mut notes,
-                    &mut encoded_sink,
-                    sink_push_from_ticks,
-                )?;
-                let access_units = track
-                    .as_ref()
-                    .map(|track| track.samples.len().min(u32::MAX as usize) as u32)
-                    .unwrap_or(0);
-                let bytes = track
-                    .as_ref()
-                    .map(|track| {
-                        track
-                            .samples
-                            .iter()
-                            .map(|sample| sample.data.len() as u64)
-                            .sum()
-                    })
-                    .unwrap_or(0);
-                (track, access_units, bytes)
-            } else {
-                let track = capture.finish_streaming(
-                    first_video_timestamp_100ns,
-                    duration_90k,
-                    &mut encoded_sink,
-                    &mut notes,
-                )?;
-                (
-                    track,
-                    capture.live_access_units(),
-                    capture.live_encoded_bytes(),
-                )
-            }
-        } else {
-            (None, 0, 0)
-        };
+    // NvFBC supplies arrival timestamps but no explicit duration for the final
+    // frame. Reuse the last observed source interval for that tail instead of
+    // manufacturing a one-tick (1/90000s) sample or extending to a CFR target.
+    let duration_90k = encoded_stats
+        .last_timestamp_90k
+        .map(|timestamp| {
+            timestamp.saturating_add(
+                last_capture_interval_90k
+                    .unwrap_or(expected_interval_90k)
+                    .max(1),
+            )
+        })
+        .unwrap_or(requested_duration_90k.max(1));
+    let audio_output = audio_worker
+        .take()
+        .expect("NvFBC audio worker is present until normal finish")
+        .finish(duration_90k)?;
+    notes.extend(audio_output.notes);
+    let audio_track = audio_output.track;
+    let audio_access_units = audio_output.access_units;
+    let audio_encoded_bytes = audio_output.encoded_bytes;
+    if let Some(message) = sink_monitor.as_ref().and_then(|sink| sink.failure()) {
+        return Err(BackendError::unsupported(
+            "NvFBC encoded sink",
+            "bounded publisher queue",
+            message,
+        ));
+    }
+    if let Some(sink) = sink_monitor.as_ref() {
+        notes.push(format!(
+            "NvFBC encoded sink：bounded_capacity={} queue_high_water={}",
+            super::record_nvfbc_workers::NVFBC_SINK_QUEUE_CAPACITY,
+            sink.queue_high_water()
+        ));
+    }
 
     let video_track = HevcMp4Track {
         width,
@@ -318,10 +414,38 @@ fn record_nvfbc_impl(
         ));
     }
     notes.push(format!(
-        "NvFBC VFR 时间线使用成功 Grab 后的绝对 QPC，同时派生 90k 相对时间戳；source_pid={} wait_mode={} periodic_idr={}ms",
+        "NvFBC VFR 时间线使用独立 DXGI vblank waiter 的绝对 QPC，同时派生 90k 相对时间戳；source_pid={} wait_mode={} periodic_idr={}ms",
         last_source_pid,
         last_wait_mode,
         REPLAY_IDR_INTERVAL_90K * 1000 / VIDEO_CLOCK_HZ
+    ));
+    let completion_latency_avg_us = nvenc_stats
+        .completion_latency_us
+        .checked_div(nvenc_stats.completed_frames)
+        .unwrap_or(0);
+    let completion_wait_avg_us = nvenc_stats
+        .completion_wait_us
+        .checked_div(nvenc_stats.completion_waits)
+        .unwrap_or(0);
+    notes.push(format!(
+        "NvFBC cadence audit：expected_interval_90k={} 1x={} 2x={} 3x+={} vblank_skips={} max_vblank_ticks={}",
+        expected_interval_90k,
+        cadence_one,
+        cadence_two,
+        cadence_three_plus,
+        vblank_skips,
+        max_vblank_ticks
+    ));
+    notes.push(format!(
+        "NvFBC NVENC completion：async={} fallback={:?} frames={} latency_avg={}us latency_max={}us blocking_waits={} wait_avg={}us wait_max={}us",
+        nvenc_stats.async_encode,
+        nvenc_stats.async_fallback,
+        nvenc_stats.completed_frames,
+        completion_latency_avg_us,
+        nvenc_stats.completion_latency_max_us,
+        nvenc_stats.completion_waits,
+        completion_wait_avg_us,
+        nvenc_stats.completion_wait_max_us
     ));
 
     let display = probe.display.as_ref();
