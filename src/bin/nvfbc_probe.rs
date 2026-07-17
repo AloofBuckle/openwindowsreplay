@@ -10,10 +10,12 @@
 
 #[cfg(windows)]
 use std::{
+    collections::HashSet,
     ffi::{OsString, c_void},
     mem::size_of,
     path::PathBuf,
     ptr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -32,11 +34,18 @@ use windows::{
             D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_VIDEO, D3DSWAPEFFECT_COPY, Direct3DCreate9Ex,
             IDirect3D9Ex, IDirect3DDevice9Ex, IDirect3DSurface9,
         },
-        Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1, IDXGIOutput},
-        System::Threading::{GetCurrentProcess, GetProcessTimes},
+        Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_NOT_FOUND,
+            IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
+        },
+        System::{
+            Diagnostics::Debug::FlushInstructionCache,
+            Memory::{PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtect},
+            Threading::{GetCurrentProcess, GetProcessTimes},
+        },
         UI::WindowsAndMessaging::GetDesktopWindow,
     },
-    core::{BOOL, Interface},
+    core::{BOOL, HRESULT, Interface},
 };
 
 #[cfg(windows)]
@@ -103,6 +112,225 @@ const NVIDIA_VENDOR_ID: u32 = 0x10de;
 
 #[cfg(windows)]
 const SUNSHINE_PRIVATE_DATA: [u32; 4] = [0xaef5_7ac5, 0x401d_1a39, 0x1b85_6bbe, 0x9ed0_ceba];
+
+#[cfg(windows)]
+const ABSOLUTE_JUMP_SIZE: usize = 12;
+
+#[cfg(windows)]
+static DUPLICATE_OUTPUT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+static DUPLICATE_OUTPUT1_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+unsafe extern "system" fn deny_duplicate_output(
+    _this: *mut c_void,
+    _device: *mut c_void,
+    output_duplication: *mut *mut c_void,
+) -> HRESULT {
+    DUPLICATE_OUTPUT_CALLS.fetch_add(1, Ordering::Relaxed);
+    if !output_duplication.is_null() {
+        unsafe { output_duplication.write(ptr::null_mut()) };
+    }
+    DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn deny_duplicate_output1(
+    _this: *mut c_void,
+    _device: *mut c_void,
+    _flags: u32,
+    _supported_formats_count: u32,
+    _supported_formats: *const windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    output_duplication: *mut *mut c_void,
+) -> HRESULT {
+    DUPLICATE_OUTPUT1_CALLS.fetch_add(1, Ordering::Relaxed);
+    if !output_duplication.is_null() {
+        unsafe { output_duplication.write(ptr::null_mut()) };
+    }
+    DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+}
+
+#[cfg(windows)]
+struct InlineDenyHook {
+    target: *mut u8,
+    original: [u8; ABSOLUTE_JUMP_SIZE],
+    label: &'static str,
+}
+
+#[cfg(windows)]
+impl InlineDenyHook {
+    unsafe fn install(
+        target: *mut c_void,
+        replacement: *const c_void,
+        label: &'static str,
+    ) -> anyhow::Result<Self> {
+        if target.is_null() || replacement.is_null() {
+            anyhow::bail!("{label}: null hook address");
+        }
+
+        let target = target.cast::<u8>();
+        let mut original = [0_u8; ABSOLUTE_JUMP_SIZE];
+        unsafe { ptr::copy_nonoverlapping(target, original.as_mut_ptr(), original.len()) };
+
+        let mut patch = [0_u8; ABSOLUTE_JUMP_SIZE];
+        patch[0] = 0x48;
+        patch[1] = 0xb8;
+        patch[2..10].copy_from_slice(&(replacement as usize as u64).to_le_bytes());
+        patch[10] = 0xff;
+        patch[11] = 0xe0;
+        unsafe { write_executable_bytes(target, &patch)? };
+
+        println!(
+            "dda_deny_hook_installed method={label} target=0x{:x} replacement=0x{:x}",
+            target as usize, replacement as usize
+        );
+        Ok(Self {
+            target,
+            original,
+            label,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InlineDenyHook {
+    fn drop(&mut self) {
+        match unsafe { write_executable_bytes(self.target, &self.original) } {
+            Ok(()) => println!("dda_deny_hook_restored method={}", self.label),
+            Err(err) => eprintln!(
+                "dda_deny_hook_restore_failed method={} error={err:#}",
+                self.label
+            ),
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn write_executable_bytes(target: *mut u8, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut old_protection = PAGE_PROTECTION_FLAGS::default();
+    unsafe {
+        VirtualProtect(
+            target.cast(),
+            bytes.len(),
+            PAGE_EXECUTE_READWRITE,
+            &mut old_protection,
+        )?;
+        ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
+        FlushInstructionCache(GetCurrentProcess(), Some(target.cast()), bytes.len())?;
+    }
+
+    let mut discarded = PAGE_PROTECTION_FLAGS::default();
+    unsafe {
+        VirtualProtect(target.cast(), bytes.len(), old_protection, &mut discarded)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn install_system_dda_deny_hooks() -> anyhow::Result<Vec<InlineDenyHook>> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let mut hooks = Vec::new();
+    let mut hooked_targets = HashSet::new();
+    let mut self_test_output = None;
+    let mut adapter_index = 0_u32;
+
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(err) => return Err(err.into()),
+        };
+        let mut output_index = 0_u32;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(err) => return Err(err.into()),
+            };
+            self_test_output.get_or_insert_with(|| output.clone());
+
+            let output1: IDXGIOutput1 = output.cast()?;
+            let duplicate_output = output1.vtable().DuplicateOutput as *const () as *mut c_void;
+            if hooked_targets.insert(duplicate_output as usize) {
+                hooks.push(unsafe {
+                    InlineDenyHook::install(
+                        duplicate_output,
+                        deny_duplicate_output as *const () as *const c_void,
+                        "IDXGIOutput1::DuplicateOutput",
+                    )?
+                });
+            }
+
+            if let Ok(output5) = output.cast::<IDXGIOutput5>() {
+                let duplicate_output1 =
+                    output5.vtable().DuplicateOutput1 as *const () as *mut c_void;
+                if hooked_targets.insert(duplicate_output1 as usize) {
+                    hooks.push(unsafe {
+                        InlineDenyHook::install(
+                            duplicate_output1,
+                            deny_duplicate_output1 as *const () as *const c_void,
+                            "IDXGIOutput5::DuplicateOutput1",
+                        )?
+                    });
+                }
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+
+    let self_test_output = self_test_output
+        .ok_or_else(|| anyhow::anyhow!("cannot install DDA deny hooks: no DXGI output"))?;
+    unsafe { verify_dda_deny_hooks(&self_test_output)? };
+    println!("dda_deny_system_hooks_ready unique_targets={}", hooks.len());
+    Ok(hooks)
+}
+
+#[cfg(windows)]
+unsafe fn verify_dda_deny_hooks(output: &IDXGIOutput) -> anyhow::Result<()> {
+    let output1: IDXGIOutput1 = output.cast()?;
+    let mut duplication = ptr::null_mut();
+    let duplicate_output_result = unsafe {
+        (output1.vtable().DuplicateOutput)(output1.as_raw(), ptr::null_mut(), &mut duplication)
+    };
+    if duplicate_output_result != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE || !duplication.is_null() {
+        anyhow::bail!(
+            "DuplicateOutput deny self-test failed: result={duplicate_output_result:?} output=0x{:x}",
+            duplication as usize
+        );
+    }
+
+    let mut duplicate_output1_tested = false;
+    if let Ok(output5) = output.cast::<IDXGIOutput5>() {
+        duplication = ptr::null_mut();
+        let duplicate_output1_result = unsafe {
+            (output5.vtable().DuplicateOutput1)(
+                output5.as_raw(),
+                ptr::null_mut(),
+                0,
+                0,
+                ptr::null(),
+                &mut duplication,
+            )
+        };
+        if duplicate_output1_result != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE || !duplication.is_null()
+        {
+            anyhow::bail!(
+                "DuplicateOutput1 deny self-test failed: result={duplicate_output1_result:?} output=0x{:x}",
+                duplication as usize
+            );
+        }
+        duplicate_output1_tested = true;
+    }
+
+    println!(
+        "dda_deny_self_test success=true duplicate_output_calls={} duplicate_output1_calls={} duplicate_output1_tested={duplicate_output1_tested}",
+        DUPLICATE_OUTPUT_CALLS.swap(0, Ordering::Relaxed),
+        DUPLICATE_OUTPUT1_CALLS.swap(0, Ordering::Relaxed),
+    );
+    Ok(())
+}
 
 #[cfg(windows)]
 #[derive(Clone, Copy)]
@@ -821,6 +1049,7 @@ unsafe fn run_hdr_capture(
 fn main() -> anyhow::Result<()> {
     let use_sunshine_private_data = std::env::args_os().any(|arg| arg == "--sunshine-private-data");
     let capture_mode = std::env::args_os().any(|arg| arg == "--capture");
+    let deny_dda = std::env::args_os().any(|arg| arg == "--deny-dda");
     let event_blocking_grab = std::env::args_os().any(|arg| arg == "--event-blocking-grab");
     let gpu_sleep_grab = std::env::args_os().any(|arg| arg == "--gpu-sleep-grab");
     let vblank_grab = std::env::args_os().any(|arg| arg == "--vblank-grab");
@@ -834,12 +1063,27 @@ fn main() -> anyhow::Result<()> {
         GrabStrategy::Timeout
     };
     let dll_path = system_nvfbc_path();
+    if deny_dda && !capture_mode {
+        anyhow::bail!("--deny-dda requires --capture");
+    }
+    DUPLICATE_OUTPUT_CALLS.store(0, Ordering::Relaxed);
+    DUPLICATE_OUTPUT1_CALLS.store(0, Ordering::Relaxed);
     println!("nvfbc_probe=status_and_create");
     println!("sunshine_private_data={use_sunshine_private_data}");
     println!("capture_mode={capture_mode}");
+    println!("deny_dda={deny_dda}");
     println!("grab_strategy={}", grab_strategy.label());
     println!("dll={}", dll_path.display());
     println!("status_struct_size={}", size_of::<NvFbcStatusEx>());
+
+    // Install before loading NvFBC64.dll so GetSDKVersion/GetStatusEx/CreateEx and
+    // the whole capture lifetime are covered. This rules out a duplication object
+    // being created during an earlier NvFBC status call.
+    let _dda_deny_hooks = if deny_dda {
+        Some(unsafe { install_system_dda_deny_hooks()? })
+    } else {
+        None
+    };
 
     let library = unsafe { Library::new(&dll_path) }?;
     let get_sdk_version: Symbol<NvFbcGetSdkVersion> =
@@ -926,15 +1170,20 @@ fn main() -> anyhow::Result<()> {
             }
         };
         println!("d3d9_adapter={adapter} create_device_success=true");
-        let dxgi_output = if capture_mode && matches!(grab_strategy, GrabStrategy::VBlank) {
-            let output = matching_dxgi_output(&d3d, adapter)?;
-            println!("d3d9_adapter={adapter} matching_dxgi_output=true");
-            Some(output)
+        let dxgi_output =
+            if capture_mode && (deny_dda || matches!(grab_strategy, GrabStrategy::VBlank)) {
+                let output = matching_dxgi_output(&d3d, adapter)?;
+                println!("d3d9_adapter={adapter} matching_dxgi_output=true");
+                Some(output)
+            } else {
+                None
+            };
+        let interface_types: &[u32] = if deny_dda {
+            &[NVFBC_TO_DX9_VID_V3]
         } else {
-            None
+            &[NVFBC_TO_DX9_VID_V2, NVFBC_TO_DX9_VID_V3]
         };
-
-        for interface_type in [NVFBC_TO_DX9_VID_V2, NVFBC_TO_DX9_VID_V3] {
+        for &interface_type in interface_types {
             let mut sunshine_private_data = SUNSHINE_PRIVATE_DATA;
             let private_data = use_sunshine_private_data.then_some(&mut sunshine_private_data);
             let mut create = NvFbcCreateParams::new(
@@ -993,9 +1242,24 @@ fn main() -> anyhow::Result<()> {
                     release_result = release_result,
                     release_name = result_name(release_result),
                 );
+                if deny_dda {
+                    println!(
+                        "dda_deny_summary duplicate_output_calls={} duplicate_output1_calls={}",
+                        DUPLICATE_OUTPUT_CALLS.load(Ordering::Relaxed),
+                        DUPLICATE_OUTPUT1_CALLS.load(Ordering::Relaxed),
+                    );
+                }
                 capture_result?;
             }
         }
+    }
+
+    if deny_dda {
+        println!(
+            "dda_deny_final duplicate_output_calls={} duplicate_output1_calls={}",
+            DUPLICATE_OUTPUT_CALLS.load(Ordering::Relaxed),
+            DUPLICATE_OUTPUT1_CALLS.load(Ordering::Relaxed),
+        );
     }
 
     Ok(())

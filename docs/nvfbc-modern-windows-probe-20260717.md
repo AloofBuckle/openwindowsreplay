@@ -69,6 +69,38 @@ On this 32-logical-processor system, the vblank route's 13.12% of one core is
 about 0.41% machine CPU before encoding. This is close to the previously
 measured NVIDIA Replay process CPU order of magnitude.
 
+## DDA fallback exclusion
+
+Static inspection of `NvFBC64.dll` shows that this driver still contains a
+standard Desktop Duplication fallback implementation, including strings for
+`DDAOwner::CaptureToDx9`, `DDAImpl::Init`, `DuplicateOutput`, and
+`AcquireNextFrame`. The DLL also imports `D3D11CreateDevice`. Static inspection
+therefore cannot establish that a successful NvFBC session uses the native
+framebuffer route.
+
+The probe's `--deny-dda` mode installs process-local deny hooks for every unique
+`IDXGIOutput1::DuplicateOutput` and `IDXGIOutput5::DuplicateOutput1` entry point
+found across all enumerated DXGI outputs. The hooks are installed before
+`NvFBC64.dll` is loaded, so they cover `GetSDKVersion`, every `GetStatusEx`,
+`CreateEx`, setup, the complete capture loop, and release. A self-test invokes
+both patched entry points and verifies that they return
+`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` before the counters are reset.
+
+Two independent 10-second V3 HDR captures then completed while DDA creation was
+denied:
+
+| Run | Frames | FPS | HDR frames | `DuplicateOutput` calls | `DuplicateOutput1` calls | Readback |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Early deny 1 | 2401 | 240.029 | 2400 | 0 | 0 | 8,294,400 non-zero pixels |
+| Early deny 2 | 2401 | 240.068 | 2398 | 0 | 0 | 8,294,400 non-zero pixels |
+
+This excludes the public DXGI Desktop Duplication path for the tested RTX 5090,
+driver `6.14.16.1074`, V3 ARGB10 HDR route. A DDA duplication object cannot be
+created without one of the denied entry points, and none existed before the
+DLL was loaded. The result does not prove that every NVIDIA driver, output
+mode, or failure recovery path avoids DDA; the DLL demonstrably retains that
+fallback code.
+
 ## GPU A/B
 
 PDH was sampled for the same Hard Noise process before and during NvFBC capture:
@@ -88,6 +120,10 @@ PDH is coarse, so these values establish scale rather than precise GPU time.
 Modern Windows GeForce NvFBC is technically callable by a third-party process
 on this driver. 4K240 HDR ARGB10 capture works, and its GPU cost is materially
 lower than the existing explicit WGC color-conversion path.
+
+For the exact tested route, the capture is not a wrapper around the public
+DXGI Desktop Duplication API. Both DDA creation methods can be made unavailable
+for the whole NvFBC lifetime without affecting capture success or cadence.
 
 The useful scheduler is `DXGI WaitForVBlank -> NvFBC NOWAIT`. Calling the NvFBC
 blocking Grab path directly wastes roughly half a CPU core at 240 Hz.
@@ -118,6 +154,10 @@ Build and run from the experimental worktree:
 cargo build --release --target x86_64-pc-windows-msvc --bin nvfbc_probe
 target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
   --sunshine-private-data --capture --vblank-grab
+
+# Exclude the standard DDA fallback for the complete NvFBC lifetime.
+target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
+  --sunshine-private-data --capture --vblank-grab --deny-dda
 ```
 
 Without `--sunshine-private-data`, the probe remains a native-access control

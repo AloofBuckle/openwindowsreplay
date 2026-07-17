@@ -1,0 +1,53 @@
+nvfbc_probe=status_and_create
+sunshine_private_data=true
+capture_mode=true
+deny_dda=false
+grab_strategy=dxgi-vblank+nowait
+dll=C:\WINDOWS\System32\NvFBC64.dll
+status_struct_size=512
+get_sdk_version_result=0(NVFBC_SUCCESS) sdk_version=0x00000070
+abi_candidate=0x00000070
+adapter=0 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=1 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=2 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=3 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=4 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=5 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=6 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=7 result=0(NVFBC_SUCCESS) struct_version=0x70020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+abi_candidate=0x00000050
+adapter=0 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=1 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=2 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=3 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=4 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=5 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=6 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+adapter=7 result=0(NVFBC_SUCCESS) struct_version=0x50020200 driver_version=0x00000070 capture_possible=true currently_capturing=false can_create_now=true multi_head=true multi_client=true raw_flags=0x0000003d
+create_probe_begin=true
+create_struct_size=512
+d3d9_adapter_count=1
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description="NVIDIA GeForce RTX 5090"
+d3d9_adapter=0 create_device_success=true
+d3d9_adapter=0 matching_dxgi_output=true
+d3d9_adapter=0 requested_interface=0x2002 create_ex_result=0(NVFBC_SUCCESS) struct_version=0x70020200 max_width=3840 max_height=2160 driver_version=0x00000070 interface=0x311a530
+d3d9_adapter=0 requested_interface=0x2002 release_result=0(NVFBC_SUCCESS)
+d3d9_adapter=0 requested_interface=0x2003 create_ex_result=0(NVFBC_SUCCESS) struct_version=0x70020200 max_width=3840 max_height=2160 driver_version=0x00000070 interface=0x311a530
+capture_setup width=3840 height=2160 buffers=3 format=ARGB10 hdr_request=true setup_struct_size=256 setup_version=0x70030100 grab_struct_size=256 grab_wait=dxgi-vblank+nowait
+capture_setup_result=0(NVFBC_SUCCESS)
+capture_frame=1 buffer=0 call_us=1117 width=3840 height=2160 buffer_width=3840 hdr=false wait_mode=1 source_pid=2528
+capture_frame=2 buffer=1 call_us=458 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=3 buffer=2 call_us=358 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=4 buffer=0 call_us=252 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=5 buffer=1 call_us=299 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=300 buffer=2 call_us=186 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=600 buffer=2 call_us=279 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=900 buffer=2 call_us=227 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=1200 buffer=2 call_us=316 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=1500 buffer=2 call_us=178 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=1800 buffer=2 call_us=226 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=2100 buffer=2 call_us=145 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_frame=2400 buffer=2 call_us=214 width=3840 height=2160 buffer_width=3840 hdr=true wait_mode=1 source_pid=2528
+capture_summary elapsed_ms=10000.741 frames=2401 fps=240.082 hdr_frames=2400 call_p50_us=225 call_p95_us=329 call_p99_us=457 call_max_us=1117 return_interval_p50_us=4166 return_interval_p95_us=4277 return_interval_p99_us=4384 return_interval_max_us=4954 capture_cpu_ms=234.375 capture_one_core_percent=2.344 first_info=Some((3840, 2160, 3840, 8, 1, 2528)) last_info=Some((3840, 2160, 3840, 9, 1, 2528))
+capture_readback buffer=0 hash=0xfb6f27a64f136670 nonzero_words=8294400 min=0xc0000000 max=0xe759d675 readback_ms=17.208
+d3d9_adapter=0 requested_interface=0x2003 release_result=0(NVFBC_SUCCESS)
