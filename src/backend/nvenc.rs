@@ -23,6 +23,11 @@ use std::ptr;
 #[cfg(windows)]
 #[path = "nvenc/cuda.rs"]
 mod cuda;
+#[cfg(windows)]
+#[path = "nvenc/d3d9.rs"]
+mod d3d9;
+#[cfg(windows)]
+pub(crate) use d3d9::{NvencD3d9Caps, NvencD3d9Encoder};
 
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 const NV_ENC_SUCCESS: i32 = 0;
@@ -396,6 +401,15 @@ pub enum NvencD3d11InputFormat {
     Yuv44410,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct NvencHevcRouteSpec {
+    profile: windows::core::GUID,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+    buffer_format: u32,
+}
+
 impl NvencD3d11InputFormat {
     pub const fn label(self) -> &'static str {
         match self {
@@ -418,6 +432,24 @@ impl NvencD3d11InputFormat {
             Self::Ayuv => NV_ENC_BUFFER_FORMAT_AYUV,
             Self::Yuv444 => NV_ENC_BUFFER_FORMAT_YUV444,
             Self::Yuv44410 => NV_ENC_BUFFER_FORMAT_YUV444_10BIT,
+        }
+    }
+
+    #[cfg(windows)]
+    const fn hevc_route_spec(self) -> NvencHevcRouteSpec {
+        let (profile, bit_depth, chroma_format_idc) = match self {
+            Self::Nv12 => (NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_BIT_DEPTH_8, 1),
+            Self::P010 => (NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_BIT_DEPTH_10, 1),
+            Self::Nv16 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 2),
+            Self::P210 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 2),
+            Self::Ayuv | Self::Yuv444 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 3),
+            Self::Yuv44410 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 3),
+        };
+        NvencHevcRouteSpec {
+            profile,
+            bit_depth,
+            chroma_format_idc,
+            buffer_format: self.buffer_format(),
         }
     }
 
@@ -1044,11 +1076,11 @@ impl NvencD3d11Encoder {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct NvencDisplayRouteColor {
-    hdr_pq: bool,
-    bit_depth: u16,
-    mp4_color: NclxColorMetadata,
-    note: &'static str,
+pub(crate) struct NvencDisplayRouteColor {
+    pub(crate) hdr_pq: bool,
+    pub(crate) bit_depth: u16,
+    pub(crate) mp4_color: NclxColorMetadata,
+    pub(crate) note: &'static str,
 }
 
 impl NvencProbeInfo {
@@ -1397,7 +1429,7 @@ fn current_display_color_for_adapter(
 }
 
 #[cfg(windows)]
-fn nvenc_display_route_color(
+pub(crate) fn nvenc_display_route_color(
     color_space: u32,
     bits_per_color: u32,
 ) -> Result<NvencDisplayRouteColor, BackendError> {
@@ -2304,6 +2336,34 @@ unsafe fn initialize_low_latency_hevc_encoder(
     frame_rate_num: u32,
     frame_rate_den: u32,
 ) -> Result<(), BackendError> {
+    initialize_low_latency_hevc_encoder_for_route(
+        api,
+        encoder,
+        width,
+        height,
+        input_format.hevc_route_spec(),
+        color,
+        rate_control,
+        frame_rate_num,
+        frame_rate_den,
+        "NvEncInitializeEncoder(HEVC D3D11 low-latency)",
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn initialize_low_latency_hevc_encoder_for_route(
+    api: &NvencApi,
+    encoder: *mut c_void,
+    width: u32,
+    height: u32,
+    route: NvencHevcRouteSpec,
+    color: NclxColorMetadata,
+    rate_control: &RateControlConfig,
+    frame_rate_num: u32,
+    frame_rate_den: u32,
+    stage: &'static str,
+) -> Result<(), BackendError> {
     let initialize = api
         .functions
         .nvEncInitializeEncoder
@@ -2323,17 +2383,18 @@ unsafe fn initialize_low_latency_hevc_encoder(
     params.enablePTD = 1;
     params.bitfields = split_encode_initialize_bitfields(rate_control.nvenc_split_encode_mode);
     let preset_config = query_preset_config(api, encoder, preset_guid)?;
-    let mut encode_config =
-        make_low_latency_hevc_config_from_base(preset_config, input_format, color, rate_control)?;
+    let mut encode_config = make_low_latency_hevc_config_for_route_from_base(
+        preset_config,
+        route,
+        color,
+        rate_control,
+    )?;
     params.encodeConfig = encode_config.as_mut_ptr();
     params.maxEncodeWidth = width;
     params.maxEncodeHeight = height;
     params.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
-    params.bufferFormat = input_format.buffer_format();
-    nvenc_check(
-        "NvEncInitializeEncoder(HEVC D3D11 low-latency)",
-        initialize(encoder, &mut params),
-    )
+    params.bufferFormat = route.buffer_format;
+    nvenc_check(stage, initialize(encoder, &mut params))
 }
 
 #[cfg(windows)]
@@ -2438,9 +2499,9 @@ unsafe fn make_low_latency_hevc_config(
     color: NclxColorMetadata,
     rate_control: &RateControlConfig,
 ) -> Result<NvEncConfigOpaque, BackendError> {
-    make_low_latency_hevc_config_from_base(
+    make_low_latency_hevc_config_for_route_from_base(
         NvEncConfigOpaque::zeroed(),
-        input_format,
+        input_format.hevc_route_spec(),
         color,
         rate_control,
     )
@@ -2448,22 +2509,28 @@ unsafe fn make_low_latency_hevc_config(
 
 #[cfg(windows)]
 unsafe fn make_low_latency_hevc_config_from_base(
-    mut config: NvEncConfigOpaque,
+    config: NvEncConfigOpaque,
     input_format: NvencD3d11InputFormat,
     color: NclxColorMetadata,
     rate_control: &RateControlConfig,
 ) -> Result<NvEncConfigOpaque, BackendError> {
-    let (profile, bit_depth, chroma_format_idc) = match input_format {
-        NvencD3d11InputFormat::Nv12 => (NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_BIT_DEPTH_8, 1),
-        NvencD3d11InputFormat::P010 => (NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_BIT_DEPTH_10, 1),
-        NvencD3d11InputFormat::Nv16 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 2),
-        NvencD3d11InputFormat::P210 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 2),
-        NvencD3d11InputFormat::Ayuv => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 3),
-        NvencD3d11InputFormat::Yuv444 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_8, 3),
-        NvencD3d11InputFormat::Yuv44410 => (NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_BIT_DEPTH_10, 3),
-    };
+    make_low_latency_hevc_config_for_route_from_base(
+        config,
+        input_format.hevc_route_spec(),
+        color,
+        rate_control,
+    )
+}
+
+#[cfg(windows)]
+unsafe fn make_low_latency_hevc_config_for_route_from_base(
+    mut config: NvEncConfigOpaque,
+    route: NvencHevcRouteSpec,
+    color: NclxColorMetadata,
+    rate_control: &RateControlConfig,
+) -> Result<NvEncConfigOpaque, BackendError> {
     config.write_u32(0, NV_ENC_CONFIG_VER);
-    config.write_guid(NV_ENC_CONFIG_PROFILE_GUID_OFFSET, profile);
+    config.write_guid(NV_ENC_CONFIG_PROFILE_GUID_OFFSET, route.profile);
     config.write_u32(NV_ENC_CONFIG_GOP_LENGTH_OFFSET, u32::MAX);
     // 1 = IPP... (no B frames), matching low-latency/VFR replay needs.
     config.write_i32(NV_ENC_CONFIG_FRAME_INTERVAL_P_OFFSET, 1);
@@ -2477,7 +2544,7 @@ unsafe fn make_low_latency_hevc_config_from_base(
     let mut hevc_flags = config.read_u32(NV_ENC_CONFIG_HEVC_FLAGS_OFFSET);
     hevc_flags |= 1 << 7;
     hevc_flags &= !(0b11 << 9);
-    hevc_flags |= chroma_format_idc << 9;
+    hevc_flags |= route.chroma_format_idc << 9;
     config.write_u32(NV_ENC_CONFIG_HEVC_FLAGS_OFFSET, hevc_flags);
     config.write_u32(NV_ENC_CONFIG_HEVC_IDR_PERIOD_OFFSET, u32::MAX);
     config.write_u32(NV_ENC_CONFIG_HEVC_VUI_VIDEO_SIGNAL_PRESENT_OFFSET, 1);
@@ -2502,8 +2569,8 @@ unsafe fn make_low_latency_hevc_config_from_base(
         NV_ENC_CONFIG_HEVC_VUI_MATRIX_COEFFICIENTS_OFFSET,
         u32::from(color.matrix_coefficients),
     );
-    config.write_u32(NV_ENC_CONFIG_HEVC_OUTPUT_BIT_DEPTH_OFFSET, bit_depth);
-    config.write_u32(NV_ENC_CONFIG_HEVC_INPUT_BIT_DEPTH_OFFSET, bit_depth);
+    config.write_u32(NV_ENC_CONFIG_HEVC_OUTPUT_BIT_DEPTH_OFFSET, route.bit_depth);
+    config.write_u32(NV_ENC_CONFIG_HEVC_INPUT_BIT_DEPTH_OFFSET, route.bit_depth);
     apply_rate_control_to_nvenc_config(&mut config, rate_control)?;
     Ok(config)
 }

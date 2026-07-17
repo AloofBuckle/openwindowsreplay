@@ -1,5 +1,10 @@
 # Modern Windows NvFBC probe (2026-07-17)
 
+This document records the original standalone probe. The validated path is now
+implemented by the dormant Rust backend described in
+`docs/nvfbc-rust-backend-20260717.md`; the standalone CLI was removed from the
+branch tip and remains available in Git history.
+
 ## Scope
 
 This experiment lives only on `codex/nvfbc-modern-probe`, based on
@@ -159,20 +164,10 @@ This is not production-ready yet:
 
 ## Reproduction
 
-Build and run from the experimental worktree:
+Historical standalone reproduction:
 
 ```powershell
-cargo build --release --target x86_64-pc-windows-msvc --bin nvfbc_probe
-target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
-  --sunshine-private-data --capture --vblank-grab
-
-# Exclude the standard DDA fallback for the complete NvFBC lifetime.
-target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
-  --sunshine-private-data --capture --vblank-grab --deny-dda
-
-# Run the same exclusion test through the V2 interface observed in Replay logs.
-target\x86_64-pc-windows-msvc\release\nvfbc_probe.exe `
-  --sunshine-private-data --capture --capture-v2 --vblank-grab --deny-dda
+git show 233da20:src/bin/nvfbc_probe.rs
 ```
 
 Without `--sunshine-private-data`, the probe remains a native-access control

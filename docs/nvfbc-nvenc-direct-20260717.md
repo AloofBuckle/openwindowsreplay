@@ -2,8 +2,10 @@
 
 ## Scope
 
-This experiment remains isolated on `codex/nvfbc-modern-probe`; it does not
-modify the RustReplay production backend or GUI. It validates HDR/PQ 10-bit
+This document records the original isolated C++ proof. The route has since been
+rewritten as a dormant Rust backend; see
+`docs/nvfbc-rust-backend-20260717.md`. It still does not modify the RustReplay
+GUI or automatic backend selection. The original proof validates HDR/PQ 10-bit
 HEVC 4:2:0, 4:2:2, and 4:4:4 from the same NvFBC ARGB10 capture route without
 an application-issued post-capture GPU copy.
 
@@ -134,25 +136,19 @@ The final evidence logs are:
 - `docs/nvfbc-nvenc-422-pipeline-2400f-run1-20260717.log`
 - `docs/nvfbc-nvenc-444-pipeline-2400f-run1-20260717.log`
 
-## Status and remaining work
+## Status after the Rust rewrite
 
 Within this isolated probe, HDR/PQ HEVC 10-bit 4:2:0, 4:2:2, and 4:4:4 are
 functional direct-resource routes. 4:2:2 and 4:4:4 have passed actual Init,
 registration, 2400-frame encode, exact frame count, metadata inspection, and
 strict decode; they are not caps-only branches.
 
-This is not yet a production NvFBC backend. Remaining work before any mainline
-merge includes:
-
-- Port the D3D9/NVENC session and the `ProbeCaps` mapping into Rust ownership.
-- Derive HDR/SDR and color metadata from the mainline display route plan.
-- Preserve source timestamps in MP4 and implement unchanged-frame handling for
-  the project's VFR design.
-- Integrate audio, encoded ring, save, cursor policy, mode-change recreation,
-  and device-loss recovery.
-- Validate older NVIDIA generations/drivers, multi-monitor selection,
-  sleep/resume, and full-screen games.
-- Resolve the unsupported private-data distribution and compatibility risk.
+The D3D9/NVENC session, runtime capability mapping, current-display HDR/PQ
+metadata, three-slot ownership, VFR arrival timestamps, and 420/422/444 hardware
+tests now live in Rust-owned backend modules. The merge intentionally keeps the
+backend dormant. Audio, the encoded ring, MP4 save, unchanged-frame policy,
+cursor policy, GUI/automatic selection, mode-change recovery, and broader
+hardware validation remain deferred product integration work.
 
 Lookahead is intentionally excluded from the NvFBC route. A follow-up probe
 showed that D3D9Ex setup fails with four output surfaces and that the legacy
@@ -160,16 +156,13 @@ NvFBC CUDA interface fails during Setup for every HDR/format combination. The
 route therefore remains fixed to three direct D3D9Ex surfaces and does not add
 a copy-backed analysis ring. See `docs/nvfbc-lookahead-feasibility-20260717.md`.
 
-## Reproduction
+## Historical reproduction
 
 ```powershell
-experiments\build_nvfbc_nvenc_direct.ps1
-target\release\nvfbc_nvenc_direct.exe 2400 target\nvfbc_422.hevc 422 18
-target\release\nvfbc_nvenc_direct.exe 2400 target\nvfbc_444.hevc 444 18
-ffprobe -v error -count_frames -show_streams target\nvfbc_422.hevc
-ffprobe -v error -count_frames -show_streams target\nvfbc_444.hevc
-ffmpeg -v error -err_detect explode -r 240 -i target\nvfbc_422.hevc `
-  -map 0:v:0 -fps_mode passthrough -f null NUL
-ffmpeg -v error -err_detect explode -r 240 -i target\nvfbc_444.hevc `
-  -map 0:v:0 -fps_mode passthrough -f null NUL
+git show 233da20:experiments/nvfbc_nvenc_direct.cpp
+
+# Current Rust hardware regression:
+cargo test --release --bin rust_replay `
+  local_nvfbc_rust_backend_records_420_422_444 -- `
+  --ignored --nocapture --test-threads=1
 ```
