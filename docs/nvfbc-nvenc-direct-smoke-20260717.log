@@ -1,0 +1,28 @@
+nvfbc_nvenc_direct frames=10 output=target\nvfbc_nvenc_direct_smoke.hevc
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description=NVIDIA GeForce RTX 5090
+d3d9_create_device hr=0x00000000
+nvfbc_create status=0 width=3840 height=2160 interface=0x000000000748c6b0
+surface_create format=A2B10G10R10 hr=0x00000000 ptr=0x00000000072cfb78
+nvfbc_setup status=0 format=ARGB10 hdr_request=true
+nvenc_stage=get_max_supported_version status=0(NV_ENC_SUCCESS)
+nvenc_api requested=0x0000000d max_supported=0x000000d1
+nvenc_stage=create_instance status=0(NV_ENC_SUCCESS)
+nvenc_stage=open_d3d9_session status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_format_count status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_formats status=0(NV_ENC_SUCCESS)
+nvenc_input_formats count=16 abgr10_supported=true
+nvenc_stage=get_preset_config status=0(NV_ENC_SUCCESS)
+nvenc_stage=initialize_hevc_main10 status=0(NV_ENC_SUCCESS)
+nvenc_stage=register_nvfbc_d3d9_surface status=0(NV_ENC_SUCCESS)
+nvenc_stage=create_bitstream status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+nvenc_stage=map_input status=0(NV_ENC_SUCCESS)
+direct_encode_summary requested=10 completed=10 elapsed_ms=50.294 fps=198.830 bytes=500694 mapped_format=0x20000000 grab_p50_us=191 grab_p95_us=979 encode_p50_us=2172 encode_p95_us=8660 encode_max_us=8660 explicit_gpu_copies=0 output=target\nvfbc_nvenc_direct_smoke.hevc

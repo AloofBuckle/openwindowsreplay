@@ -1,0 +1,18 @@
+nvfbc_nvenc_direct frames=2400 output=target\nvfbc_nvenc_direct_2400f_run1.hevc
+d3d9_adapter=0 vendor=0x10de device=0x2b85 description=NVIDIA GeForce RTX 5090
+d3d9_create_device hr=0x00000000
+nvfbc_create status=0 width=3840 height=2160 interface=0x00000000072bf3f0
+surface_create format=A2B10G10R10 hr=0x00000000 ptr=0x00000000072dcf58
+nvfbc_setup status=0 format=ARGB10 hdr_request=true
+nvenc_stage=get_max_supported_version status=0(NV_ENC_SUCCESS)
+nvenc_api requested=0x0000000d max_supported=0x000000d1
+nvenc_stage=create_instance status=0(NV_ENC_SUCCESS)
+nvenc_stage=open_d3d9_session status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_format_count status=0(NV_ENC_SUCCESS)
+nvenc_stage=get_input_formats status=0(NV_ENC_SUCCESS)
+nvenc_input_formats count=16 abgr10_supported=true
+nvenc_stage=get_preset_config status=0(NV_ENC_SUCCESS)
+nvenc_stage=initialize_hevc_main10 status=0(NV_ENC_SUCCESS)
+nvenc_stage=register_nvfbc_d3d9_surface status=0(NV_ENC_SUCCESS)
+nvenc_stage=create_bitstream status=0(NV_ENC_SUCCESS)
+direct_encode_summary requested=2400 completed=2400 elapsed_ms=10026.547 fps=239.365 bytes=4290138 mapped_format=0x20000000 grab_p50_us=225 grab_p95_us=332 encode_p50_us=1931 encode_p95_us=2296 encode_max_us=9599 explicit_gpu_copies=0 output=target\nvfbc_nvenc_direct_2400f_run1.hevc
