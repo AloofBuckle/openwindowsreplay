@@ -15,8 +15,8 @@ struct RrNvFbcHandle {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct RrNvFbcCreateInfo {
-    width: u32,
-    height: u32,
+    max_width: u32,
+    max_height: u32,
     nvfbc_version: u32,
 }
 
@@ -59,8 +59,8 @@ unsafe extern "C" {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CreateInfo {
-    pub(super) width: u32,
-    pub(super) height: u32,
+    pub(super) max_width: u32,
+    pub(super) max_height: u32,
     pub(super) nvfbc_version: u32,
 }
 
@@ -102,14 +102,14 @@ impl NvFbcSession {
                 "shim 返回成功但 session handle 为空",
             )
         })?;
-        if info.width == 0 || info.height == 0 {
+        if info.max_width == 0 || info.max_height == 0 {
             unsafe {
                 let _ = rr_nvfbc_destroy(handle.as_ptr());
             }
             return Err(BackendError::unsupported(
                 "NvFBC FFI",
                 "NvFBC_CreateEx display dimensions",
-                format!("返回无效尺寸 {}x{}", info.width, info.height),
+                format!("返回无效上限 {}x{}", info.max_width, info.max_height),
             ));
         }
         Ok((
@@ -118,8 +118,8 @@ impl NvFbcSession {
                 _not_send_sync: PhantomData,
             },
             CreateInfo {
-                width: info.width,
-                height: info.height,
+                max_width: info.max_width,
+                max_height: info.max_height,
                 nvfbc_version: info.nvfbc_version,
             },
         ))

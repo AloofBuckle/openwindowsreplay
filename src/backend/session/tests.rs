@@ -17,6 +17,10 @@ fn disk_segment_sidecar_roundtrips_tracks() {
         read.audio_track.as_ref().unwrap().duration_ticks,
         segment.audio_track.as_ref().unwrap().duration_ticks
     );
+    assert_eq!(
+        read.audio_track.as_ref().unwrap().samples[0].timestamp_ticks,
+        segment.audio_track.as_ref().unwrap().samples[0].timestamp_ticks
+    );
     assert!(
         fs::metadata(indexed_sidecar(&dir, "segment"))
             .unwrap()
@@ -43,10 +47,41 @@ fn disk_segment_concat_rebases_timestamps() {
     let audio = snapshot.audio_track.unwrap();
     assert_eq!(audio.duration_ticks, 72_000);
     assert_eq!(audio.samples.len(), 4);
+    assert_eq!(
+        audio
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp_ticks)
+            .collect::<Vec<_>>(),
+        vec![0, 24_000, 48_000, 60_000]
+    );
     let out = dir.join("final.mp4");
     crate::backend::mp4_mux::write_prepared_hevc_aac_mp4(&out, &snapshot.video_track, Some(&audio))
         .unwrap();
     assert!(fs::metadata(&out).unwrap().len() > 0);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn disk_segment_concat_tolerates_one_tick_vfr_origin_rounding() {
+    let dir = unique_temp_dir("concat_vfr_rounding");
+    fs::create_dir_all(&dir).unwrap();
+    let first = write_indexed_segment(&dir, "first", &segment(1_000, 1_000, 0, 534));
+    let second = write_indexed_segment(&dir, "second", &segment(2_000, 1_000, 0, 534));
+
+    let snapshot = concat_disk_indexed_segments(&[first, second])
+        .unwrap()
+        .unwrap();
+    let audio = snapshot.audio_track.unwrap();
+
+    assert_eq!(
+        audio
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp_ticks)
+            .collect::<Vec<_>>(),
+        vec![0, 267, 534, 801]
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -390,6 +425,107 @@ fn disk_segment_assigns_cross_boundary_aac_before_flushing_the_old_segment() {
     let audio = job.segment.audio_track.unwrap();
     assert_eq!(audio.samples.len(), 1);
     assert_eq!(audio.samples[0].timestamp_ticks, 47_500);
+}
+
+#[test]
+fn disk_segment_moves_early_aac_when_a_delayed_keyframe_reveals_the_boundary() {
+    let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+    let (event_tx, _event_rx) = mpsc::channel();
+    let live_ring = Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(7))));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+        live_ring.clone(),
+        Arc::new(AtomicU64::new(u64::MAX)),
+    );
+    sink.video_track_started(super::vpl::VplOutputTrackInfo {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_parameter_sets().into(),
+        is_sync: false,
+        discard_from_track: true,
+    });
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+    sink.aac_access_unit(&AacAccessUnit {
+        timestamp_ticks: 60_000,
+        duration_ticks: 1_024,
+        data: vec![0x21, 0x10].into(),
+    });
+
+    let mut boundary_au = fake_hevc_parameter_sets_with_seed(2);
+    boundary_au.extend(fake_hevc_idr());
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 90_000,
+        data: boundary_au.into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+
+    let job = writer_rx.try_recv().unwrap();
+    assert!(job.segment.audio_track.is_none());
+    let current = sink.current.as_ref().unwrap();
+    assert_eq!(current.start_audio_ticks, 48_000);
+    assert_eq!(current.audio_samples.len(), 1);
+    assert_eq!(current.audio_samples[0].timestamp_ticks, 12_000);
+    assert_eq!(live_ring.lock().unwrap().availability().audio_packets, 1);
+}
+
+#[test]
+fn disk_segment_adopts_aac_published_before_the_first_delayed_idr() {
+    let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+    let (event_tx, _event_rx) = mpsc::channel();
+    let live_ring = Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(7))));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+        live_ring.clone(),
+        Arc::new(AtomicU64::new(u64::MAX)),
+    );
+    sink.video_track_started(super::vpl::VplOutputTrackInfo {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+    });
+    for timestamp_ticks in [0, 1_024] {
+        sink.aac_access_unit(&AacAccessUnit {
+            timestamp_ticks,
+            duration_ticks: 1_024,
+            data: vec![0x21, 0x10].into(),
+        });
+    }
+
+    let mut first_idr = fake_hevc_parameter_sets();
+    first_idr.extend(fake_hevc_idr());
+    sink.hevc_access_unit(&HevcAccessUnit {
+        timestamp_90k: 0,
+        data: first_idr.into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+
+    assert!(sink.pending_audio_before_video.is_empty());
+    let current = sink.current.as_ref().unwrap();
+    assert_eq!(current.audio_samples.len(), 2);
+    assert_eq!(current.audio_samples[0].timestamp_ticks, 0);
+    assert_eq!(current.audio_samples[1].timestamp_ticks, 1_024);
+    assert_eq!(live_ring.lock().unwrap().availability().audio_packets, 2);
 }
 
 #[test]
@@ -799,6 +935,10 @@ fn segment(
     audio_start_ticks: u64,
     audio_duration_ticks: u64,
 ) -> DiskSegmentTracks {
+    let first_audio_duration = (audio_duration_ticks / 2).max(1);
+    let second_audio_duration = audio_duration_ticks
+        .saturating_sub(first_audio_duration)
+        .max(1);
     DiskSegmentTracks {
         source_start_90k: video_start_90k,
         source_end_90k: video_start_90k.saturating_add(duration_90k),
@@ -810,13 +950,13 @@ fn segment(
             codec: HevcCodecMetadata::main_420_8(),
             samples: vec![
                 HevcAccessUnit {
-                    timestamp_90k: video_start_90k,
+                    timestamp_90k: 0,
                     data: fake_hevc_parameter_sets().into(),
                     is_sync: false,
                     discard_from_track: true,
                 },
                 HevcAccessUnit {
-                    timestamp_90k: video_start_90k,
+                    timestamp_90k: 0,
                     data: fake_hevc_idr().into(),
                     is_sync: true,
                     discard_from_track: false,
@@ -826,16 +966,16 @@ fn segment(
         audio_track: Some(AacLcMp4Track {
             sample_rate: 48_000,
             channel_count: 2,
-            duration_ticks: audio_duration_ticks,
+            duration_ticks: audio_start_ticks.saturating_add(audio_duration_ticks),
             samples: vec![
                 AacAccessUnit {
                     timestamp_ticks: audio_start_ticks,
-                    duration_ticks: 1024,
+                    duration_ticks: first_audio_duration as u32,
                     data: vec![0x21, 0x10].into(),
                 },
                 AacAccessUnit {
-                    timestamp_ticks: audio_start_ticks + audio_duration_ticks / 2,
-                    duration_ticks: 1024,
+                    timestamp_ticks: audio_start_ticks.saturating_add(first_audio_duration),
+                    duration_ticks: second_audio_duration as u32,
                     data: vec![0x21, 0x10].into(),
                 },
             ],

@@ -38,6 +38,8 @@ pub(super) struct DisplayInfo {
     pub(super) desktop_bottom: i32,
     pub(super) color_space: u32,
     pub(super) bits_per_color: u32,
+    pub(super) physical_width: u32,
+    pub(super) physical_height: u32,
     pub(super) refresh_numerator: u32,
     pub(super) refresh_denominator: u32,
 }
@@ -480,8 +482,8 @@ fn matching_output(
                         func: "IDXGIOutput6::GetDesc1(NvFBC)",
                         message: err.to_string(),
                     })?;
-                let (refresh_numerator, refresh_denominator) =
-                    current_refresh_rate(&desc.DeviceName)?;
+                let (physical_width, physical_height, refresh_numerator, refresh_denominator) =
+                    current_display_mode(&desc.DeviceName)?;
                 return Ok((
                     output,
                     DisplayInfo {
@@ -494,6 +496,8 @@ fn matching_output(
                         desktop_bottom: desc.DesktopCoordinates.bottom,
                         color_space: desc1.ColorSpace.0 as u32,
                         bits_per_color: desc1.BitsPerColor,
+                        physical_width,
+                        physical_height,
                         refresh_numerator,
                         refresh_denominator,
                     },
@@ -510,7 +514,7 @@ fn matching_output(
     ))
 }
 
-fn current_refresh_rate(device_name: &[u16; 32]) -> Result<(u32, u32), BackendError> {
+fn current_display_mode(device_name: &[u16; 32]) -> Result<(u32, u32, u32, u32), BackendError> {
     let mut mode = DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -522,14 +526,23 @@ fn current_refresh_rate(device_name: &[u16; 32]) -> Result<(u32, u32), BackendEr
             &mut mode,
         )
     };
-    if !ok.as_bool() || mode.dmDisplayFrequency <= 1 {
+    if !ok.as_bool()
+        || mode.dmPelsWidth == 0
+        || mode.dmPelsHeight == 0
+        || mode.dmDisplayFrequency <= 1
+    {
         return Err(BackendError::unsupported(
-            "NvFBC display refresh",
+            "NvFBC display mode",
             wide_string(device_name),
-            "EnumDisplaySettingsW 未返回有效当前刷新率",
+            "EnumDisplaySettingsW 未返回有效当前物理尺寸或刷新率",
         ));
     }
-    Ok((mode.dmDisplayFrequency, 1))
+    Ok((
+        mode.dmPelsWidth,
+        mode.dmPelsHeight,
+        mode.dmDisplayFrequency,
+        1,
+    ))
 }
 
 fn c_string(value: &[i8]) -> String {

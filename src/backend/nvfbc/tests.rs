@@ -4,6 +4,50 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn display_dimensions_use_the_physical_mode_with_nvfbc_as_a_limit() {
+    let display = d3d9::DisplayInfo {
+        dxgi_adapter_index: 0,
+        output_index: 0,
+        device_name: "test".to_owned(),
+        desktop_left: 0,
+        desktop_top: 0,
+        desktop_right: 1920,
+        desktop_bottom: 1080,
+        color_space: 12,
+        bits_per_color: 10,
+        physical_width: 3840,
+        physical_height: 2160,
+        refresh_numerator: 170,
+        refresh_denominator: 1,
+    };
+    assert_eq!(display_dimensions(&display).unwrap(), (3840, 2160));
+    assert!(
+        validate_display_dimensions(
+            3840,
+            2160,
+            ffi::CreateInfo {
+                max_width: 4096,
+                max_height: 2160,
+                nvfbc_version: 3,
+            }
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_display_dimensions(
+            3840,
+            2160,
+            ffi::CreateInfo {
+                max_width: 2560,
+                max_height: 1440,
+                nvfbc_version: 3,
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 #[ignore = "requires a modern NVIDIA driver exposing NvFBC V3 and an HDR PQ desktop"]
 fn local_nvfbc_rust_backend_records_420_422_444() {
     eprintln!("nvfbc_rust_stage=probe_begin");

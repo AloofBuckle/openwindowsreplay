@@ -5,8 +5,8 @@
 struct RrNvFbcHandle;
 
 struct RrNvFbcCreateInfo {
-    std::uint32_t width;
-    std::uint32_t height;
+    std::uint32_t max_width;
+    std::uint32_t max_height;
     std::uint32_t nvfbc_version;
 };
 

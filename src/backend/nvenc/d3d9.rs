@@ -64,10 +64,14 @@ impl NvencD3d9Session {
         if self.encoder.is_null() {
             return NV_ENC_SUCCESS;
         }
-        let encoder = std::mem::replace(&mut self.encoder, ptr::null_mut());
-        self.destroy
-            .map(|destroy| unsafe { destroy(encoder) })
-            .unwrap_or(NV_ENC_SUCCESS)
+        let status = self
+            .destroy
+            .map(|destroy| unsafe { destroy(self.encoder) })
+            .unwrap_or(NV_ENC_SUCCESS);
+        if status == NV_ENC_SUCCESS {
+            self.encoder = ptr::null_mut();
+        }
+        status
     }
 }
 
@@ -134,16 +138,30 @@ impl NvencAsyncEvent {
             })
         }
     }
+
+    fn unregister_now(&mut self) -> i32 {
+        let Some(unregister) = self.unregister else {
+            return NV_ENC_SUCCESS;
+        };
+        let mut params: NvEncEventParams = unsafe { std::mem::zeroed() };
+        params.version = NV_ENC_EVENT_PARAMS_VER;
+        params.completionEvent = self.handle.0;
+        let status = unsafe { unregister(self.encoder, &mut params) };
+        if status == NV_ENC_SUCCESS {
+            self.unregister = None;
+        }
+        status
+    }
+
+    fn abandon_registration(&mut self) {
+        self.encoder = ptr::null_mut();
+        self.unregister = None;
+    }
 }
 
 impl Drop for NvencAsyncEvent {
     fn drop(&mut self) {
-        if let Some(unregister) = self.unregister.take() {
-            let mut params: NvEncEventParams = unsafe { std::mem::zeroed() };
-            params.version = NV_ENC_EVENT_PARAMS_VER;
-            params.completionEvent = self.handle.0;
-            let _ = unsafe { unregister(self.encoder, &mut params) };
-        }
+        let _ = self.unregister_now();
         if !self.handle.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.handle);
@@ -189,8 +207,8 @@ pub(crate) struct NvencD3d9Encoder {
     slots: Vec<EncodeSlot>,
     eos_completion: Option<NvencAsyncEvent>,
     pending_order: VecDeque<usize>,
-    session: NvencD3d9Session,
-    api: NvencApi,
+    session: Option<NvencD3d9Session>,
+    api: Option<NvencApi>,
     width: u32,
     height: u32,
     chroma: ChromaSampling,
@@ -397,8 +415,8 @@ impl NvencD3d9Encoder {
             slots,
             eos_completion,
             pending_order: VecDeque::with_capacity(NVFBC_SURFACE_COUNT),
-            session,
-            api,
+            session: Some(session),
+            api: Some(api),
             width,
             height,
             chroma,
@@ -452,9 +470,14 @@ impl NvencD3d9Encoder {
             ));
         }
 
+        let api = self.api.as_ref().expect("NVENC API exists until shutdown");
+        let encoder = self
+            .session
+            .as_ref()
+            .expect("NVENC session exists until shutdown")
+            .encoder();
         let slot = &mut self.slots[slot_index];
-        let mapped =
-            unsafe { map_input_resource(&self.api, self.session.encoder(), &slot.registered)? };
+        let mapped = unsafe { map_input_resource(api, encoder, &slot.registered)? };
         let completion_event = slot
             .completion
             .as_ref()
@@ -462,8 +485,8 @@ impl NvencD3d9Encoder {
             .unwrap_or(ptr::null_mut());
         let expect_sync = force_idr || self.frame_index == 0;
         let status = submit_d3d9_picture(
-            &self.api,
-            self.session.encoder(),
+            api,
+            encoder,
             &mapped,
             &slot.bitstream,
             self.width,
@@ -507,19 +530,19 @@ impl NvencD3d9Encoder {
     }
 
     pub(crate) fn flush(&mut self) -> Result<Vec<HevcAccessUnit>, BackendError> {
+        let api = self.api.as_ref().expect("NVENC API exists until shutdown");
+        let encoder = self
+            .session
+            .as_ref()
+            .expect("NVENC session exists until shutdown")
+            .encoder();
         if !self.eos_submitted {
             let completion_event = self
                 .eos_completion
                 .as_ref()
                 .map(NvencAsyncEvent::raw)
                 .unwrap_or(ptr::null_mut());
-            unsafe {
-                submit_encoder_eos_with_completion(
-                    &self.api,
-                    self.session.encoder(),
-                    completion_event,
-                )?
-            };
+            unsafe { submit_encoder_eos_with_completion(api, encoder, completion_event)? };
             self.eos_submitted = true;
         }
         let mut output = Vec::with_capacity(self.pending_order.len());
@@ -589,18 +612,28 @@ impl NvencD3d9Encoder {
             ));
         }
         let output = unsafe {
-            lock_and_copy_bitstream_with_mode(
-                &self.api,
-                self.session.encoder(),
-                &slot.bitstream,
-                self.async_encode,
-            )
+            let api = self.api.as_ref().expect("NVENC API exists until shutdown");
+            let encoder = self
+                .session
+                .as_ref()
+                .expect("NVENC session exists until shutdown")
+                .encoder();
+            lock_and_copy_bitstream_with_mode(api, encoder, &slot.bitstream, self.async_encode)
         }?;
         let pending = slot.pending.take().expect("validated above");
         self.pending_order.pop_front();
         // The copied bytes no longer borrow the mapped input. Release it before
         // validating or publishing the access unit so NvFBC may reuse the slot.
-        slot.mapped.take();
+        let mut mapped = slot.mapped.take().ok_or_else(|| {
+            BackendError::unsupported(
+                "NvFBC NVENC drain",
+                format!("slot={slot_index}"),
+                "完成输出时找不到 mapped input resource",
+            )
+        })?;
+        nvenc_check("NvEncUnmapInputResource(NvFBC D3D9Ex)", unsafe {
+            mapped.unmap_now()
+        })?;
         slot.completion_seen = false;
         let completion_latency_us = pending
             .submitted_at
@@ -660,6 +693,164 @@ impl NvencD3d9Encoder {
             completed_frames: self.completed_frames,
             completion_latency_us: self.completion_latency_us,
             completion_latency_max_us: self.completion_latency_max_us,
+        }
+    }
+
+    fn abort_handles(&mut self) -> i32 {
+        let status = self
+            .session
+            .as_mut()
+            .map(NvencD3d9Session::destroy_now)
+            .unwrap_or(NV_ENC_SUCCESS);
+        if status != NV_ENC_SUCCESS {
+            return status;
+        }
+        for slot in &mut self.slots {
+            if let Some(mapped) = slot.mapped.as_mut() {
+                unsafe { mapped.abandon() };
+            }
+            unsafe {
+                slot.registered.abandon();
+                slot.bitstream.abandon();
+            }
+            if let Some(completion) = slot.completion.as_mut() {
+                completion.abandon_registration();
+            }
+            slot.pending = None;
+        }
+        if let Some(completion) = self.eos_completion.as_mut() {
+            completion.abandon_registration();
+        }
+        self.pending_order.clear();
+        status
+    }
+
+    fn leak_live_encoder_state(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.slots));
+        if let Some(event) = self.eos_completion.take() {
+            std::mem::forget(event);
+        }
+        std::mem::forget(std::mem::take(&mut self.pending_order));
+        if let Some(session) = self.session.take() {
+            std::mem::forget(session);
+        }
+        if let Some(api) = self.api.take() {
+            std::mem::forget(api);
+        }
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), BackendError> {
+        let status = self.abort_handles();
+        if status == NV_ENC_SUCCESS {
+            Ok(())
+        } else {
+            self.leak_live_encoder_state();
+            Err(BackendError::unsupported(
+                "NvFBC NVENC abort",
+                chroma_label(self.chroma),
+                format!("NvEncDestroyEncoder status={status}"),
+            ))
+        }
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<(), BackendError> {
+        let mut failures = Vec::new();
+        let mut events_pending_encoder_destroy = Vec::new();
+        if !self.pending_order.is_empty() || self.slots.iter().any(|slot| slot.pending.is_some()) {
+            let queue = self.pending_order.len();
+            let slots = self
+                .slots
+                .iter()
+                .filter(|slot| slot.pending.is_some())
+                .count();
+            let destroy_status = self.abort_handles();
+            if destroy_status != NV_ENC_SUCCESS {
+                self.leak_live_encoder_state();
+            }
+            return Err(BackendError::unsupported(
+                "NvFBC NVENC shutdown",
+                chroma_label(self.chroma),
+                format!(
+                    "pending frames remain: queue={queue} slots={slots}; encoder aborted before child resources; NvEncDestroyEncoder status={destroy_status}"
+                ),
+            ));
+        }
+        for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(mut mapped) = slot.mapped.take() {
+                let status = unsafe { mapped.unmap_now() };
+                if status != NV_ENC_SUCCESS {
+                    failures.push(format!(
+                        "slot={slot_index} NvEncUnmapInputResource status={status}"
+                    ));
+                }
+            }
+            let unregister_status = unsafe { slot.registered.unregister_now() };
+            if unregister_status != NV_ENC_SUCCESS {
+                failures.push(format!(
+                    "slot={slot_index} NvEncUnregisterResource status={unregister_status}"
+                ));
+            }
+            if let Some(mut completion) = slot.completion.take() {
+                let status = completion.unregister_now();
+                if status != NV_ENC_SUCCESS {
+                    failures.push(format!(
+                        "slot={slot_index} NvEncUnregisterAsyncEvent status={status}"
+                    ));
+                    events_pending_encoder_destroy.push(completion);
+                }
+            }
+            let bitstream_status = unsafe { slot.bitstream.destroy_now() };
+            if bitstream_status != NV_ENC_SUCCESS {
+                failures.push(format!(
+                    "slot={slot_index} NvEncDestroyBitstreamBuffer status={bitstream_status}"
+                ));
+            }
+        }
+        if let Some(mut completion) = self.eos_completion.take() {
+            let status = completion.unregister_now();
+            if status != NV_ENC_SUCCESS {
+                failures.push(format!("EOS NvEncUnregisterAsyncEvent status={status}"));
+                events_pending_encoder_destroy.push(completion);
+            }
+        }
+        let session_status = self
+            .session
+            .as_mut()
+            .map(NvencD3d9Session::destroy_now)
+            .unwrap_or(NV_ENC_SUCCESS);
+        if session_status != NV_ENC_SUCCESS {
+            failures.push(format!("NvEncDestroyEncoder status={session_status}"));
+            std::mem::forget(events_pending_encoder_destroy);
+            self.leak_live_encoder_state();
+            return Err(BackendError::unsupported(
+                "NvFBC NVENC shutdown",
+                chroma_label(self.chroma),
+                failures.join(" | "),
+            ));
+        }
+        for event in &mut events_pending_encoder_destroy {
+            event.abandon_registration();
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::unsupported(
+                "NvFBC NVENC shutdown",
+                chroma_label(self.chroma),
+                failures.join(" | "),
+            ))
+        }
+    }
+}
+
+impl Drop for NvencD3d9Encoder {
+    fn drop(&mut self) {
+        let encoder_live = self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.encoder().is_null());
+        if encoder_live && self.abort_handles() != NV_ENC_SUCCESS {
+            self.leak_live_encoder_state();
         }
     }
 }
@@ -817,14 +1008,14 @@ fn validate_surface(
         func: "IDirect3DSurface9::GetDesc(NvFBC NVENC)",
         message: err.to_string(),
     })?;
-    if desc.Width != width || desc.Height != height || desc.Format != D3DFMT_A2B10G10R10 {
+    if desc.Width < width || desc.Height < height || desc.Format != D3DFMT_A2B10G10R10 {
         return Err(BackendError::unsupported(
             "NvFBC NVENC D3D9Ex input",
             format!(
                 "{}x{} D3DFORMAT({})",
                 desc.Width, desc.Height, desc.Format.0
             ),
-            format!("需要 {width}x{height} A2B10G10R10 render target"),
+            format!("需要至少 {width}x{height} A2B10G10R10 render target"),
         ));
     }
     Ok(())

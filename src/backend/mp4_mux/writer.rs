@@ -110,6 +110,7 @@ pub(crate) fn write_hevc_aac_mp4_with_index(
                     .into_iter()
                     .zip(offsets)
                     .map(|(sample, offset)| AacIndexedSample {
+                        timestamp_ticks: sample.timestamp_ticks,
                         duration_ticks: sample.duration_ticks,
                         offset,
                         len: sample.data.len(),
@@ -135,6 +136,9 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
             "音轨 timescale/采样率必须大于 0",
         ));
     }
+    if let Some(audio) = audio_track {
+        validate_prepared_audio_track(audio)?;
+    }
 
     let converted = video_track
         .samples
@@ -157,6 +161,7 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
             .samples
             .iter()
             .map(|sample| PreparedAudioSample {
+                timestamp_ticks: sample.timestamp_ticks,
                 duration_ticks: sample.duration_ticks,
                 data: SamplePayload::FileRange(sample.data.clone()),
             })
@@ -323,7 +328,20 @@ pub(super) fn prepare_audio_track(
     }
 
     let mut prepared = Vec::with_capacity(track.samples.len());
+    let mut expected_timestamp = None;
     for (index, sample) in track.samples.iter().enumerate() {
+        if let Some(expected) = expected_timestamp
+            && sample.timestamp_ticks != expected
+        {
+            return Err(BackendError::unsupported(
+                "MP4 封装",
+                "AAC sample timeline",
+                format!(
+                    "AAC sample 时间戳不连续：index={index} expected={expected} actual={}",
+                    sample.timestamp_ticks
+                ),
+            ));
+        }
         let duration_ticks = if sample.duration_ticks == 0 {
             track
                 .samples
@@ -335,12 +353,71 @@ pub(super) fn prepare_audio_track(
         } else {
             sample.duration_ticks
         };
+        expected_timestamp = Some(
+            sample
+                .timestamp_ticks
+                .saturating_add(u64::from(duration_ticks)),
+        );
         prepared.push(PreparedAudioSample {
+            timestamp_ticks: sample.timestamp_ticks,
             duration_ticks,
             data: SamplePayload::Memory(sample.data.clone()),
         });
     }
+    if expected_timestamp.is_some_and(|end| track.duration_ticks < end) {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "AAC track duration",
+            format!(
+                "duration_ticks={} 小于最后 sample 结束时间 {}",
+                track.duration_ticks,
+                expected_timestamp.unwrap_or_default()
+            ),
+        ));
+    }
     Ok(prepared)
+}
+
+fn validate_prepared_audio_track(track: &AacPreparedMp4Track) -> Result<(), BackendError> {
+    if track.samples.is_empty() {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "AAC prepared audio track",
+            "请求写入音轨但没有可封装的 AAC sample",
+        ));
+    }
+    let mut expected_timestamp = None;
+    for (index, sample) in track.samples.iter().enumerate() {
+        if let Some(expected) = expected_timestamp
+            && sample.timestamp_ticks != expected
+        {
+            return Err(BackendError::unsupported(
+                "MP4 封装",
+                "AAC prepared sample timeline",
+                format!(
+                    "AAC sample 时间戳不连续：index={index} expected={expected} actual={}",
+                    sample.timestamp_ticks
+                ),
+            ));
+        }
+        expected_timestamp = Some(
+            sample
+                .timestamp_ticks
+                .saturating_add(u64::from(sample.duration_ticks)),
+        );
+    }
+    if expected_timestamp.is_some_and(|end| track.duration_ticks < end) {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "AAC prepared track duration",
+            format!(
+                "duration_ticks={} 小于最后 sample 结束时间 {}",
+                track.duration_ticks,
+                expected_timestamp.unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn sample_duration(

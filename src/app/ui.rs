@@ -1,9 +1,13 @@
 use super::*;
 
-pub(super) const fn capture_mode_switch_target(
+pub(super) fn capture_mode_switch_target(
+    configured_mode: CaptureMode,
     effective_mode: CaptureMode,
     nvfbc_usable: bool,
 ) -> Option<CaptureMode> {
+    if configured_mode == CaptureMode::DedicatedNvFbc && effective_mode == CaptureMode::Generic {
+        return Some(CaptureMode::Generic);
+    }
     match effective_mode {
         CaptureMode::Generic if nvfbc_usable => Some(CaptureMode::DedicatedNvFbc),
         CaptureMode::Generic => None,
@@ -413,11 +417,18 @@ impl RustReplayApp {
                         self.config.capture_backend.short_name()
                     ));
                     let switch_target = capture_mode_switch_target(
+                        self.config.capture_mode,
                         self.effective_capture_mode,
                         self.caps.as_ref().is_some_and(ProbeCaps::nvfbc_usable),
                     );
                     if let Some(target) = switch_target
-                        && ui.button("切换到专用捕获（重启）").clicked()
+                        && ui
+                            .button(if target == CaptureMode::DedicatedNvFbc {
+                                "切换到专用捕获（重启）"
+                            } else {
+                                "清除失效的专用捕获偏好（重启）"
+                            })
+                            .clicked()
                     {
                         self.restart_with_capture_mode(ui.ctx(), target);
                     }
@@ -425,6 +436,7 @@ impl RustReplayApp {
                 CaptureMode::DedicatedNvFbc => {
                     ui.label("当前使用 NvFBC 专用捕获");
                     let switch_target = capture_mode_switch_target(
+                        self.config.capture_mode,
                         self.effective_capture_mode,
                         self.caps.as_ref().is_some_and(ProbeCaps::nvfbc_usable),
                     );

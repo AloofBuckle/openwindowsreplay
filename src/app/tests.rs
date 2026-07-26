@@ -5,15 +5,23 @@ use crate::rate_control::{NvencMultiPass, NvencPreset, NvencSplitEncodeMode};
 #[test]
 fn capture_mode_controls_hide_unavailable_dedicated_switch_and_preserve_return_path() {
     assert_eq!(
-        capture_mode_switch_target(CaptureMode::Generic, false),
+        capture_mode_switch_target(CaptureMode::Generic, CaptureMode::Generic, false),
         None
     );
     assert_eq!(
-        capture_mode_switch_target(CaptureMode::Generic, true),
+        capture_mode_switch_target(CaptureMode::Generic, CaptureMode::Generic, true),
         Some(CaptureMode::DedicatedNvFbc)
     );
     assert_eq!(
-        capture_mode_switch_target(CaptureMode::DedicatedNvFbc, true),
+        capture_mode_switch_target(
+            CaptureMode::DedicatedNvFbc,
+            CaptureMode::DedicatedNvFbc,
+            true
+        ),
+        Some(CaptureMode::Generic)
+    );
+    assert_eq!(
+        capture_mode_switch_target(CaptureMode::DedicatedNvFbc, CaptureMode::Generic, false),
         Some(CaptureMode::Generic)
     );
 }

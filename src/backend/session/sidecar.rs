@@ -34,6 +34,7 @@ pub(super) fn write_disk_segment_sidecar(
             write_u64(&mut file, audio.duration_ticks)?;
             write_u64(&mut file, audio.samples.len() as u64)?;
             for sample in &audio.samples {
+                write_u64(&mut file, sample.timestamp_ticks)?;
                 write_u32(&mut file, sample.duration_ticks)?;
                 write_u64(&mut file, sample.offset)?;
                 write_u64(&mut file, sample.len)?;
@@ -82,6 +83,7 @@ pub(super) fn read_disk_segment_sidecar(path: &Path) -> Result<HevcAacMp4Index, 
         let mut samples = Vec::with_capacity(sample_count);
         for _ in 0..sample_count {
             samples.push(AacIndexedSample {
+                timestamp_ticks: read_u64(&mut file)?,
                 duration_ticks: read_u32(&mut file)?,
                 offset: read_u64(&mut file)?,
                 len: read_u64(&mut file)?,

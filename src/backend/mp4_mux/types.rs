@@ -156,6 +156,7 @@ pub(super) struct PreparedSample {
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedAudioSample {
+    pub(super) timestamp_ticks: u64,
     pub(super) duration_ticks: u32,
     pub(super) data: SamplePayload,
 }
@@ -206,6 +207,7 @@ pub(crate) struct HevcIndexedSample {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AacIndexedSample {
+    pub(crate) timestamp_ticks: u64,
     pub(crate) duration_ticks: u32,
     pub(crate) offset: u64,
     pub(crate) len: u64,
@@ -245,6 +247,7 @@ pub(crate) struct HevcPreparedSample {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AacPreparedSample {
+    pub(crate) timestamp_ticks: u64,
     pub(crate) duration_ticks: u32,
     pub(crate) data: Mp4SampleFileRange,
 }

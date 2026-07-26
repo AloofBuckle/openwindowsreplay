@@ -71,8 +71,13 @@ float4 ps_luma(float4 pos : SV_Position) : SV_Target {
 
 float4 ps_chroma(float4 pos : SV_Position) : SV_Target {
     uint2 base_pixel = uint2(pos.xy) * 2;
-    float3 c = load_ycbcr(base_pixel + uint2(1, 1));
-    return float4(c.yz, 0.0, 1.0);
+    float2 chroma = (
+        load_ycbcr(base_pixel).yz
+        + load_ycbcr(base_pixel + uint2(1, 0)).yz
+        + load_ycbcr(base_pixel + uint2(0, 1)).yz
+        + load_ycbcr(base_pixel + uint2(1, 1)).yz
+    ) * 0.25;
+    return float4(chroma, 0.0, 1.0);
 }
 
 RWTexture2D<float> y_plane : register(u0);

@@ -85,10 +85,71 @@ pub(super) fn make_audio_trak(
     offsets: &[u64],
     track_duration_ms: u32,
 ) -> Result<Vec<u8>, BackendError> {
+    let media_duration_ticks = samples
+        .iter()
+        .map(|sample| u64::from(sample.duration_ticks))
+        .sum::<u64>()
+        .max(1);
+    let start_offset_ticks = samples
+        .first()
+        .map(|sample| sample.timestamp_ticks)
+        .unwrap_or(0);
+    let sample_end_ticks = start_offset_ticks.saturating_add(media_duration_ticks);
+    let timeline_duration_ticks = track.duration_ticks.max(sample_end_ticks);
+    let trailing_empty_ticks = timeline_duration_ticks.saturating_sub(sample_end_ticks);
     let mut p = Vec::new();
     p.extend(make_tkhd(2, track_duration_ms, 0x0100, 0, 0));
-    p.extend(make_audio_mdia(track, samples, offsets)?);
+    if start_offset_ticks > 0 || trailing_empty_ticks > 0 {
+        p.extend(make_audio_edts(
+            start_offset_ticks,
+            media_duration_ticks,
+            timeline_duration_ticks,
+            track.sample_rate,
+        ));
+    }
+    p.extend(make_audio_mdia(
+        track,
+        media_duration_ticks,
+        samples,
+        offsets,
+    )?);
     Ok(mp4_box(*b"trak", p))
+}
+
+pub(super) fn make_audio_edts(
+    start_offset_ticks: u64,
+    media_duration_ticks: u64,
+    timeline_duration_ticks: u64,
+    sample_rate: u32,
+) -> Vec<u8> {
+    let start_offset_ms = scale_duration(start_offset_ticks, sample_rate, MOVIE_TIMESCALE);
+    let media_end_ms = scale_duration(
+        start_offset_ticks.saturating_add(media_duration_ticks),
+        sample_rate,
+        MOVIE_TIMESCALE,
+    );
+    let timeline_duration_ms =
+        scale_duration(timeline_duration_ticks, sample_rate, MOVIE_TIMESCALE);
+    let media_duration_ms = media_end_ms.saturating_sub(start_offset_ms).max(1);
+    let trailing_empty_ms = timeline_duration_ms.saturating_sub(media_end_ms);
+    let mut entries = Vec::new();
+    if start_offset_ticks > 0 {
+        entries.push((start_offset_ms, u32::MAX));
+    }
+    entries.push((media_duration_ms, 0));
+    if trailing_empty_ms > 0 {
+        entries.push((trailing_empty_ms, u32::MAX));
+    }
+
+    let mut p = Vec::new();
+    be32(&mut p, entries.len() as u32);
+    for (segment_duration, media_time) in entries {
+        be32(&mut p, segment_duration);
+        be32(&mut p, media_time);
+        be16(&mut p, 1);
+        be16(&mut p, 0);
+    }
+    mp4_box(*b"edts", full_box(*b"elst", 0, 0, p))
 }
 
 pub(super) fn make_tkhd(
@@ -132,11 +193,12 @@ pub(super) fn make_mdia(
 
 pub(super) fn make_audio_mdia(
     track: &AacLcMp4Track,
+    media_duration_ticks: u64,
     samples: &[PreparedAudioSample],
     offsets: &[u64],
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
-    p.extend(make_mdhd(track.sample_rate, track.duration_ticks));
+    p.extend(make_mdhd(track.sample_rate, media_duration_ticks));
     p.extend(make_hdlr(*b"soun", "SoundHandler"));
     p.extend(make_audio_minf(track, samples, offsets)?);
     Ok(mp4_box(*b"mdia", p))

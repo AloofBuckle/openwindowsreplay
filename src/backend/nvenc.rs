@@ -5214,7 +5214,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "需要 NVIDIA CUDA external-memory interop 与 HEVC RExt；验证四种 planar 输入和 Lookahead 持久注册"]
+    #[ignore = "需要 NVIDIA CUDA external-memory interop 与 HEVC RExt；验证四种 planar 输入、Lookahead 和输入槽位复用"]
     fn local_nvenc_cuda_external_formats_lookahead_smoke() {
         use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
         use windows::core::Interface;
@@ -5259,7 +5259,9 @@ mod tests {
                     1,
                 )
                 .unwrap_or_else(|err| panic!("{} 初始化失败：{err}", input_format.label()));
-                let textures = (0..12)
+                let slot_count = usize::from(rate_control.look_ahead_depth).saturating_add(1);
+                let frame_count = slot_count.saturating_mul(3);
+                let textures = (0..slot_count)
                     .map(|_| {
                         let (texture, unused_handle) = create_synthetic_external_input_texture(
                             encoder.device(),
@@ -5276,16 +5278,19 @@ mod tests {
                     .iter()
                     .map(|texture| texture.cast::<IDXGIKeyedMutex>().unwrap())
                     .collect::<Vec<_>>();
-                let timestamps = (0..textures.len())
+                let timestamps = (0..frame_count)
                     .map(|index| (index as u64).saturating_mul(750))
                     .collect::<Vec<_>>();
                 let mut outputs = Vec::new();
-                for (index, (texture, mutex)) in textures.iter().zip(mutexes.iter()).enumerate() {
+                for (index, timestamp) in timestamps.iter().copied().enumerate() {
+                    let slot_index = index % slot_count;
+                    let texture = &textures[slot_index];
+                    let mutex = &mutexes[slot_index];
                     mutex.AcquireSync(0, 1_000).unwrap();
                     mutex.ReleaseSync(1).unwrap();
                     outputs.extend(
                         encoder
-                            .submit_texture(texture, timestamps[index], index == 0, false)
+                            .submit_texture(texture, timestamp, index == 0, false)
                             .unwrap(),
                     );
                 }

@@ -210,8 +210,8 @@ extern "C" std::int32_t rr_nvfbc_create(void* d3d9_device, std::uint32_t adapter
     handle->grab = grab;
     handle->gpu_sleep = gpu_sleep;
     handle->release = release;
-    out_info->width = params.max_display_width;
-    out_info->height = params.max_display_height;
+    out_info->max_width = params.max_display_width;
+    out_info->max_height = params.max_display_height;
     out_info->nvfbc_version = params.nvfbc_version;
     *out_handle = handle;
     return 0;

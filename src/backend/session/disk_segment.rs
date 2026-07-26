@@ -12,6 +12,7 @@ pub(super) struct DiskSegmentSink {
     pub(super) pending_codec_epoch_change: bool,
     pub(super) current: Option<DiskSegmentBuilder>,
     pub(super) pending: VecDeque<DiskSegmentBuilder>,
+    pub(super) pending_audio_before_video: VecDeque<AacAccessUnit>,
     pub(super) target_duration_90k: u64,
     pub(super) max_open_duration_90k: u64,
     pub(super) waiting_for_sync_start_90k: Option<u64>,
@@ -45,6 +46,7 @@ impl DiskSegmentSink {
             pending_codec_epoch_change: false,
             current: None,
             pending: VecDeque::new(),
+            pending_audio_before_video: VecDeque::new(),
             target_duration_90k: seconds_to_90k(target_seconds),
             max_open_duration_90k: seconds_to_90k(target_seconds).saturating_mul(4).max(1),
             waiting_for_sync_start_90k: None,
@@ -86,6 +88,7 @@ impl DiskSegmentSink {
     pub(super) fn abort(&mut self) {
         self.current = None;
         self.pending.clear();
+        self.pending_audio_before_video.clear();
         if let Ok(mut ring) = self.live_ring.lock() {
             ring.abort_segment();
         }
@@ -131,6 +134,7 @@ impl DiskSegmentSink {
         let Some(metadata) = self.metadata.clone() else {
             return;
         };
+        let audio_sample_rate = metadata.audio_sample_rate;
         if self.pending_codec_epoch_change && !sample.is_sync {
             if let Ok(mut ring) = self.live_ring.lock() {
                 ring.push_video_au_90k(sample);
@@ -169,6 +173,8 @@ impl DiskSegmentSink {
                         >= self.target_duration_90k)
         });
         let needs_new_builder = self.current.is_none() || should_rotate;
+        let mut restart_live_ring = false;
+        let mut audio_to_republish = Vec::new();
         let mut parameter_set_header = if needs_new_builder {
             let Some(header) = self.parameter_sets.header_access_unit() else {
                 self.fail(
@@ -182,21 +188,31 @@ impl DiskSegmentSink {
         };
         if self.current.is_none() {
             self.waiting_for_sync_start_90k = None;
-            self.current = Some(DiskSegmentBuilder::new(
+            restart_live_ring = true;
+            let start_audio_ticks = scale_90k_to_ticks(sample.timestamp_90k, audio_sample_rate);
+            let mut current = DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
-                scale_90k_to_ticks(
-                    sample.timestamp_90k,
-                    crate::backend::audio::TARGET_SAMPLE_RATE,
-                ),
+                start_audio_ticks,
                 parameter_set_header
                     .take()
                     .expect("new disk segment requires parameter sets"),
-            ));
+            );
+            while let Some(audio) = self.pending_audio_before_video.pop_front() {
+                if audio.timestamp_ticks >= start_audio_ticks {
+                    current.push_audio(&audio);
+                    audio_to_republish.push(audio);
+                }
+            }
+            self.current = Some(current);
         }
+        let mut carried_audio = Vec::new();
         if should_rotate {
+            let next_start_audio_ticks =
+                scale_90k_to_ticks(sample.timestamp_90k, audio_sample_rate);
             if let Some(mut current) = self.current.take() {
                 current.end_90k = Some(sample.timestamp_90k);
+                carried_audio = current.take_audio_at_or_after(next_start_audio_ticks);
                 self.pending.push_back(current);
             }
             if self.pending.len() > DISK_PENDING_SEGMENT_LIMIT {
@@ -209,19 +225,24 @@ impl DiskSegmentSink {
             self.current = Some(DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
-                scale_90k_to_ticks(
-                    sample.timestamp_90k,
-                    crate::backend::audio::TARGET_SAMPLE_RATE,
-                ),
+                scale_90k_to_ticks(sample.timestamp_90k, audio_sample_rate),
                 parameter_set_header
                     .take()
                     .expect("rotated disk segment requires parameter sets"),
             ));
-            self.pending_codec_epoch_change = false;
-            if let Ok(mut ring) = self.live_ring.lock() {
-                ring.restart_timeline(metadata);
+            if let Some(current) = self.current.as_mut() {
+                for audio in &carried_audio {
+                    current.push_audio(audio);
+                }
             }
+            restart_live_ring = true;
+            audio_to_republish.extend(carried_audio);
+            self.pending_codec_epoch_change = false;
             self.flush_ready_pending();
+        }
+
+        if restart_live_ring && let Ok(mut ring) = self.live_ring.lock() {
+            ring.restart_timeline(metadata);
         }
 
         if let Some(current) = self.current.as_mut() {
@@ -229,6 +250,9 @@ impl DiskSegmentSink {
         }
         if let Ok(mut ring) = self.live_ring.lock() {
             ring.push_video_au_90k(sample);
+            for audio in &audio_to_republish {
+                ring.push_audio_au_ticks(audio, audio_sample_rate);
+            }
         }
     }
 
@@ -236,16 +260,47 @@ impl DiskSegmentSink {
         if self.failed {
             return;
         }
-        if let Some(segment) = self
+        let assigned = if let Some(segment) = self
             .pending
             .iter_mut()
             .find(|segment| segment.contains_audio_timestamp(sample.timestamp_ticks))
         {
             segment.push_audio(sample);
+            true
         } else if let Some(current) = self.current.as_mut()
             && sample.timestamp_ticks >= current.start_audio_ticks
         {
             current.push_audio(sample);
+            true
+        } else {
+            false
+        };
+        if !assigned && self.current.is_none() && self.pending.is_empty() {
+            self.pending_audio_before_video.push_back(sample.clone());
+            let audio_sample_rate = self
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.audio_sample_rate)
+                .unwrap_or(crate::backend::audio::TARGET_SAMPLE_RATE);
+            let max_pending_ticks =
+                scale_90k_to_ticks(self.max_open_duration_90k, audio_sample_rate);
+            let pending_span = self
+                .pending_audio_before_video
+                .front()
+                .zip(self.pending_audio_before_video.back())
+                .map(|(first, last)| {
+                    last.timestamp_ticks
+                        .saturating_add(u64::from(last.duration_ticks))
+                        .saturating_sub(first.timestamp_ticks)
+                })
+                .unwrap_or(0);
+            if pending_span > max_pending_ticks {
+                self.fail(format!(
+                    "磁盘循环等待首个关键帧期间 AAC 已积累超过 {:.1}s",
+                    self.max_open_duration_90k as f64 / VIDEO_CLOCK_HZ as f64
+                ));
+                return;
+            }
         }
         self.latest_audio_ticks = self.latest_audio_ticks.max(
             sample
@@ -365,6 +420,26 @@ impl DiskSegmentBuilder {
         self.audio_samples.push(sample);
     }
 
+    pub(super) fn take_audio_at_or_after(&mut self, start_audio_ticks: u64) -> Vec<AacAccessUnit> {
+        let split_at = self
+            .audio_samples
+            .iter()
+            .position(|sample| {
+                sample
+                    .timestamp_ticks
+                    .saturating_add(self.start_audio_ticks)
+                    >= start_audio_ticks
+            })
+            .unwrap_or(self.audio_samples.len());
+        let mut carried = self.audio_samples.split_off(split_at);
+        for sample in &mut carried {
+            sample.timestamp_ticks = sample
+                .timestamp_ticks
+                .saturating_add(self.start_audio_ticks);
+        }
+        carried
+    }
+
     pub(super) fn end_audio_ticks(&self) -> Option<u64> {
         self.end_90k.map(|end| {
             scale_90k_to_ticks(end, self.metadata.audio_sample_rate).max(self.start_audio_ticks)
@@ -470,7 +545,7 @@ pub(super) fn concat_disk_indexed_segments(
     let mut audio_samples = Vec::new();
     let parameter_sets = first.index.video_track.parameter_sets.clone();
     let mut video_base_90k = 0u64;
-    let mut audio_base_ticks = 0u64;
+    let mut expected_audio_timestamp_ticks = None;
     let audio_sample_rate = first
         .index
         .audio_track
@@ -485,6 +560,7 @@ pub(super) fn concat_disk_indexed_segments(
         .unwrap_or(2);
     for segment in segments {
         validate_disk_segment_compatibility(first, segment)?;
+        let segment_audio_base_ticks = scale_90k_to_ticks(video_base_90k, audio_sample_rate);
         video_samples.extend(segment.index.video_track.samples.iter().map(|sample| {
             HevcPreparedSample {
                 duration_90k: sample.duration_90k,
@@ -496,23 +572,37 @@ pub(super) fn concat_disk_indexed_segments(
                 },
             }
         }));
-        video_base_90k = video_base_90k.saturating_add(segment.index.video_track.duration_90k);
         if let Some(audio) = &segment.index.audio_track {
-            audio_samples.extend(audio.samples.iter().map(|sample| AacPreparedSample {
-                duration_ticks: sample.duration_ticks,
-                data: Mp4SampleFileRange {
-                    path: segment.mp4_path.clone(),
-                    offset: sample.offset,
-                    len: sample.len,
-                },
-            }));
-            audio_base_ticks = audio_base_ticks.saturating_add(audio.duration_ticks);
-        } else {
-            audio_base_ticks = audio_base_ticks.saturating_add(scale_90k_to_ticks(
-                segment.index.video_track.duration_90k,
-                audio_sample_rate,
-            ));
+            for sample in &audio.samples {
+                let mut timestamp_ticks =
+                    segment_audio_base_ticks.saturating_add(sample.timestamp_ticks);
+                if let Some(expected) = expected_audio_timestamp_ticks {
+                    let rounding_delta = timestamp_ticks.abs_diff(expected);
+                    if rounding_delta > 1 {
+                        return Err(BackendError::unsupported(
+                            "磁盘循环缓存拼接",
+                            segment.mp4_path.display().to_string(),
+                            format!(
+                                "AAC 时间线不连续：expected={expected} actual={timestamp_ticks}"
+                            ),
+                        ));
+                    }
+                    timestamp_ticks = expected;
+                }
+                expected_audio_timestamp_ticks =
+                    Some(timestamp_ticks.saturating_add(u64::from(sample.duration_ticks)));
+                audio_samples.push(AacPreparedSample {
+                    timestamp_ticks,
+                    duration_ticks: sample.duration_ticks,
+                    data: Mp4SampleFileRange {
+                        path: segment.mp4_path.clone(),
+                        offset: sample.offset,
+                        len: sample.len,
+                    },
+                });
+            }
         }
+        video_base_90k = video_base_90k.saturating_add(segment.index.video_track.duration_90k);
     }
     if video_samples.is_empty() {
         return Ok(None);
@@ -523,7 +613,9 @@ pub(super) fn concat_disk_indexed_segments(
         Some(AacPreparedMp4Track {
             sample_rate: audio_sample_rate,
             channel_count: audio_channel_count,
-            duration_ticks: audio_base_ticks.max(1),
+            duration_ticks: scale_90k_to_ticks(video_base_90k, audio_sample_rate)
+                .max(expected_audio_timestamp_ticks.unwrap_or(0))
+                .max(1),
             samples: audio_samples,
         })
     };

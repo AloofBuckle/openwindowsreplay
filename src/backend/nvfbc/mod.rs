@@ -1,10 +1,9 @@
 #![allow(dead_code)]
-//! Dormant Windows NvFBC capture backend.
+//! Windows NvFBC dedicated capture backend.
 //!
-//! This module deliberately is not connected to the global capability probe,
-//! GUI, or automatic backend selector. It exposes a typed backend API so the
-//! proven D3D9Ex NvFBC-to-NVENC route can live in mainline without changing the
-//! current DDA/WGC production behavior.
+//! The global capability probe exposes this route only when the active display,
+//! NvFBC, D3D9Ex, and NVENC capabilities form a complete production path. Users
+//! select it explicitly; it does not silently replace the DDA/WGC route.
 
 mod d3d9;
 mod ffi;
@@ -173,6 +172,7 @@ impl NvFbcRecorder {
 
         let device = d3d9::D3d9Device::open(options.adapter_index)?;
         let display = device.display();
+        let (width, height) = display_dimensions(display)?;
         let display_color = nvenc_display_route_color(display.color_space, display.bits_per_color)?;
         if !display_color.hdr_pq || display_color.bit_depth != 10 {
             return Err(BackendError::unsupported(
@@ -186,8 +186,12 @@ impl NvFbcRecorder {
         }
 
         let (mut session, create_info) = ffi::NvFbcSession::create(&device)?;
-        let surfaces =
-            device.create_surface_pool(create_info.width, create_info.height, SURFACE_COUNT)?;
+        validate_display_dimensions(width, height, create_info)?;
+        let surfaces = device.create_surface_pool(
+            create_info.max_width,
+            create_info.max_height,
+            SURFACE_COUNT,
+        )?;
         session.setup(&surfaces, true, options.capture_cursor)?;
 
         // Once Setup succeeds the shim may retain the output-buffer descriptors.
@@ -201,8 +205,8 @@ impl NvFbcRecorder {
         let encoder = NvencD3d9Encoder::open(
             capture.device.device(),
             capture.surfaces.surfaces(),
-            create_info.width,
-            create_info.height,
+            width,
+            height,
             options.chroma,
             display_color.mp4_color,
             &options.rate_control,
@@ -217,8 +221,8 @@ impl NvFbcRecorder {
         Ok(Self {
             encoder: Some(encoder),
             capture: Some(capture),
-            width: create_info.width,
-            height: create_info.height,
+            width,
+            height,
             chroma: options.chroma,
             color: display_color.mp4_color,
             timeline_origin_100ns: None,
@@ -333,13 +337,37 @@ impl NvFbcRecorder {
         let mut encoder = self.encoder.take().ok_or_else(|| {
             BackendError::unsupported("NvFBC recorder", "NVENC encoder", "encoder 已关闭")
         })?;
-        let output = encoder.flush()?;
+        let output_result = encoder.flush();
         let stats = encoder.runtime_stats();
-        drop(encoder);
-        if let Some(capture) = self.capture.take() {
-            capture.close()?;
+        let encoder_cleanup = if output_result.is_ok() {
+            encoder.shutdown()
+        } else {
+            encoder.abort()
+        };
+        let capture_cleanup = self
+            .capture
+            .take()
+            .map_or(Ok(()), |capture| capture.close());
+        let cleanup_result = match (encoder_cleanup, capture_cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Err(encoder_err), Err(capture_err)) => Err(BackendError::unsupported(
+                "NvFBC recorder shutdown",
+                "NVENC + NvFBC capture",
+                format!(
+                    "NVENC cleanup failed: {encoder_err}; capture cleanup failed: {capture_err}"
+                ),
+            )),
+        };
+        match (output_result, cleanup_result) {
+            (Ok(output), Ok(())) => Ok((output, stats)),
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => Err(err),
+            (Err(flush_err), Err(cleanup_err)) => Err(BackendError::unsupported(
+                "NvFBC recorder finish",
+                "flush + cleanup",
+                format!("flush failed: {flush_err}; cleanup failed: {cleanup_err}"),
+            )),
         }
-        Ok((output, stats))
     }
 
     fn encoder(&mut self) -> Result<&mut NvencD3d9Encoder, BackendError> {
@@ -374,10 +402,12 @@ fn probe_impl(adapter_index: Option<u32>) -> Result<NvFbcProbeInfo, BackendError
     #[cfg(test)]
     eprintln!("nvfbc_rust_probe=d3d9_open_end");
     let display = device.display().clone();
+    let (width, height) = display_dimensions(&display)?;
     let display_color = nvenc_display_route_color(display.color_space, display.bits_per_color)?;
     #[cfg(test)]
     eprintln!("nvfbc_rust_probe=ffi_create_begin");
     let (session, create_info) = ffi::NvFbcSession::create(&device)?;
+    validate_display_dimensions(width, height, create_info)?;
     #[cfg(test)]
     eprintln!("nvfbc_rust_probe=ffi_create_end");
     let caps = NvencD3d9Encoder::probe(device.device())?;
@@ -389,8 +419,8 @@ fn probe_impl(adapter_index: Option<u32>) -> Result<NvFbcProbeInfo, BackendError
 
     let routes = route_infos(
         &caps,
-        create_info.width,
-        create_info.height,
+        width,
+        height,
         display_color.hdr_pq && display_color.bit_depth == 10,
     );
     Ok(NvFbcProbeInfo {
@@ -415,8 +445,8 @@ fn probe_impl(adapter_index: Option<u32>) -> Result<NvFbcProbeInfo, BackendError
             hdr_pq: display_color.hdr_pq,
             color_note: display_color.note.to_owned(),
         }),
-        capture_width: create_info.width,
-        capture_height: create_info.height,
+        capture_width: width,
+        capture_height: height,
         nvfbc_version: create_info.nvfbc_version,
         routes,
         rate_controls: caps.rate_controls,
@@ -426,6 +456,39 @@ fn probe_impl(adapter_index: Option<u32>) -> Result<NvFbcProbeInfo, BackendError
         lookahead_policy: "disabled_for_nvfbc".to_owned(),
         warnings: caps.warnings,
     })
+}
+
+fn display_dimensions(display: &d3d9::DisplayInfo) -> Result<(u32, u32), BackendError> {
+    if display.physical_width > 0 && display.physical_height > 0 {
+        Ok((display.physical_width, display.physical_height))
+    } else {
+        Err(BackendError::unsupported(
+            "NvFBC current display dimensions",
+            format!(
+                "physical={}x{}",
+                display.physical_width, display.physical_height
+            ),
+            "EnumDisplaySettingsW 没有返回有效当前物理尺寸",
+        ))
+    }
+}
+
+fn validate_display_dimensions(
+    width: u32,
+    height: u32,
+    create_info: ffi::CreateInfo,
+) -> Result<(), BackendError> {
+    if width <= create_info.max_width && height <= create_info.max_height {
+        return Ok(());
+    }
+    Err(BackendError::unsupported(
+        "NvFBC current display dimensions",
+        format!("display={width}x{height}"),
+        format!(
+            "超过 NvFBC_CreateEx 报告的上限 {}x{}",
+            create_info.max_width, create_info.max_height
+        ),
+    ))
 }
 
 fn route_infos(

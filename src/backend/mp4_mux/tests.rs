@@ -93,6 +93,60 @@ fn muxer_can_emit_video_and_aac_tracks() {
 }
 
 #[test]
+fn muxer_preserves_aac_leading_offset_with_an_edit_list() {
+    let path = std::env::temp_dir().join(format!(
+        "rustreplay_mux_audio_offset_{}_{}.mp4",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let video = HevcMp4Track {
+        width: 16,
+        height: 16,
+        duration_90k: 90_000,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+        samples: vec![HevcAccessUnit {
+            timestamp_90k: 0,
+            data: fake_hevc_annex_b_access_unit().into(),
+            is_sync: true,
+            discard_from_track: false,
+        }],
+    };
+    let audio = AacLcMp4Track {
+        sample_rate: 48_000,
+        channel_count: 2,
+        duration_ticks: 48_000,
+        samples: vec![
+            AacAccessUnit {
+                timestamp_ticks: 12_000,
+                duration_ticks: 1_024,
+                data: vec![0x21, 0x10, 0x04, 0x60].into(),
+            },
+            AacAccessUnit {
+                timestamp_ticks: 13_024,
+                duration_ticks: 1_024,
+                data: vec![0x21, 0x10, 0x04, 0x61].into(),
+            },
+        ],
+    };
+
+    let index = write_hevc_aac_mp4_with_index(&path, &video, Some(&audio)).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        index.audio_track.unwrap().samples[0].timestamp_ticks,
+        12_000
+    );
+    for needle in [b"edts".as_slice(), b"elst"] {
+        assert!(bytes.windows(needle.len()).any(|window| window == needle));
+    }
+}
+
+#[test]
 fn hevc_annex_b_detects_sync_and_extracts_parameter_sets() {
     let au = fake_hevc_annex_b_access_unit();
 

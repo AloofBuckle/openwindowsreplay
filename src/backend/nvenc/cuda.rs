@@ -17,6 +17,7 @@ type CuExternalSemaphore = *mut c_void;
 
 const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE: u32 = 6;
 const CUDA_EXTERNAL_MEMORY_DEDICATED: u32 = 0x01;
+const CUDA_ARRAY3D_SURFACE_LDST: u32 = 0x02;
 const CU_AD_FORMAT_UNSIGNED_INT8: u32 = 0x01;
 const CU_AD_FORMAT_UNSIGNED_INT16: u32 = 0x02;
 const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_KEYED_MUTEX: u32 = 7;
@@ -449,7 +450,7 @@ impl CudaPrimaryContext {
                     CU_AD_FORMAT_UNSIGNED_INT16
                 },
                 num_channels: 1,
-                flags: 0,
+                flags: CUDA_ARRAY3D_SURFACE_LDST,
             },
             num_levels: 1,
             reserved: [0; 16],
@@ -682,10 +683,46 @@ struct CudaPendingFrame {
 }
 
 struct CudaPersistentInput {
-    mapped: NvencMappedInputResource,
+    mapped: Option<NvencMappedInputResource>,
     registered: NvencRegisteredResource,
     external: CudaExternalTexture,
     key_owned: bool,
+}
+
+impl CudaPersistentInput {
+    unsafe fn unmap_for_reuse(
+        &mut self,
+        input_format: NvencD3d11InputFormat,
+    ) -> Result<(), BackendError> {
+        let mut mapped = self.mapped.take().ok_or_else(|| {
+            BackendError::unsupported(
+                "NVENC CUDA mapped input",
+                input_format.label(),
+                "输入完成时找不到对应的 mapped resource",
+            )
+        })?;
+        let status = mapped.unmap_now();
+        if status == NV_ENC_SUCCESS {
+            Ok(())
+        } else {
+            Err(BackendError::unsupported(
+                "NVENC CUDA mapped input",
+                input_format.label(),
+                format!("NvEncUnmapInputResource status={status}"),
+            ))
+        }
+    }
+
+    unsafe fn release_key(&mut self) -> Result<(), BackendError> {
+        if !self.key_owned {
+            return Ok(());
+        }
+        let result = self.external.signal_key(0);
+        if result.is_ok() {
+            self.key_owned = false;
+        }
+        result
+    }
 }
 
 pub(crate) struct NvencCudaInteropEncoder {
@@ -834,7 +871,7 @@ impl NvencCudaInteropEncoder {
                         return Err(err);
                     }
                 };
-                let mut registered = match register_cuda_array_input(
+                let registered = match register_cuda_array_input(
                     &self.api,
                     self.session.encoder,
                     external.array(),
@@ -848,19 +885,10 @@ impl NvencCudaInteropEncoder {
                         return Err(err);
                     }
                 };
-                let mapped = match map_input_resource(&self.api, self.session.encoder, &registered)
-                {
-                    Ok(mapped) => mapped,
-                    Err(err) => {
-                        let _ = registered.unregister_now();
-                        self.free_bitstreams.push(bitstream);
-                        return Err(err);
-                    }
-                };
                 self.registered_inputs.insert(
                     texture_key,
                     CudaPersistentInput {
-                        mapped,
+                        mapped: None,
                         registered,
                         external,
                         key_owned: false,
@@ -890,10 +918,32 @@ impl NvencCudaInteropEncoder {
                 return Err(err);
             }
             input.key_owned = true;
+            let mapped =
+                match map_input_resource(&self.api, self.session.encoder, &input.registered) {
+                    Ok(mapped) => mapped,
+                    Err(err) => {
+                        let release_result = input.release_key();
+                        self.free_bitstreams.push(bitstream);
+                        return match release_result {
+                            Ok(()) => Err(err),
+                            Err(release_err) => Err(BackendError::unsupported(
+                                "NVENC CUDA map cleanup",
+                                self.input_format.label(),
+                                format!(
+                                    "输入 map 失败：{err}；keyed mutex 释放也失败：{release_err}"
+                                ),
+                            )),
+                        };
+                    }
+                };
+            input.mapped = Some(mapped);
             let status = match encode_one_d3d11_frame(
                 &self.api,
                 self.session.encoder,
-                &input.mapped,
+                input
+                    .mapped
+                    .as_ref()
+                    .expect("mapped input was stored immediately above"),
                 &bitstream,
                 self.width,
                 self.height,
@@ -904,17 +954,27 @@ impl NvencCudaInteropEncoder {
             ) {
                 Ok(status) => status,
                 Err(err) => {
-                    let release_result = input.external.signal_key(0);
-                    if release_result.is_ok() {
-                        input.key_owned = false;
-                    }
+                    let unmap_result = input.unmap_for_reuse(self.input_format);
+                    let release_result = input.release_key();
                     self.free_bitstreams.push(bitstream);
-                    return match release_result {
-                        Ok(()) => Err(err),
-                        Err(release_err) => Err(BackendError::unsupported(
+                    return match (unmap_result, release_result) {
+                        (Ok(()), Ok(())) => Err(err),
+                        (Err(unmap_err), Ok(())) => Err(BackendError::unsupported(
+                            "NVENC CUDA submit cleanup",
+                            self.input_format.label(),
+                            format!("编码提交失败：{err}；输入 unmap 也失败：{unmap_err}"),
+                        )),
+                        (Ok(()), Err(release_err)) => Err(BackendError::unsupported(
                             "NVENC CUDA submit cleanup",
                             self.input_format.label(),
                             format!("编码提交失败：{err}；keyed mutex 释放也失败：{release_err}"),
+                        )),
+                        (Err(unmap_err), Err(release_err)) => Err(BackendError::unsupported(
+                            "NVENC CUDA submit cleanup",
+                            self.input_format.label(),
+                            format!(
+                                "编码提交失败：{err}；输入 unmap 失败：{unmap_err}；keyed mutex 释放失败：{release_err}"
+                            ),
                         )),
                     };
                 }
@@ -975,13 +1035,12 @@ impl NvencCudaInteropEncoder {
                     "延迟输出完成时找不到对应 CUDA/NVENC 输入",
                 )
             })?;
-        let signal_result = input.external.signal_key(0);
-        if signal_result.is_ok() {
-            input.key_owned = false;
-        }
+        let unmap_result = input.unmap_for_reuse(self.input_format);
+        let signal_result = input.release_key();
         self.free_bitstreams.push(bitstream);
 
         let output = output_result?;
+        unmap_result?;
         signal_result?;
         if output.output_timestamp_90k != timestamp_90k {
             return Err(BackendError::unsupported(
@@ -1023,16 +1082,15 @@ impl NvencCudaInteropEncoder {
         }
         let mut failures = Vec::new();
         for (_, mut input) in self.registered_inputs.drain() {
-            if input.key_owned {
-                if let Err(err) = unsafe { input.external.signal_key(0) } {
-                    failures.push(format!("CUDA keyed-mutex release: {err}"));
-                } else {
-                    input.key_owned = false;
-                }
+            if input.mapped.is_some()
+                && let Err(err) = unsafe { input.unmap_for_reuse(self.input_format) }
+            {
+                failures.push(format!("CUDA mapped input release: {err}"));
             }
-            let unmap_status = unsafe { input.mapped.unmap_now() };
-            if unmap_status != NV_ENC_SUCCESS {
-                failures.push(format!("NvEncUnmapInputResource status={unmap_status}"));
+            if input.key_owned
+                && let Err(err) = unsafe { input.release_key() }
+            {
+                failures.push(format!("CUDA keyed-mutex release: {err}"));
             }
             let unregister_status = unsafe { input.registered.unregister_now() };
             if unregister_status != NV_ENC_SUCCESS {
@@ -1136,7 +1194,9 @@ impl Drop for NvencCudaInteropEncoder {
                 bitstream.abandon();
             }
             for input in self.registered_inputs.values_mut() {
-                input.mapped.abandon();
+                if let Some(mapped) = input.mapped.as_mut() {
+                    mapped.abandon();
+                }
                 input.registered.abandon();
                 if input.key_owned && input.external.signal_key(0).is_ok() {
                     input.key_owned = false;

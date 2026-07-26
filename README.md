@@ -2,16 +2,16 @@
 
 RustReplay 是一个 Windows 桌面即时回放程序，GUI 使用 `egui/eframe`。成品后端按 **GPU-only raw frame path** 约束工作：捕获输出、色彩转换、色度写入、硬编码器输入前的未编码视频帧都必须保持在同一 DXGI adapter 的 D3D11 纹理路径上。
 
-> NVENC fork 说明：本副本目标是在保留现有 oneVPL 自动适配能力的前提下增加 NVIDIA NVENC 后端，并由能力探测自动区分 oneVPL/NVENC。当前已生产化 4:2:0 NV12/P010 与 SDR 8-bit 4:4:4 AYUV 路径：DDA/WGC GPU texture → GPU route converter → NVENC D3D11 registered resource → HEVC → encoded ring/MP4。oneVPL 仍优先；当 oneVPL 不能形成生产路径而 NVENC 可用时自动选择 NVENC。进度见 `docs/nvenc.md`。
+> NVENC fork 说明：本副本在保留 oneVPL 自动适配能力的前提下增加 NVIDIA NVENC 后端，并由能力探测自动区分 oneVPL/NVENC。DDA/WGC 已生产化 4:2:0 NV12/P010、SDR 8-bit 4:4:4 AYUV，以及经 CUDA external-memory 输入的 4:2:2/4:4:4 路径；支持的 NVIDIA HDR 环境还可显式切换到 NvFBC D3D9Ex 专用捕获。oneVPL 仍优先；当 oneVPL 不能形成生产路径而 NVENC 可用时自动选择 NVENC。进度见 `docs/nvenc.md`。
 
 当前成品范围：
 
 - 启动即打开中文 GUI；不保留调试命令行、无窗口探测或自检入口。
-- GUI：开始/保存/停止即时回放、DDA/WGC 捕获后端、色度采样、oneVPL/NVENC 通用 RateControlMethod 引导式参数、循环缓存目录/保存目录/回放时长、双日志区。
+- GUI：开始/保存/停止即时回放、DDA/WGC 通用捕获与可用时的 NvFBC 专用捕获、色度采样、oneVPL/NVENC 通用 RateControlMethod 引导式参数、循环缓存目录/保存目录/回放时长、双日志区。
 - 启动能力探测：DXGI adapter LUID、oneVPL dispatcher/implementation、NVENC API/adapter、HEVC profile、输入 FourCC/format、RateControlMethod、当前显示器可生产路线。
 - 前端规则：当前机器/路径不可用的字段直接隐藏；详细原因写入日志。配置自动保存到 `%ProgramData%\OneVPL Replay\config.json`。
 - NVENC 原始调参：仅在 NVENC 成为 active backend 且当前色度有生产路线时显示。Preset 主标签直接使用 P1-P7；`splitEncodeMode` 与 `multiPass` 使用人话名称并保留 SDK 常量/原始值；Spatial AQ 直接控制 `enableAQ`。`splitEncodeMode` 暴露全部 0/1/2/3/4/15，GPU engine 数只用于说明实际条带数。额外调参不暴露 Temporal AQ 或 AQ strength。
-- 视频生产路线：DDA texture 或 WGC BGRA8/FP16 → GPU shader/VideoProcessor 转换到目标 FourCC/format → oneVPL D3D11 surface 或 NVENC D3D11 registered resource → HEVC → MP4。
+- 视频生产路线：DDA texture 或 WGC BGRA8/FP16 → GPU shader/VideoProcessor 转换到目标 FourCC/format → oneVPL D3D11 surface 或 NVENC D3D11/CUDA registered resource → HEVC → MP4；NvFBC 专用模式使用 NvFBC → D3D9Ex surface → NVENC。
 - 发布规则：oneVPL dispatcher 及其用户态运行库内嵌于 `rust_replay.exe`，启动时释放到 `%ProgramData%\OneVPL Replay\`；NVENC 使用 NVIDIA 驱动提供的 `nvEncodeAPI64.dll`。发布目录不携带 DLL，GPU 驱动、D3D11、Media Foundation 仍是系统/驱动前提。
 - 色彩策略：按当前显示器状态与 DDA/WGC 实际给到的数据动态推导 primaries/transfer/matrix/range；range 不固化为 full 或 limited。未实现或不能保证的桌面模式返回 `UnsupportedGpuPath`，原因包含 `不支持的桌面模式`，不会伪装降级。
 - 位深策略：丢弃 12-bit 路线，只保留内部 8-bit / 10-bit。
