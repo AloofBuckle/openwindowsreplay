@@ -421,7 +421,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
         let mut first_sample_timestamp_90k: Option<u64> = None;
         let mut first_video_timestamp_100ns: Option<i64> = None;
         let mut last_submitted_sample_timestamp_90k: Option<u64> = None;
-        let mut last_forced_idr_timestamp_90k: Option<u64> = None;
+        let mut idr_scheduler = SourceTimedIdrScheduler::default();
         let capture_duration = Duration::from_secs_f32(duration_seconds.max(0.1));
         let requested_duration_90k =
             (duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64;
@@ -749,14 +749,10 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                                     *first_sample_timestamp_90k.get_or_insert(timestamp_90k);
                                 let sample_ts90 = timestamp_90k.saturating_sub(first_ts);
                                 last_submitted_sample_timestamp_90k = Some(sample_ts90);
-                                let idr_reference = encoded_stats
-                                    .last_sync_timestamp_90k
-                                    .or(last_forced_idr_timestamp_90k);
-                                let force_idr =
-                                    should_force_source_timed_idr(idr_reference, sample_ts90);
-                                if force_idr {
-                                    last_forced_idr_timestamp_90k = Some(sample_ts90);
-                                }
+                                let force_idr = idr_scheduler.should_force(
+                                    encoded_stats.last_sync_timestamp_90k,
+                                    sample_ts90,
+                                );
                                 (sample_ts90, force_idr, false)
                             };
 
@@ -952,6 +948,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                         audio_frames,
                         first_video_timestamp_100ns,
                         duration_90k,
+                        None,
                         &mut notes,
                         &mut encoded_sink,
                         sink_push_from_ticks,
@@ -975,6 +972,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
                     let track = capture.finish_streaming(
                         first_video_timestamp_100ns,
                         duration_90k,
+                        None,
                         &mut encoded_sink,
                         &mut notes,
                     )?;
@@ -991,6 +989,7 @@ pub(super) fn record_nvenc_d3d11_onecopy_mp4_impl(
             width: capture_width,
             height: capture_height,
             duration_90k,
+            presentation_duration_100ns: None,
             color: record_route.mp4_color,
             codec: record_route.mp4_codec,
             samples,

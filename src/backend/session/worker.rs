@@ -1,5 +1,45 @@
 use super::*;
 
+pub(super) const MAX_CONSECUTIVE_DISPLAY_RECONFIGURES: u32 = 8;
+const DISPLAY_RECONFIGURE_INITIAL_BACKOFF_MS: u64 = 200;
+const DISPLAY_RECONFIGURE_MAX_BACKOFF_MS: u64 = 5_000;
+const DISPLAY_RECONFIGURE_STABLE_RUN: Duration = Duration::from_secs(30);
+
+pub(super) fn display_reconfigure_backoff(consecutive_reconfigures: u32) -> Duration {
+    let shift = consecutive_reconfigures.saturating_sub(1).min(31);
+    let multiplier = 1u64 << shift;
+    Duration::from_millis(
+        DISPLAY_RECONFIGURE_INITIAL_BACKOFF_MS
+            .saturating_mul(multiplier)
+            .min(DISPLAY_RECONFIGURE_MAX_BACKOFF_MS),
+    )
+}
+
+pub(super) fn next_display_reconfigure_count(
+    previous_count: u32,
+    last_attempt_duration: Duration,
+) -> u32 {
+    if last_attempt_duration >= DISPLAY_RECONFIGURE_STABLE_RUN {
+        1
+    } else {
+        previous_count.saturating_add(1)
+    }
+}
+
+fn wait_for_reconfigure_backoff(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_recording_worker(
     request: pipeline::RecordingRequest,
@@ -25,6 +65,7 @@ pub(super) fn run_recording_worker(
         .map(|store| DiskSegmentWriter::spawn(store, tx.clone(), stop_flag.clone()));
     let requested_chroma = request.chroma_writer.chroma();
     let mut run_index = 0u64;
+    let mut consecutive_display_reconfigures = 0u32;
     let mut terminal_error = None;
     'recording: while !stop_flag.load(Ordering::Relaxed) {
         let Some(record_target) =
@@ -53,6 +94,7 @@ pub(super) fn run_recording_worker(
             run_index
         ));
 
+        let record_attempt_started = Instant::now();
         let (result, mut sink) = {
             let mut sink = match buffer_mode {
                 ReplayBufferMode::Memory => {
@@ -111,6 +153,7 @@ pub(super) fn run_recording_worker(
                     terminal_error = Some(failure.to_owned());
                     break;
                 }
+                consecutive_display_reconfigures = 0;
                 if let ReplayRecordSink::Memory(_) = sink {
                     let report = recorded.report;
                     let (snapshot, ring_packets, ring_bytes) = encoded_ring
@@ -156,17 +199,27 @@ pub(super) fn run_recording_worker(
                 }
                 if err.is_reconfigure_required() {
                     sink.abort();
+                    consecutive_display_reconfigures = next_display_reconfigure_count(
+                        consecutive_display_reconfigures,
+                        record_attempt_started.elapsed(),
+                    );
+                    if consecutive_display_reconfigures >= MAX_CONSECUTIVE_DISPLAY_RECONFIGURES {
+                        terminal_error = Some(format!(
+                            "显示环境连续 {} 次要求重配，已停止自动重启以避免无限循环；最后错误：{err}",
+                            consecutive_display_reconfigures
+                        ));
+                        break;
+                    }
+                    let backoff = display_reconfigure_backoff(consecutive_display_reconfigures);
                     let _ = tx.send(ReplayEvent::BackendStatus {
                         index: run_index,
-                        message: format!("显示环境变化，重新执行能力探测后重启录制段：{err}"),
+                        message: format!(
+                            "显示环境变化（连续第 {} 次），等待 {:.1}s 后重新探测并重启录制段：{err}",
+                            consecutive_display_reconfigures,
+                            backoff.as_secs_f32()
+                        ),
                     });
-                    for _ in 0..20 {
-                        if stop_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    if stop_flag.load(Ordering::Relaxed) {
+                    if wait_for_reconfigure_backoff(&stop_flag, backoff) {
                         break;
                     }
                     caps = crate::backend::probe_all();
@@ -296,8 +349,9 @@ impl SessionRingSink {
     pub(super) fn finish_success(&mut self, recorded: &super::vpl::VplOneCopyRecordOutput) {
         if self.started {
             if let Ok(mut ring) = self.ring.lock() {
-                ring.finish_segment_with_audio_duration(
+                ring.finish_segment_with_audio_and_presentation_duration(
                     recorded.video_track.duration_90k,
+                    recorded.video_track.presentation_duration_100ns,
                     recorded
                         .audio_track
                         .as_ref()

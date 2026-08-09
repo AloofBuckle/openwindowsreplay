@@ -6,7 +6,12 @@
 
 use crate::rate_control::RateControlConfig;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -101,7 +106,7 @@ impl AppConfig {
         }
         let text =
             serde_json::to_string_pretty(self).map_err(|err| format!("序列化配置失败：{err}"))?;
-        std::fs::write(&path, text)
+        write_file_atomically(&path, text.as_bytes())
             .map_err(|err| format!("写入配置文件 {} 失败：{err}", path.display()))
     }
 
@@ -433,6 +438,90 @@ impl ChromaSampling {
     }
 }
 
+fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_file_atomically_with_replace(path, contents, replace_file_atomically)
+}
+
+fn write_file_atomically_with_replace(
+    path: &Path,
+    contents: &[u8],
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (temp_path, mut temp_file) = create_atomic_temp_file(path)?;
+    let write_result = temp_file
+        .write_all(contents)
+        .and_then(|()| temp_file.flush())
+        .and_then(|()| temp_file.sync_all());
+    drop(temp_file);
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = replace(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn create_atomic_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    for _ in 0..100 {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法为配置文件创建唯一临时文件",
+    ))
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source_wide.as_ptr()),
+            PCWSTR(destination_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|err| io::Error::other(format!("MoveFileExW 原子替换失败：{err}")))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +555,45 @@ mod tests {
 
         assert_eq!(restored.capture_mode, CaptureMode::DedicatedNvFbc);
         assert_eq!(restored.capture_backend, CaptureBackend::Dda);
+    }
+
+    #[test]
+    fn atomic_config_write_replaces_existing_file() {
+        let dir = config_test_dir("replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"old config").unwrap();
+
+        write_file_atomically(&path, b"new config").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new config");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_atomic_config_replace_preserves_old_file_and_removes_temp() {
+        let dir = config_test_dir("replace_failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"known-good config").unwrap();
+
+        let error = write_file_atomically_with_replace(&path, b"partial new config", |_, _| {
+            Err(io::Error::other("injected replacement failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected replacement failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"known-good config");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn config_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rustreplay_config_{name}_{}_{}",
+            std::process::id(),
+            CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }

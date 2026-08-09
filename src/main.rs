@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod config;
+mod cpu_placement;
 mod embedded_vpl;
 mod error;
 mod hotkey;
@@ -27,6 +28,9 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     wait_for_relaunch_parent();
+    if let Some(status) = cpu_placement::initialize_from_env() {
+        eprintln!("RustReplay {status}");
+    }
     set_process_dpi_awareness();
     let Some(single_instance) =
         single_instance::SingleInstance::acquire().map_err(|err| anyhow::anyhow!(err))?

@@ -14,6 +14,7 @@ use crate::error::BackendError;
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use std::collections::VecDeque;
     use std::mem::ManuallyDrop;
     use std::ptr;
     use windows::Win32::Media::MediaFoundation::{
@@ -32,13 +33,23 @@ mod platform {
 
     const HNS_PER_SECOND: i64 = 10_000_000;
     const DEFAULT_AAC_BITRATE: u32 = 192_000;
+    const MAX_DRAIN_NO_PROGRESS: usize = 8;
+    const PRIME_SILENCE_BLOCKS: u32 = 4;
 
     pub struct MfAacLcEncoder {
         transform: IMFTransform,
         output_buffer_size: u32,
         provides_output_samples: bool,
         input_format: EncoderPcmInputFormat,
+        pending_timestamps: VecDeque<PendingTimestamp>,
+        transport_offset_ticks: u64,
         _mf: MfPlatformGuard,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct PendingTimestamp {
+        transport_ticks: u64,
+        presentation_ticks: Option<u64>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +118,8 @@ mod platform {
                     output_buffer_size: stream_info.cbSize.max(4096),
                     provides_output_samples,
                     input_format,
+                    pending_timestamps: VecDeque::new(),
+                    transport_offset_ticks: 0,
                     _mf: mf,
                 })
             }
@@ -116,6 +129,51 @@ mod platform {
             &mut self,
             block: &AacPcmBlock,
         ) -> Result<Vec<AacAccessUnit>, BackendError> {
+            let transport_ticks = block
+                .timestamp_ticks
+                .checked_add(self.transport_offset_ticks)
+                .ok_or_else(|| BackendError::AudioUnsupported {
+                    reason: format!(
+                        "AAC transport timestamp 溢出: presentation={} offset={}",
+                        block.timestamp_ticks, self.transport_offset_ticks
+                    ),
+                })?;
+            self.submit_block(block, transport_ticks, Some(block.timestamp_ticks))?;
+            self.drain_available_output(false)
+        }
+
+        /// Warm the Media Foundation transform before live capture begins without
+        /// exposing the discarded AAC access units on the presentation timeline.
+        pub fn prime_silence(&mut self) -> Result<u32, BackendError> {
+            if self.transport_offset_ticks != 0 || !self.pending_timestamps.is_empty() {
+                return Err(BackendError::AudioUnsupported {
+                    reason: "AAC encoder 只能在正式输入前预热一次".to_owned(),
+                });
+            }
+            for index in 0..PRIME_SILENCE_BLOCKS {
+                let transport_ticks = u64::from(index) * AAC_LC_FRAME_SAMPLES as u64;
+                let block = AacPcmBlock {
+                    timestamp_ticks: transport_ticks,
+                    interleaved: vec![0.0; AAC_LC_FRAME_SAMPLES * usize::from(TARGET_CHANNELS)],
+                };
+                self.submit_block(&block, transport_ticks, None)?;
+                let discarded = self.drain_available_output(false)?;
+                debug_assert!(discarded.is_empty());
+            }
+            self.transport_offset_ticks = u64::from(PRIME_SILENCE_BLOCKS)
+                .checked_mul(AAC_LC_FRAME_SAMPLES as u64)
+                .ok_or_else(|| BackendError::AudioUnsupported {
+                    reason: "AAC prime transport offset 溢出".to_owned(),
+                })?;
+            Ok(PRIME_SILENCE_BLOCKS)
+        }
+
+        fn submit_block(
+            &mut self,
+            block: &AacPcmBlock,
+            transport_ticks: u64,
+            presentation_ticks: Option<u64>,
+        ) -> Result<(), BackendError> {
             if block.interleaved.len() != AAC_LC_FRAME_SAMPLES * usize::from(TARGET_CHANNELS) {
                 return Err(BackendError::AudioUnsupported {
                     reason: format!(
@@ -124,13 +182,17 @@ mod platform {
                     ),
                 });
             }
-            let sample = make_input_sample(block, self.input_format)?;
+            let sample = make_input_sample(block, transport_ticks, self.input_format)?;
             unsafe {
                 self.transform
                     .ProcessInput(0, &sample, 0)
                     .map_err(windows_audio_error("IMFTransform::ProcessInput(AAC)"))?;
             }
-            self.drain_available_output(false)
+            self.pending_timestamps.push_back(PendingTimestamp {
+                transport_ticks,
+                presentation_ticks,
+            });
+            Ok(())
         }
 
         pub fn finish(mut self) -> Result<Vec<AacAccessUnit>, BackendError> {
@@ -142,7 +204,16 @@ mod platform {
                     .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
                     .map_err(windows_audio_error("IMFTransform::DRAIN"))?;
             }
-            self.drain_available_output(true)
+            let output = self.drain_available_output(true)?;
+            if !self.pending_timestamps.is_empty() {
+                return Err(BackendError::AudioUnsupported {
+                    reason: format!(
+                        "Media Foundation AAC drain 后仍有 {} 个输入时间戳没有对应输出",
+                        self.pending_timestamps.len()
+                    ),
+                });
+            }
+            Ok(output)
         }
 
         fn drain_available_output(
@@ -150,35 +221,47 @@ mod platform {
             draining: bool,
         ) -> Result<Vec<AacAccessUnit>, BackendError> {
             let mut out = Vec::new();
+            let mut no_progress = 0usize;
             loop {
                 match self.process_output_once() {
-                    Ok(Some(unit)) => out.push(unit),
-                    Ok(None) => {
-                        if draining {
-                            continue;
-                        }
-                        break;
+                    Ok(MfOutput::Unit(unit)) => {
+                        no_progress = 0;
+                        out.push(unit);
                     }
-                    Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                    Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    Ok(MfOutput::Discarded) => {
+                        no_progress = 0;
+                    }
+                    Ok(MfOutput::NoSample) if draining => {
+                        no_progress = no_progress.saturating_add(1);
+                        if no_progress >= MAX_DRAIN_NO_PROGRESS {
+                            return Err(BackendError::AudioUnsupported {
+                                reason: format!(
+                                    "Media Foundation AAC drain 连续 {no_progress} 次成功但没有输出，已中止以避免停止路径死循环"
+                                ),
+                            });
+                        }
+                    }
+                    Ok(MfOutput::NoSample | MfOutput::NeedMoreInput) => break,
+                    Ok(MfOutput::StreamChange) => {
                         return Err(BackendError::AudioUnsupported {
                             reason: "Media Foundation AAC encoder 请求 stream change；当前固定 AAC LC 输出类型未实现动态重协商".to_owned(),
                         });
                     }
-                    Err(err) => {
-                        return Err(windows_audio_error("IMFTransform::ProcessOutput(AAC)")(err));
-                    }
+                    Err(err) => return Err(err),
                 }
             }
             Ok(out)
         }
 
-        fn process_output_once(&mut self) -> Result<Option<AacAccessUnit>, windows::core::Error> {
+        fn process_output_once(&mut self) -> Result<MfOutput, BackendError> {
             unsafe {
                 let sample = if self.provides_output_samples {
                     None
                 } else {
-                    Some(make_empty_output_sample(self.output_buffer_size)?)
+                    Some(
+                        make_empty_output_sample(self.output_buffer_size)
+                            .map_err(windows_audio_error("MFCreateSample(AAC output)"))?,
+                    )
                 };
                 let mut output = MFT_OUTPUT_DATA_BUFFER {
                     dwStreamID: 0,
@@ -192,26 +275,82 @@ mod platform {
                         .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
                 let maybe_sample = ManuallyDrop::take(&mut output.pSample);
                 let _ = ManuallyDrop::take(&mut output.pEvents);
-                result?;
-                let Some(sample) = maybe_sample else {
-                    return Ok(None);
-                };
-                let data = copy_sample_bytes(&sample)?;
-                if data.is_empty() {
-                    return Ok(None);
+                if let Err(err) = result {
+                    return if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
+                        Ok(MfOutput::NeedMoreInput)
+                    } else if err.code() == MF_E_TRANSFORM_STREAM_CHANGE {
+                        Ok(MfOutput::StreamChange)
+                    } else {
+                        Err(windows_audio_error("IMFTransform::ProcessOutput(AAC)")(err))
+                    };
                 }
-                let timestamp_100ns = sample.GetSampleTime().unwrap_or(0).max(0);
-                let duration_100ns = sample
-                    .GetSampleDuration()
-                    .unwrap_or_else(|_| ticks_to_100ns(AAC_LC_FRAME_SAMPLES as u64))
-                    .max(1);
-                Ok(Some(AacAccessUnit {
-                    timestamp_ticks: time_100ns_to_ticks(timestamp_100ns),
-                    duration_ticks: time_100ns_to_ticks(duration_100ns).max(1) as u32,
-                    data: data.into(),
-                }))
+                let Some(sample) = maybe_sample else {
+                    return Ok(MfOutput::NoSample);
+                };
+                let data = copy_sample_bytes(&sample)
+                    .map_err(windows_audio_error("IMFSample AAC output buffer"))?;
+                if data.is_empty() {
+                    return Ok(MfOutput::NoSample);
+                }
+                let pending = self.pending_timestamps.pop_front().ok_or_else(|| {
+                    BackendError::AudioUnsupported {
+                        reason: "Media Foundation AAC 输出没有对应的已提交源时间戳".to_owned(),
+                    }
+                })?;
+                if let Ok(output_timestamp_100ns) = sample.GetSampleTime() {
+                    if output_timestamp_100ns < 0 {
+                        return Err(BackendError::AudioUnsupported {
+                            reason: format!(
+                                "Media Foundation AAC 输出负时间戳: {output_timestamp_100ns}"
+                            ),
+                        });
+                    }
+                    let output_ticks = time_100ns_to_ticks(output_timestamp_100ns);
+                    if output_ticks.abs_diff(pending.transport_ticks) > 1 {
+                        return Err(BackendError::AudioUnsupported {
+                            reason: format!(
+                                "Media Foundation AAC 输出 PTS 与 transport ledger 不匹配: source_ticks={} mft_ticks={output_ticks}",
+                                pending.transport_ticks
+                            ),
+                        });
+                    }
+                }
+                if let Ok(output_duration_100ns) = sample.GetSampleDuration() {
+                    if output_duration_100ns <= 0 {
+                        return Err(BackendError::AudioUnsupported {
+                            reason: format!(
+                                "Media Foundation AAC 输出 duration 非正数: {output_duration_100ns}"
+                            ),
+                        });
+                    }
+                    let output_duration_ticks = time_100ns_to_ticks(output_duration_100ns);
+                    if output_duration_ticks.abs_diff(AAC_LC_FRAME_SAMPLES as u64) > 1 {
+                        return Err(BackendError::AudioUnsupported {
+                            reason: format!(
+                                "Media Foundation AAC 输出 duration 与 AAC-LC frame 不匹配: expected_ticks={} mft_ticks={output_duration_ticks}",
+                                AAC_LC_FRAME_SAMPLES
+                            ),
+                        });
+                    }
+                }
+                Ok(match pending.presentation_ticks {
+                    Some(timestamp_ticks) => MfOutput::Unit(AacAccessUnit {
+                        timestamp_ticks,
+                        duration_ticks: AAC_LC_FRAME_SAMPLES as u32,
+                        data: data.into(),
+                    }),
+                    None => MfOutput::Discarded,
+                })
             }
         }
+    }
+
+    enum MfOutput {
+        Unit(AacAccessUnit),
+        Discarded,
+        NoSample,
+        NeedMoreInput,
+        StreamChange,
     }
 
     fn create_aac_encoder_mft() -> Result<IMFTransform, BackendError> {
@@ -331,6 +470,7 @@ mod platform {
 
     fn make_input_sample(
         block: &AacPcmBlock,
+        timestamp_ticks: u64,
         input_format: EncoderPcmInputFormat,
     ) -> Result<IMFSample, BackendError> {
         unsafe {
@@ -359,7 +499,7 @@ mod platform {
                 .AddBuffer(&buffer)
                 .map_err(windows_audio_error("IMFSample::AddBuffer(input)"))?;
             sample
-                .SetSampleTime(ticks_to_100ns(block.timestamp_ticks))
+                .SetSampleTime(ticks_to_100ns(timestamp_ticks))
                 .map_err(windows_audio_error("IMFSample::SetSampleTime(input)"))?;
             sample
                 .SetSampleDuration(ticks_to_100ns(AAC_LC_FRAME_SAMPLES as u64))
@@ -425,6 +565,43 @@ mod platform {
             reason: format!("{func} 失败: HRESULT=0x{:08X} {}", err.code().0 as u32, err),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn media_foundation_aac_preprime_preserves_presentation_ledger() {
+            let mut encoder = MfAacLcEncoder::new().unwrap();
+            assert_eq!(encoder.prime_silence().unwrap(), PRIME_SILENCE_BLOCKS);
+
+            let mut output = Vec::new();
+            for index in 0..3 {
+                output.extend(
+                    encoder
+                        .encode_block(&AacPcmBlock {
+                            timestamp_ticks: index as u64 * AAC_LC_FRAME_SAMPLES as u64,
+                            interleaved: vec![
+                                0.0;
+                                AAC_LC_FRAME_SAMPLES * usize::from(TARGET_CHANNELS)
+                            ],
+                        })
+                        .unwrap(),
+                );
+            }
+            output.extend(encoder.finish().unwrap());
+
+            assert_eq!(output.len(), 3);
+            for (index, sample) in output.iter().enumerate() {
+                assert_eq!(
+                    sample.timestamp_ticks,
+                    index as u64 * AAC_LC_FRAME_SAMPLES as u64
+                );
+                assert_eq!(sample.duration_ticks, AAC_LC_FRAME_SAMPLES as u32);
+                assert!(!sample.data.is_empty());
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -445,6 +622,12 @@ impl MfAacLcEncoder {
         &mut self,
         _block: &AacPcmBlock,
     ) -> Result<Vec<AacAccessUnit>, BackendError> {
+        Err(BackendError::AudioUnsupported {
+            reason: "Media Foundation AAC encoder 仅支持 Windows".to_owned(),
+        })
+    }
+
+    pub fn prime_silence(&mut self) -> Result<u32, BackendError> {
         Err(BackendError::AudioUnsupported {
             reason: "Media Foundation AAC encoder 仅支持 Windows".to_owned(),
         })

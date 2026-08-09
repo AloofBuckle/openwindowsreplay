@@ -248,13 +248,13 @@ impl ReplayController {
         let chroma = validate_config(config, caps, capture_mode)?;
         let save_dir = PathBuf::from(&config.save_dir);
         fs::create_dir_all(&save_dir).map_err(|err| BackendError::Io(err.to_string()))?;
-        cleanup_stale_replay_parts(&save_dir)?;
+        let mut startup_warnings = cleanup_stale_replay_parts(&save_dir);
         let replay_duration =
             Duration::from_secs_f32((config.replay_minutes.max(0.1) * 60.0).max(1.0));
         let buffer_mode = config.replay_buffer_mode;
         let cache_dir = if buffer_mode.is_disk() {
             let cache_dir = PathBuf::from(&config.cache_dir);
-            DiskReplayStore::prepare_directory(&cache_dir)?;
+            startup_warnings.extend(DiskReplayStore::prepare_directory(&cache_dir)?);
             Some(cache_dir)
         } else {
             None
@@ -272,6 +272,12 @@ impl ReplayController {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker_stop = stop_flag.clone();
         let (tx, rx) = mpsc::channel();
+        for warning in startup_warnings {
+            let _ = tx.send(ReplayEvent::BackendStatus {
+                index: 0,
+                message: warning,
+            });
+        }
         let live_ring = (buffer_mode == ReplayBufferMode::Memory).then(|| {
             Arc::new(Mutex::new(EncodedReplayRing::new(
                 replay_duration + Duration::from_secs(5),
@@ -296,9 +302,15 @@ impl ReplayController {
         let worker_disk_store = disk_store.clone();
         let worker_disk_live_ring = disk_live_ring.clone();
         let worker_disk_live_run_index = disk_live_run_index.clone();
+        let placement_guard = crate::cpu_placement::activate_recording();
+        let placement_status = placement_guard.status().map(str::to_owned);
         let worker = thread::Builder::new()
             .name("rustreplay-recording-worker".to_owned())
             .spawn(move || {
+                let _placement_guard = placement_guard;
+                if let Some(message) = placement_status {
+                    let _ = tx.send(ReplayEvent::BackendStatus { index: 0, message });
+                }
                 run_recording_worker(
                     request,
                     caps,
@@ -403,10 +415,13 @@ impl ReplayController {
         }
 
         if let Some(store) = &self.disk_store {
-            let snapshot_with_cursor = store
+            let selected = store
                 .lock()
                 .map_err(|_| BackendError::Io("磁盘循环缓存锁已中毒".to_owned()))?
-                .snapshot_recent_tracks_after(replay_duration, self.disk_save_after)?;
+                .select_recent_segments_after(replay_duration, self.disk_save_after);
+            // SegmentMeta 的 lease 会在锁释放后阻止 prune 删除对应文件；sidecar
+            // 读取和轨道拼接不再占用 writer 的全局 store mutex。
+            let snapshot_with_cursor = DiskReplayStore::snapshot_selected_segments(selected)?;
             if let Some((snapshot, last_cursor)) = snapshot_with_cursor {
                 if snapshot.audio_track.is_some() {
                     write_replay_output_atomically(&dst, |path| {
@@ -522,21 +537,51 @@ fn write_replay_output_atomically(
     result
 }
 
-fn cleanup_stale_replay_parts(save_dir: &Path) -> Result<(), BackendError> {
-    for entry in fs::read_dir(save_dir).map_err(|err| BackendError::Io(err.to_string()))? {
-        let entry = entry.map_err(|err| BackendError::Io(err.to_string()))?;
+fn cleanup_stale_replay_parts(save_dir: &Path) -> Vec<String> {
+    cleanup_stale_replay_parts_older_than(save_dir, Duration::from_secs(60 * 60))
+}
+
+pub(super) fn cleanup_stale_replay_parts_older_than(
+    save_dir: &Path,
+    min_stale_age: Duration,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let entries = match fs::read_dir(save_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warnings.push(format!(
+                "枚举即时回放临时文件失败，已跳过清理：{}: {err}",
+                save_dir.display()
+            ));
+            return warnings;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warnings.push(format!("读取即时回放临时文件条目失败：{err}"));
+                continue;
+            }
+        };
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with("RustReplay_") && name.ends_with(".mp4.part") {
-            fs::remove_file(entry.path()).map_err(|err| {
-                BackendError::Io(format!(
-                    "清理残留即时回放临时文件 {} 失败：{err}",
+            let old_enough = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= min_stale_age);
+            if old_enough && let Err(err) = fs::remove_file(entry.path()) {
+                warnings.push(format!(
+                    "清理残留即时回放临时文件 {} 失败，已继续启动：{err}",
                     entry.path().display()
-                ))
-            })?;
+                ));
+            }
         }
     }
-    Ok(())
+    warnings
 }
 
 pub(super) fn validate_config(

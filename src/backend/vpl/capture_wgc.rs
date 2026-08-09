@@ -1,5 +1,28 @@
 use super::*;
 
+const WGC_EVENT_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+
+pub(super) fn wgc_event_wait_timeout(
+    coalesce_remaining: Option<std::time::Duration>,
+    deadline_remaining: std::time::Duration,
+) -> std::time::Duration {
+    let timeout = WGC_EVENT_WAIT_MAX.min(deadline_remaining);
+    coalesce_remaining.map_or(timeout, |remaining| timeout.min(remaining))
+}
+
+#[cfg(windows)]
+struct WgcFrameArrivedRegistration {
+    frame_pool: windows::Graphics::Capture::Direct3D11CaptureFramePool,
+    token: i64,
+}
+
+#[cfg(windows)]
+impl Drop for WgcFrameArrivedRegistration {
+    fn drop(&mut self) {
+        let _ = self.frame_pool.RemoveFrameArrived(self.token);
+    }
+}
+
 #[cfg(windows)]
 struct WgcCaptureJob {
     adapter1: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
@@ -184,7 +207,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
     use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use windows::Foundation::TimeSpan;
+    use windows::Foundation::{TimeSpan, TypedEventHandler};
     use windows::Graphics::Capture::{
         Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
         GraphicsCaptureSession,
@@ -199,7 +222,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
         CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     };
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-    use windows::core::Interface;
+    use windows::core::{IInspectable, Interface};
 
     struct WgcCaptureState {
         stats: CaptureStats,
@@ -289,9 +312,6 @@ pub(super) unsafe fn run_wgc_capture_thread(
         .GetDesc()
         .map_err(|err| win_err("IDXGIOutput::GetDesc(WGC record)", err))?;
     let display_refresh_hz = display_frequency_hz_from_output(&output_desc);
-    let minimum_source_interval_90k = display_refresh_hz
-        .map(minimum_source_interval_90k_for_refresh)
-        .unwrap_or(1);
     let wgc_coalesce_window_100ns = display_refresh_hz
         .map(wgc_coalesce_window_100ns_for_refresh)
         .unwrap_or(0);
@@ -361,7 +381,7 @@ pub(super) unsafe fn run_wgc_capture_thread(
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-    let frame_pool = Direct3D11CaptureFramePool::Create(
+    let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         pixel_format,
         wgc_frame_pool_size,
@@ -431,6 +451,19 @@ pub(super) unsafe fn run_wgc_capture_thread(
         );
     }
     let callback_state = Arc::new(Mutex::new(initial_state));
+    let (frame_arrived_tx, frame_arrived_rx) = std::sync::mpsc::sync_channel(1);
+    let frame_arrived_handler =
+        TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |_, _| {
+            let _ = frame_arrived_tx.try_send(());
+            Ok(())
+        });
+    let frame_arrived_token = frame_pool
+        .FrameArrived(&frame_arrived_handler)
+        .map_err(|err| win_err("Direct3D11CaptureFramePool::FrameArrived(WGC record)", err))?;
+    let frame_arrived_registration = WgcFrameArrivedRegistration {
+        frame_pool: frame_pool.clone(),
+        token: frame_arrived_token,
+    };
     session
         .StartCapture()
         .map_err(|err| win_err("GraphicsCaptureSession::StartCapture(WGC record)", err))?;
@@ -497,19 +530,6 @@ pub(super) unsafe fn run_wgc_capture_thread(
             && (state.pipeline_warmup_remaining > 0
                 || state.pipeline_warmup_stable_intervals
                     < pipeline_warmup_stable_intervals_required);
-        if !encoder_warmup_frame
-            && !pipeline_warmup_frame
-            && let (Some(origin_100ns), Some(previous_90k)) =
-                (state.timestamp_origin_100ns, state.last_timestamp_90k)
-            && wgc_timestamp_from_origin_90k(timestamp_100ns, origin_100ns)
-                .saturating_sub(previous_90k)
-                < minimum_source_interval_90k
-        {
-            state.stats.dropped_duplicate_timestamp += 1;
-            state.last_timestamp_100ns = Some(timestamp_100ns);
-            return Ok(());
-        }
-
         let surface = frame
             .Surface()
             .map_err(|err| win_err("Direct3D11CaptureFrame::Surface(WGC capture thread)", err))?;
@@ -645,15 +665,14 @@ pub(super) unsafe fn run_wgc_capture_thread(
 
         state.last_timestamp_100ns = Some(timestamp_100ns);
         let previous_timestamp_90k = state.last_timestamp_90k;
-        let mut timestamp_origin_100ns = state.timestamp_origin_100ns;
-        let mut last_timestamp_90k = state.last_timestamp_90k;
-        let timestamp_90k = wgc_relative_timestamp_90k(
+        let timestamp_origin_100ns = state.timestamp_origin_100ns.unwrap_or(timestamp_100ns);
+        let (timestamp_90k, _transport_adjustment_90k) = quantize_wgc_timestamp_90k(
             timestamp_100ns,
-            &mut timestamp_origin_100ns,
-            &mut last_timestamp_90k,
+            timestamp_origin_100ns,
+            previous_timestamp_90k,
         );
-        state.timestamp_origin_100ns = timestamp_origin_100ns;
-        state.last_timestamp_90k = last_timestamp_90k;
+        state.timestamp_origin_100ns = Some(timestamp_origin_100ns);
+        state.last_timestamp_90k = Some(timestamp_90k);
         let capture_index = state.capture_index;
         if state.record_wall_deadline.is_none() {
             state.record_wall_deadline = Some(
@@ -811,20 +830,36 @@ pub(super) unsafe fn run_wgc_capture_thread(
             }
         }
         let now = std::time::Instant::now();
-        let deadline_reached = {
+        let record_deadline = {
             let state = callback_state.lock().map_err(|_| {
                 "WGC callback state mutex poisoned while checking deadline".to_owned()
             })?;
-            state
-                .record_wall_deadline
-                .map(|deadline| now >= deadline)
-                .unwrap_or(now >= startup_deadline)
+            state.record_wall_deadline.unwrap_or(startup_deadline)
         };
-        if deadline_reached {
+        if now >= record_deadline {
             break;
         }
         if !polled_frame {
-            std::thread::sleep(std::time::Duration::from_micros(500));
+            let coalesce_remaining = pending_wgc_frame.as_ref().map(|frame| {
+                wgc_coalesce_window.saturating_sub(frame.coalesce_started_at.elapsed())
+            });
+            let wait_timeout = wgc_event_wait_timeout(
+                coalesce_remaining,
+                record_deadline.saturating_duration_since(std::time::Instant::now()),
+            );
+            if !wait_timeout.is_zero() {
+                match frame_arrived_rx.recv_timeout(wait_timeout) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if let Ok(mut state) = callback_state.lock() {
+                            state.error =
+                                Some("WGC FrameArrived event channel disconnected".to_owned());
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
         }
         while let Ok(slot) = free_rx.try_recv() {
             return_slot(slot)?;
@@ -846,6 +881,8 @@ pub(super) unsafe fn run_wgc_capture_thread(
     // Lookahead 合法持有输入槽位直到 recorder 随后的 EOS flush。这里等待全部槽位
     // 会与“先停止捕获线程、再 flush 编码器”的关闭顺序形成固定超时等待。
     let _ = session.Close();
+    drop(frame_arrived_registration);
+    drop(frame_arrived_handler);
     let _ = frame_pool.Close();
 
     let (error, mut stats) = {

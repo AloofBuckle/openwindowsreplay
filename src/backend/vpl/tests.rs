@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[test]
 fn fourcc_roundtrip() {
@@ -78,13 +79,42 @@ fn dll_candidates_include_env_first() {
 }
 
 #[test]
-fn wgc_timestamp_quantization_exposes_sub_tick_duplicates() {
+fn wgc_transport_ticks_do_not_replace_exact_source_pts() {
     assert_eq!(wgc_timestamp_from_origin_90k(1, 0), 0);
     assert_eq!(wgc_timestamp_from_origin_90k(55, 0), 0);
     assert_eq!(wgc_timestamp_from_origin_90k(56, 0), 1);
-    assert_eq!(minimum_source_interval_90k_for_refresh(240), 187);
-    assert_eq!(minimum_source_interval_90k_for_refresh(60), 750);
-    assert_eq!(minimum_source_interval_90k_for_refresh(0), 1);
+
+    assert_eq!(quantize_wgc_timestamp_90k(1, 0, None), (0, 0));
+    assert_eq!(quantize_wgc_timestamp_90k(55, 0, Some(0)), (1, 1));
+    assert_eq!(quantize_wgc_timestamp_90k(56, 0, Some(0)), (1, 0));
+
+    let mut timeline = PresentationTimestampTracker::default();
+    timeline.remember(0, 0, Some(1), Some(1)).unwrap();
+    timeline.remember(1, 1, Some(55), Some(1)).unwrap();
+    let mut first = crate::backend::mp4_mux::HevcAccessUnit {
+        timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
+        data: std::sync::Arc::<[u8]>::from([]),
+        is_sync: true,
+        discard_from_track: false,
+    };
+    let mut second = crate::backend::mp4_mux::HevcAccessUnit {
+        timestamp_90k: 1,
+        presentation_timestamp_100ns: None,
+        data: std::sync::Arc::<[u8]>::from([]),
+        is_sync: false,
+        discard_from_track: false,
+    };
+    timeline.attach(&mut first).unwrap();
+    timeline.attach(&mut second).unwrap();
+    timeline.finish().unwrap();
+    assert_eq!(first.presentation_timestamp_100ns, Some(0));
+    assert_eq!(second.presentation_timestamp_100ns, Some(54));
+    assert_eq!(timeline.presentation_duration_100ns(), Some(108));
+}
+
+#[test]
+fn wgc_coalesce_window_tracks_display_refresh() {
     assert_eq!(wgc_coalesce_window_100ns_for_refresh(240), 35_000);
     assert_eq!(wgc_coalesce_window_100ns_for_refresh(60), 140_000);
     assert_eq!(wgc_coalesce_window_100ns_for_refresh(0), 0);
@@ -93,6 +123,54 @@ fn wgc_timestamp_quantization_exposes_sub_tick_duplicates() {
         1_000_000, 1_035_000, 35_000
     ));
     assert!(!should_coalesce_wgc_timestamps(1_000_000, 999_999, 35_000));
+}
+
+#[test]
+fn delayed_warmup_output_cannot_enter_the_formal_source_timeline() {
+    let mut timeline = PresentationTimestampTracker::default();
+    timeline.remember_discard(0).unwrap();
+    timeline.remember_discard(1).unwrap();
+    timeline.remember(2, 0, Some(100), Some(100)).unwrap();
+
+    let mut delayed_warmup = crate::backend::mp4_mux::HevcAccessUnit {
+        timestamp_90k: 1,
+        presentation_timestamp_100ns: None,
+        data: std::sync::Arc::<[u8]>::from([]),
+        is_sync: true,
+        discard_from_track: false,
+    };
+    timeline.attach(&mut delayed_warmup).unwrap();
+    assert!(delayed_warmup.discard_from_track);
+
+    let mut first_formal = crate::backend::mp4_mux::HevcAccessUnit {
+        timestamp_90k: 2,
+        presentation_timestamp_100ns: None,
+        data: std::sync::Arc::<[u8]>::from([]),
+        is_sync: true,
+        discard_from_track: true,
+    };
+    timeline.attach(&mut first_formal).unwrap();
+    assert!(!first_formal.discard_from_track);
+    assert_eq!(first_formal.timestamp_90k, 0);
+    assert_eq!(first_formal.presentation_timestamp_100ns, Some(0));
+    assert_eq!(timeline.presentation_duration_100ns(), Some(1));
+    timeline.finish().unwrap();
+}
+
+#[test]
+fn wgc_event_wait_honors_coalesce_deadline_and_idle_cap() {
+    assert_eq!(
+        wgc_event_wait_timeout(None, Duration::from_secs(1)),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        wgc_event_wait_timeout(Some(Duration::from_millis(3)), Duration::from_secs(1)),
+        Duration::from_millis(3)
+    );
+    assert_eq!(
+        wgc_event_wait_timeout(Some(Duration::from_millis(30)), Duration::from_millis(2)),
+        Duration::from_millis(2)
+    );
 }
 
 #[test]
@@ -429,6 +507,59 @@ fn replay_idr_requests_are_bounded_by_source_pts_not_frame_count() {
 }
 
 #[test]
+fn delayed_encoder_uses_the_latest_completed_or_requested_idr_timestamp() {
+    assert_eq!(
+        latest_idr_timestamp_90k(Some(0), Some(450_000)),
+        Some(450_000)
+    );
+    assert_eq!(
+        latest_idr_timestamp_90k(Some(450_000), Some(0)),
+        Some(450_000)
+    );
+    assert_eq!(latest_idr_timestamp_90k(None, Some(450_000)), Some(450_000));
+    assert!(!should_force_source_timed_idr(
+        latest_idr_timestamp_90k(Some(0), Some(450_000)),
+        450_001,
+    ));
+
+    let mut scheduler = SourceTimedIdrScheduler::default();
+    assert!(scheduler.should_force(None, 0));
+    assert!(scheduler.should_force(Some(0), REPLAY_IDR_INTERVAL_90K));
+    assert!(!scheduler.should_force(Some(0), REPLAY_IDR_INTERVAL_90K + 1));
+    assert!(scheduler.should_force(Some(0), REPLAY_IDR_INTERVAL_90K * 2));
+}
+
+#[test]
+fn delayed_idr_scheduler_does_not_repeat_request_while_output_is_in_flight() {
+    let mut scheduler = SourceTimedIdrScheduler::default();
+    let mut completed_sync = None;
+    let timestamps = [
+        0,
+        REPLAY_IDR_INTERVAL_90K,
+        REPLAY_IDR_INTERVAL_90K + 1,
+        REPLAY_IDR_INTERVAL_90K + 2,
+        REPLAY_IDR_INTERVAL_90K + 3,
+        REPLAY_IDR_INTERVAL_90K * 2,
+    ];
+    let mut requests = Vec::new();
+    for (index, timestamp) in timestamps.into_iter().enumerate() {
+        let force = scheduler.should_force(completed_sync, timestamp);
+        if force {
+            requests.push(timestamp);
+        }
+        // Simulate an async encoder that does not publish the second IDR until
+        // after several later source frames have already been submitted.
+        if index == 4 {
+            completed_sync = Some(REPLAY_IDR_INTERVAL_90K);
+        }
+    }
+    assert_eq!(
+        requests,
+        vec![0, REPLAY_IDR_INTERVAL_90K, REPLAY_IDR_INTERVAL_90K * 2]
+    );
+}
+
+#[test]
 fn aligned_live_audio_chunks_keep_aac_timestamps_contiguous() {
     let mut blocker = crate::backend::audio::AacBlocker::default();
     let mut timestamps = Vec::new();
@@ -502,6 +633,279 @@ fn capture_pool_preserves_32_slots_for_4k_and_bounds_8k_cross_device_vram() {
         capture_pool_size_for_route(7_680, 4_320, VplRecordRoute::hdr_pq_y410(), false)
             > eight_k_shared
     );
+}
+
+#[test]
+fn direct_arc_async_output_survives_bitstream_pool_reuse() {
+    let expected = [0, 0, 0, 1, 0x26, 1, 2, 3, 4];
+    let data_offset = 7usize;
+    let mut storage = vec![0u8; 96];
+    storage[data_offset..data_offset + expected.len()].copy_from_slice(&expected);
+    let bitstream = MfxBitstream {
+        Data: storage.as_mut_ptr(),
+        DataOffset: data_offset as u32,
+        DataLength: expected.len() as u32,
+        TimeStamp: u64::MAX,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let flight = AsyncEncode {
+        bitstream,
+        storage,
+        syncp: ptr::null_mut(),
+        _ctrl: None,
+        timestamp_90k: 123,
+        is_sync: false,
+        discard: false,
+    };
+    let mut bitstream_pool = Vec::new();
+
+    let sample = unsafe { finish_synced_async_encode(flight, &mut bitstream_pool) }
+        .unwrap()
+        .unwrap();
+    assert_eq!(bitstream_pool.len(), 1);
+    bitstream_pool[0].fill(0xff);
+
+    assert_eq!(&*sample.data, expected.as_slice());
+    assert_eq!(sample.timestamp_90k, 123);
+}
+
+#[test]
+fn direct_arc_empty_async_output_returns_storage_without_a_sample() {
+    let storage = vec![0u8; 96];
+    let flight = AsyncEncode {
+        bitstream: unsafe { std::mem::zeroed() },
+        storage,
+        syncp: ptr::null_mut(),
+        _ctrl: None,
+        timestamp_90k: 123,
+        is_sync: false,
+        discard: false,
+    };
+    let mut bitstream_pool = Vec::new();
+
+    let sample = unsafe { finish_synced_async_encode(flight, &mut bitstream_pool) }.unwrap();
+
+    assert!(sample.is_none());
+    assert_eq!(bitstream_pool.len(), 1);
+}
+
+#[test]
+#[ignore = "需要 Intel oneVPL、D3D11 桌面会话、可捕获桌面、WASAPI 与 Media Foundation AAC"]
+fn local_onevpl_dda_record_smoke() {
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+    let probe = probe_vpl();
+    let route = probe
+        .current_display_routes
+        .iter()
+        .find(|route| route.chroma == ChromaSampling::Yuv420 && !route.fourcc.is_empty())
+        .expect("本机需要当前显示器对应的 oneVPL YUV420 production route");
+    let output_override = std::env::var_os("RUST_REPLAY_VPL_SMOKE_OUTPUT");
+    let keep_output = output_override.is_some();
+    let output = output_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("rustreplay_onevpl_dda_record_smoke.mp4"));
+    let duration_seconds = std::env::var("RUST_REPLAY_VPL_SMOKE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.1)
+        .unwrap_or(5.0);
+    let rate_control = RateControlConfig {
+        method: RateControlMethod::Cbr,
+        target_kbps: 130_000,
+        brc_param_multiplier: 2,
+        ..RateControlConfig::default()
+    };
+
+    let recorded = record_d3d11_onecopy_mp4_output_with_route_cancelable(
+        route.adapter_index,
+        &output,
+        duration_seconds,
+        &rate_control,
+        ChromaSampling::Yuv420,
+        None,
+        Some(route),
+    )
+    .unwrap();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&recorded.report).unwrap()
+    );
+    println!("onevpl_smoke_output={}", output.display());
+    assert!(recorded.report.captured_frames > 0);
+    assert!(recorded.report.encoded_samples > 0);
+    assert!(recorded.report.encoded_bytes > 0);
+    assert!(recorded.report.audio_access_units > 0);
+    assert!(recorded.report.audio_encoded_bytes > 0);
+    assert!(
+        output.metadata().expect("oneVPL smoke MP4 metadata").len() > 0,
+        "应写出非空 oneVPL HEVC/AAC MP4"
+    );
+    if !keep_output {
+        let _ = std::fs::remove_file(output);
+    }
+}
+
+#[cfg(windows)]
+struct OneVplWgcRingSmokeSink {
+    ring: crate::ring::EncodedReplayRing,
+    started: bool,
+}
+
+#[cfg(windows)]
+impl OneVplWgcRingSmokeSink {
+    fn new(retention: std::time::Duration) -> Self {
+        Self {
+            ring: crate::ring::EncodedReplayRing::new(retention),
+            started: false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl VplOneCopyRecordSink for OneVplWgcRingSmokeSink {
+    fn status(&mut self, message: &str) {
+        println!("wgc production smoke status: {message}");
+    }
+
+    fn video_track_started(&mut self, info: VplOutputTrackInfo) {
+        self.ring.start_segment(crate::ring::EncodedReplayMetadata {
+            width: info.width,
+            height: info.height,
+            color: info.color,
+            codec: info.codec,
+            audio_sample_rate: crate::backend::audio::TARGET_SAMPLE_RATE,
+            audio_channel_count: crate::backend::audio::TARGET_CHANNELS,
+        });
+        self.started = true;
+    }
+
+    fn hevc_access_unit(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit) {
+        if self.started {
+            self.ring.push_video_au_90k(sample);
+        }
+    }
+
+    fn aac_access_unit(&mut self, sample: &crate::backend::mp4_mux::AacAccessUnit) {
+        if self.started {
+            self.ring
+                .push_audio_au_ticks(sample, crate::backend::audio::TARGET_SAMPLE_RATE);
+        }
+    }
+}
+
+#[test]
+#[ignore = "需要 Intel oneVPL、WGC 桌面会话、可捕获桌面、WASAPI 与 Media Foundation AAC；使用当前磁盘配置验证生产 Memory ring 路线"]
+fn local_onevpl_wgc_production_record_smoke() {
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+    for name in [
+        "RUST_REPLAY_WGC_POST_WARMUP_DISCARD_FRAMES",
+        "RUST_REPLAY_WGC_PIPELINE_WARMUP_FRAMES",
+        "RUST_REPLAY_WGC_PIPELINE_WARMUP_STABLE_INTERVALS",
+        "RUST_REPLAY_VPL_ASYNC_DEPTH",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "production WGC smoke forbids override {name}"
+        );
+    }
+
+    let config = AppConfig::load_from_disk()
+        .expect("读取当前用户配置")
+        .expect("当前用户配置必须存在");
+    assert_eq!(
+        config.capture_backend,
+        crate::config::CaptureBackend::Wgc,
+        "当前配置必须选择 WGC"
+    );
+    assert_eq!(
+        config.replay_buffer_mode,
+        crate::config::ReplayBufferMode::Memory,
+        "当前配置必须选择 Memory encoded ring"
+    );
+    let requested_chroma = config.chroma.unwrap_or(ChromaSampling::Yuv420);
+    let probe = probe_vpl();
+    let route = probe
+        .current_display_routes
+        .iter()
+        .find(|route| route.chroma == requested_chroma && !route.fourcc.is_empty())
+        .expect("本机需要当前显示器对应的 oneVPL production route");
+    let output_override = std::env::var_os("RUST_REPLAY_VPL_WGC_SMOKE_OUTPUT");
+    let keep_output = output_override.is_some();
+    let output = output_override.map(PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir().join("rustreplay_onevpl_wgc_production_record_smoke.mp4")
+    });
+    let duration_seconds = std::env::var("RUST_REPLAY_VPL_WGC_SMOKE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.1)
+        .unwrap_or(5.0);
+    let retention = std::time::Duration::from_secs_f32(duration_seconds + 30.0);
+    let mut sink = OneVplWgcRingSmokeSink::new(retention);
+
+    let recorded = record_wgc_d3d11_onecopy_memory_output_with_sink_cancelable(
+        route.adapter_index,
+        &output,
+        duration_seconds,
+        &config.rate_control,
+        requested_chroma,
+        None,
+        Some(&mut sink),
+        Some(route),
+    )
+    .unwrap();
+    assert!(
+        sink.started,
+        "WGC production sink must receive track metadata"
+    );
+    sink.ring.finish_segment_with_audio_duration(
+        recorded.video_track.duration_90k,
+        recorded
+            .audio_track
+            .as_ref()
+            .map(|track| (track.duration_ticks, track.sample_rate)),
+    );
+    let availability = sink.ring.availability();
+    println!("wgc production ring availability: {availability:?}");
+    let snapshot = sink
+        .ring
+        .snapshot_recent_tracks(retention)
+        .expect("Memory encoded ring 必须可生成包含关键帧的快照");
+    crate::backend::mp4_mux::write_hevc_aac_mp4(
+        &output,
+        &snapshot.video_track,
+        snapshot.audio_track.as_ref(),
+    )
+    .unwrap();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&recorded.report).unwrap()
+    );
+    println!("onevpl_wgc_smoke_output={}", output.display());
+    assert!(recorded.report.captured_frames > 0);
+    assert!(recorded.report.encoded_samples > 0);
+    assert!(recorded.report.encoded_bytes > 0);
+    assert!(recorded.report.audio_access_units > 0);
+    assert!(recorded.report.audio_encoded_bytes > 0);
+    assert!(availability.parameter_sets_ready);
+    assert!(availability.video_key_packets > 0);
+    assert!(availability.audio_packets > 0);
+    assert!(
+        output.metadata().expect("WGC smoke MP4 metadata").len() > 0,
+        "应从 Memory encoded ring 写出非空 oneVPL HEVC/AAC MP4"
+    );
+    if !keep_output {
+        let _ = std::fs::remove_file(output);
+    }
 }
 
 #[test]

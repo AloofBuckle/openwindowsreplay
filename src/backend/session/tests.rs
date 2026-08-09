@@ -11,7 +11,7 @@ fn disk_segment_sidecar_roundtrips_tracks() {
     let read = read_disk_segment_sidecar(&indexed_sidecar(&dir, "segment")).unwrap();
 
     assert_eq!(read.video_track.width, segment.video_track.width);
-    assert_eq!(read.video_track.duration_90k, 90_000);
+    assert_eq!(read.video_track.duration_ticks, 90_000);
     assert_eq!(read.video_track.samples.len(), 1);
     assert_eq!(
         read.audio_track.as_ref().unwrap().duration_ticks,
@@ -41,9 +41,9 @@ fn disk_segment_concat_rebases_timestamps() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(snapshot.video_track.duration_90k, 135_000);
-    assert_eq!(snapshot.video_track.samples[0].duration_90k, 90_000);
-    assert_eq!(snapshot.video_track.samples[1].duration_90k, 45_000);
+    assert_eq!(snapshot.video_track.duration_ticks, 135_000);
+    assert_eq!(snapshot.video_track.samples[0].duration_ticks, 90_000);
+    assert_eq!(snapshot.video_track.samples[1].duration_ticks, 45_000);
     let audio = snapshot.audio_track.unwrap();
     assert_eq!(audio.duration_ticks, 72_000);
     assert_eq!(audio.samples.len(), 4);
@@ -283,7 +283,7 @@ fn disk_store_snapshot_uses_only_the_latest_compatible_codec_epoch() {
                 },
             ),
             mp4_path: segment.mp4_path,
-            duration_90k: segment.index.video_track.duration_90k,
+            duration_90k: segment.index.video_track.duration_ticks,
             audio_access_units: segment
                 .index
                 .audio_track
@@ -301,7 +301,7 @@ fn disk_store_snapshot_uses_only_the_latest_compatible_codec_epoch() {
         .unwrap();
 
     assert_eq!(snapshot.video_track.width, 16);
-    assert_eq!(snapshot.video_track.duration_90k, 180_000);
+    assert_eq!(snapshot.video_track.duration_ticks, 180_000);
     assert_eq!(snapshot.video_track.samples.len(), 2);
     let _ = fs::remove_dir_all(dir);
 }
@@ -316,11 +316,17 @@ fn disk_segment_builder_keeps_audio_duration_aligned_to_video_segment() {
         audio_sample_rate: 48_000,
         audio_channel_count: 2,
     };
-    let mut builder =
-        DiskSegmentBuilder::new(metadata, 90_000, 48_000, fake_hevc_parameter_sets().into());
+    let mut builder = DiskSegmentBuilder::new(
+        metadata,
+        90_000,
+        None,
+        48_000,
+        fake_hevc_parameter_sets().into(),
+    );
     builder.end_90k = Some(180_000);
     builder.push_video(&HevcAccessUnit {
         timestamp_90k: 90_000,
+        presentation_timestamp_100ns: None,
         data: vec![0, 0, 1, 38, 1].into(),
         is_sync: true,
         discard_from_track: false,
@@ -337,8 +343,8 @@ fn disk_segment_builder_keeps_audio_duration_aligned_to_video_segment() {
 }
 
 #[test]
-fn disk_segment_sink_fails_instead_of_blocking_when_writer_queue_is_full() {
-    let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+fn disk_segment_sink_applies_cancelable_backpressure_when_writer_queue_is_full() {
+    let (writer_tx, writer_rx) = mpsc::sync_channel(1);
     writer_tx
         .try_send(DiskSegmentWriteJob {
             run_index: 0,
@@ -357,23 +363,109 @@ fn disk_segment_sink_fails_instead_of_blocking_when_writer_queue_is_full() {
         Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(65)))),
         Arc::new(AtomicU64::new(u64::MAX)),
     );
-    let mut builder = DiskSegmentBuilder::new(metadata(), 0, 0, fake_hevc_parameter_sets().into());
+    let mut builder =
+        DiskSegmentBuilder::new(metadata(), 0, None, 0, fake_hevc_parameter_sets().into());
     builder.end_90k = Some(90_000);
     builder.push_video(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    });
+
+    let release_queue = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        let queued_before_backpressure = writer_rx.recv().unwrap();
+        let queued_after_backpressure = writer_rx.recv().unwrap();
+        (queued_before_backpressure, queued_after_backpressure)
+    });
+    sink.write_completed_segment(builder);
+    let _ = release_queue.join().unwrap();
+
+    assert!(!stop.load(Ordering::Relaxed));
+    assert!(sink.failure_message.is_none());
+    assert!(matches!(
+        event_rx.recv().unwrap(),
+        ReplayEvent::BackendStatus { .. }
+    ));
+}
+
+#[test]
+fn disk_segment_sink_reports_final_segment_drop_when_stop_interrupts_full_queue() {
+    let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+    writer_tx
+        .try_send(DiskSegmentWriteJob {
+            run_index: 0,
+            segment: segment(0, 90_000, 0, 48_000),
+            enqueued_at: Instant::now(),
+        })
+        .unwrap();
+    let (event_tx, _event_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(true));
+    let mut sink = DiskSegmentSink::new(
+        writer_tx,
+        event_tx,
+        0,
+        Duration::from_secs(60),
+        stop.clone(),
+        Arc::new(Mutex::new(EncodedReplayRing::new(Duration::from_secs(65)))),
+        Arc::new(AtomicU64::new(u64::MAX)),
+    );
+    let mut builder =
+        DiskSegmentBuilder::new(metadata(), 0, None, 0, fake_hevc_parameter_sets().into());
+    builder.end_90k = Some(90_000);
+    builder.push_video(&HevcAccessUnit {
+        timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
     });
 
     sink.write_completed_segment(builder);
-
+    assert!(sink.failed);
+    assert!(
+        sink.failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("最终分段未能排队"))
+    );
     assert!(stop.load(Ordering::Relaxed));
-    assert!(sink.failure_message.is_some());
-    assert!(matches!(
-        event_rx.recv().unwrap(),
-        ReplayEvent::BackendStatus { .. }
-    ));
+}
+
+#[test]
+fn stale_replay_part_cleanup_failure_is_nonfatal() {
+    let dir = unique_temp_dir("stale_part_cleanup_failure");
+    fs::create_dir_all(&dir).unwrap();
+    let undeletable_part = dir.join("RustReplay_undeletable.mp4.part");
+    fs::create_dir(&undeletable_part).unwrap();
+
+    let warnings = cleanup_stale_replay_parts_older_than(&dir, Duration::ZERO);
+
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("已继续启动"));
+    assert!(undeletable_part.is_dir());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn display_reconfigure_backoff_is_exponential_and_capped() {
+    let delays: Vec<_> = (1..=MAX_CONSECUTIVE_DISPLAY_RECONFIGURES)
+        .map(display_reconfigure_backoff)
+        .collect();
+
+    assert_eq!(
+        delays,
+        [200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000].map(Duration::from_millis)
+    );
+    assert_eq!(
+        next_display_reconfigure_count(7, Duration::from_secs(1)),
+        MAX_CONSECUTIVE_DISPLAY_RECONFIGURES
+    );
+    assert_eq!(
+        next_display_reconfigure_count(7, Duration::from_secs(30)),
+        1
+    );
 }
 
 #[test]
@@ -398,18 +490,21 @@ fn disk_segment_assigns_cross_boundary_aac_before_flushing_the_old_segment() {
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_parameter_sets().into(),
         is_sync: false,
         discard_from_track: true,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 90_000,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
@@ -449,12 +544,14 @@ fn disk_segment_moves_early_aac_when_a_delayed_keyframe_reveals_the_boundary() {
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_parameter_sets().into(),
         is_sync: false,
         discard_from_track: true,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
@@ -469,6 +566,7 @@ fn disk_segment_moves_early_aac_when_a_delayed_keyframe_reveals_the_boundary() {
     boundary_au.extend(fake_hevc_idr());
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 90_000,
+        presentation_timestamp_100ns: None,
         data: boundary_au.into(),
         is_sync: true,
         discard_from_track: false,
@@ -515,6 +613,7 @@ fn disk_segment_adopts_aac_published_before_the_first_delayed_idr() {
     first_idr.extend(fake_hevc_idr());
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: first_idr.into(),
         is_sync: true,
         discard_from_track: false,
@@ -550,24 +649,28 @@ fn disk_segment_builder_keeps_the_parameter_sets_from_its_own_codec_epoch() {
     let first_header = fake_hevc_parameter_sets_with_seed(1);
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: first_header.clone().into(),
         is_sync: false,
         discard_from_track: true,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 45_000,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_parameter_sets_with_seed(2).into(),
         is_sync: false,
         discard_from_track: true,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 90_000,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
@@ -607,12 +710,14 @@ fn disk_open_segment_ring_can_save_a_static_first_idr_before_any_rotation() {
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_parameter_sets().into(),
         is_sync: false,
         discard_from_track: true,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: true,
         discard_from_track: false,
@@ -638,6 +743,142 @@ fn disk_open_segment_ring_can_save_a_static_first_idr_before_any_rotation() {
         1
     );
     assert_eq!(snapshot.audio_track.unwrap().samples.len(), 1);
+}
+
+#[test]
+fn memory_and_disk_sinks_expose_equivalent_open_segment_replays() {
+    let retention = Duration::from_secs(65);
+    let memory_ring = Arc::new(Mutex::new(EncodedReplayRing::new(retention)));
+    let disk_ring = Arc::new(Mutex::new(EncodedReplayRing::new(retention)));
+    let (memory_event_tx, _memory_event_rx) = mpsc::channel();
+    let (disk_event_tx, _disk_event_rx) = mpsc::channel();
+    let (disk_writer_tx, _disk_writer_rx) = mpsc::sync_channel(1);
+    let mut memory_sink = ReplayRecordSink::Memory(SessionRingSink {
+        ring: memory_ring.clone(),
+        tx: memory_event_tx,
+        segment_index: 0,
+        started: false,
+    });
+    let mut disk_sink = ReplayRecordSink::Disk(Box::new(DiskSegmentSink::new(
+        disk_writer_tx,
+        disk_event_tx,
+        0,
+        Duration::from_secs(60),
+        Arc::new(AtomicBool::new(false)),
+        disk_ring.clone(),
+        Arc::new(AtomicU64::new(u64::MAX)),
+    )));
+    let info = super::vpl::VplOutputTrackInfo {
+        width: 16,
+        height: 16,
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+    };
+    let header = HevcAccessUnit {
+        timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
+        data: fake_hevc_parameter_sets().into(),
+        is_sync: false,
+        discard_from_track: true,
+    };
+    let idr = HevcAccessUnit {
+        timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
+        data: fake_hevc_idr().into(),
+        is_sync: true,
+        discard_from_track: false,
+    };
+    let mut predicted_data = Vec::new();
+    append_fake_nal(&mut predicted_data, 1, &[13, 14, 15]);
+    let predicted = HevcAccessUnit {
+        timestamp_90k: 90_000,
+        presentation_timestamp_100ns: None,
+        data: predicted_data.into(),
+        is_sync: false,
+        discard_from_track: false,
+    };
+    let audio = AacAccessUnit {
+        timestamp_ticks: 0,
+        duration_ticks: 1_024,
+        data: vec![0x21, 0x10].into(),
+    };
+
+    for sink in [&mut memory_sink, &mut disk_sink] {
+        super::vpl::VplOneCopyRecordSink::video_track_started(sink, info);
+        super::vpl::VplOneCopyRecordSink::hevc_access_unit(sink, &header);
+        super::vpl::VplOneCopyRecordSink::hevc_access_unit(sink, &idr);
+        super::vpl::VplOneCopyRecordSink::hevc_access_unit(sink, &predicted);
+        super::vpl::VplOneCopyRecordSink::aac_access_unit(sink, &audio);
+    }
+
+    let memory_snapshot = memory_ring
+        .lock()
+        .unwrap()
+        .snapshot_recent_tracks(Duration::from_secs(60))
+        .unwrap();
+    let disk_snapshot = disk_ring
+        .lock()
+        .unwrap()
+        .snapshot_recent_tracks(Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(
+        memory_snapshot.video_track.width,
+        disk_snapshot.video_track.width
+    );
+    assert_eq!(
+        memory_snapshot.video_track.height,
+        disk_snapshot.video_track.height
+    );
+    assert_eq!(
+        memory_snapshot.video_track.duration_90k,
+        disk_snapshot.video_track.duration_90k
+    );
+    assert_eq!(
+        memory_snapshot.video_track.samples.len(),
+        disk_snapshot.video_track.samples.len()
+    );
+    for (memory, disk) in memory_snapshot
+        .video_track
+        .samples
+        .iter()
+        .zip(&disk_snapshot.video_track.samples)
+    {
+        assert_eq!(memory.timestamp_90k, disk.timestamp_90k);
+        assert_eq!(memory.is_sync, disk.is_sync);
+        assert_eq!(memory.discard_from_track, disk.discard_from_track);
+        assert_eq!(memory.data.as_ref(), disk.data.as_ref());
+    }
+    let memory_audio = memory_snapshot.audio_track.unwrap();
+    let disk_audio = disk_snapshot.audio_track.unwrap();
+    assert_eq!(memory_audio.sample_rate, disk_audio.sample_rate);
+    assert_eq!(memory_audio.channel_count, disk_audio.channel_count);
+    assert_eq!(memory_audio.duration_ticks, disk_audio.duration_ticks);
+    assert_eq!(memory_audio.samples.len(), disk_audio.samples.len());
+    assert_eq!(
+        memory_audio.samples[0].data.as_ref(),
+        disk_audio.samples[0].data.as_ref()
+    );
+
+    let mut memory_controller = ReplayController::default();
+    memory_controller.state = ReplayState::Running {
+        started_at: Instant::now(),
+    };
+    memory_controller.live_ring = Some(memory_ring);
+    let mut disk_controller = ReplayController::default();
+    disk_controller.state = ReplayState::Running {
+        started_at: Instant::now(),
+    };
+    disk_controller.disk_store = Some(Arc::new(Mutex::new(DiskReplayStore::new(
+        unique_temp_dir("disk_parity_store"),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    ))));
+    disk_controller.disk_live_ring = Some(disk_ring);
+    assert_eq!(
+        memory_controller.save_readiness(),
+        ReplaySaveReadiness::Ready
+    );
+    assert_eq!(disk_controller.save_readiness(), ReplaySaveReadiness::Ready);
 }
 
 #[test]
@@ -722,6 +963,127 @@ fn local_nvfbc_controller_memory_ring_saves_hevc_aac_mp4() {
 }
 
 #[test]
+#[ignore = "需要本机 NVENC、D3D11/WGC 桌面、WASAPI 与 Media Foundation AAC"]
+fn local_nvenc_controller_memory_and_disk_modes_save_mp4() {
+    unsafe {
+        std::env::set_var("RUST_REPLAY_WGC_POST_WARMUP_DISCARD_FRAMES", "0");
+        std::env::set_var("RUST_REPLAY_WGC_PIPELINE_WARMUP_FRAMES", "0");
+        std::env::set_var("RUST_REPLAY_WGC_PIPELINE_WARMUP_STABLE_INTERVALS", "0");
+    }
+    let caps = crate::backend::probe_all();
+    assert_eq!(
+        caps.video_encoder_selection.active,
+        Some(crate::backend::VideoEncoderBackend::Nvenc),
+        "本测试要求自动选择 NVENC：{:?}",
+        caps.video_encoder_selection
+    );
+    let chroma = caps
+        .supported_chroma_for_capture_mode(CaptureMode::Generic)
+        .into_iter()
+        .find(|chroma| *chroma == ChromaSampling::Yuv420)
+        .expect("NVENC current display YUV420 production route");
+    let root = unique_temp_dir("nvenc_controller_buffer_modes");
+    fs::create_dir_all(&root).unwrap();
+    let cursor_stop = Arc::new(AtomicBool::new(false));
+    let cursor_thread = {
+        let cursor_stop = cursor_stop.clone();
+        std::thread::spawn(move || {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+            let mut origin = POINT::default();
+            if unsafe { GetCursorPos(&mut origin) }.is_err() {
+                return;
+            }
+            let mut tick = 0i32;
+            while !cursor_stop.load(Ordering::Relaxed) {
+                let dx = if tick & 1 == 0 { 6 } else { -6 };
+                let _ = unsafe { SetCursorPos(origin.x + dx, origin.y) };
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = unsafe { SetCursorPos(origin.x, origin.y) };
+        })
+    };
+
+    for mode in [ReplayBufferMode::Memory, ReplayBufferMode::Disk] {
+        let label = mode.label();
+        let save_dir = root.join(format!("save_{label}"));
+        let cache_dir = root.join(format!("cache_{label}"));
+        let mut config = AppConfig {
+            capture_mode: CaptureMode::Generic,
+            capture_backend: CaptureBackend::Wgc,
+            replay_buffer_mode: mode,
+            chroma: Some(chroma),
+            replay_minutes: 0.1,
+            save_dir: save_dir.display().to_string(),
+            cache_dir: cache_dir.display().to_string(),
+            ..AppConfig::default()
+        };
+        config.rate_control.method = RateControlMethod::Cbr;
+        config.rate_control.look_ahead_depth = 0;
+
+        let mut controller = ReplayController::default();
+        controller
+            .start(&config, &caps)
+            .unwrap_or_else(|err| panic!("start {label}: {err}"));
+        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        let mut log = Vec::new();
+        while controller.save_readiness() != ReplaySaveReadiness::Ready {
+            log.extend(controller.drain_log_messages());
+            assert!(
+                !matches!(controller.state(), ReplayState::Idle),
+                "{label} stopped before ready: {}",
+                log.join(" | ")
+            );
+            assert!(
+                Instant::now() < ready_deadline,
+                "{label} did not become saveable: {}",
+                log.join(" | ")
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        controller
+            .save(&config)
+            .unwrap_or_else(|err| panic!("save {label}: {err}"));
+        let saved = fs::read_dir(&save_dir)
+            .unwrap_or_else(|err| panic!("read {label} save dir: {err}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "mp4"))
+            .unwrap_or_else(|| panic!("{label} did not write an MP4"));
+        assert!(
+            saved.metadata().expect("saved MP4 metadata").len() > 0,
+            "{label} wrote an empty MP4"
+        );
+        eprintln!("nvenc_controller_{label}_output={}", saved.display());
+
+        controller
+            .stop()
+            .unwrap_or_else(|err| panic!("stop {label}: {err}"));
+        let stop_deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(controller.state(), ReplayState::Idle) {
+            log.extend(controller.drain_log_messages());
+            assert!(
+                Instant::now() < stop_deadline,
+                "{label} did not stop promptly: {}",
+                log.join(" | ")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    cursor_stop.store(true, Ordering::Relaxed);
+    let _ = cursor_thread.join();
+    unsafe {
+        std::env::remove_var("RUST_REPLAY_WGC_POST_WARMUP_DISCARD_FRAMES");
+        std::env::remove_var("RUST_REPLAY_WGC_PIPELINE_WARMUP_FRAMES");
+        std::env::remove_var("RUST_REPLAY_WGC_PIPELINE_WARMUP_STABLE_INTERVALS");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn disk_segment_sink_stops_if_encoder_never_emits_a_keyframe() {
     let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
     let (event_tx, event_rx) = mpsc::channel();
@@ -742,12 +1104,14 @@ fn disk_segment_sink_stops_if_encoder_never_emits_a_keyframe() {
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 0,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: false,
         discard_from_track: false,
     });
     sink.hevc_access_unit(&HevcAccessUnit {
         timestamp_90k: 360_000,
+        presentation_timestamp_100ns: None,
         data: fake_hevc_idr().into(),
         is_sync: false,
         discard_from_track: false,
@@ -905,6 +1269,37 @@ fn disk_writer_panic_stops_the_session_and_is_reported_to_the_worker() {
 }
 
 #[test]
+fn disk_writer_shutdown_drains_a_queued_final_segment() {
+    let dir = unique_temp_dir("disk_writer_shutdown_drain");
+    fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Mutex::new(DiskReplayStore::new(
+        dir.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    )));
+    let (event_tx, _event_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = DiskSegmentWriter::spawn(store.clone(), event_tx, stop);
+    writer
+        .sender()
+        .unwrap()
+        .send(DiskSegmentWriteJob {
+            run_index: 3,
+            segment: segment(0, 90_000, 0, 48_000),
+            enqueued_at: Instant::now(),
+        })
+        .unwrap();
+
+    assert!(writer.shutdown().is_none());
+    let store = store.lock().unwrap();
+    assert_eq!(store.segments.len(), 1);
+    assert!(store.segments[0].mp4_path.exists());
+    assert!(store.segments[0].sidecar_path.exists());
+    drop(store);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn disk_segment_transaction_rolls_back_if_sidecar_publish_fails() {
     let dir = unique_temp_dir("publish_rollback");
     fs::create_dir_all(&dir).unwrap();
@@ -946,17 +1341,20 @@ fn segment(
             width: 16,
             height: 16,
             duration_90k,
+            presentation_duration_100ns: None,
             color: NclxColorMetadata::bt709_full(),
             codec: HevcCodecMetadata::main_420_8(),
             samples: vec![
                 HevcAccessUnit {
                     timestamp_90k: 0,
+                    presentation_timestamp_100ns: None,
                     data: fake_hevc_parameter_sets().into(),
                     is_sync: false,
                     discard_from_track: true,
                 },
                 HevcAccessUnit {
                     timestamp_90k: 0,
+                    presentation_timestamp_100ns: None,
                     data: fake_hevc_idr().into(),
                     is_sync: true,
                     discard_from_track: false,

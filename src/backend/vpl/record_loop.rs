@@ -769,8 +769,10 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
         let mut dirty_area_total = 0u64;
         let mut first_sample_timestamp_90k: Option<u64> = None;
         let mut first_video_timestamp_100ns: Option<i64> = None;
+        let mut formal_transport_origin_90k: Option<u64> = None;
+        let mut presentation_timeline = PresentationTimestampTracker::default();
         let mut last_submitted_sample_timestamp_90k: Option<u64> = None;
-        let mut last_forced_idr_timestamp_90k: Option<u64> = None;
+        let mut idr_scheduler = SourceTimedIdrScheduler::default();
         let capture_duration = Duration::from_secs_f32(duration_seconds.max(0.1));
         let requested_duration_90k =
             (duration_seconds.max(0.1) as f64 * VIDEO_CLOCK_HZ as f64).round() as u64;
@@ -920,13 +922,16 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 &mut bitstream_pool,
                                 0,
                             )? {
-                                TrySyncResult::Ready(Some(sample)) => push_record_hevc_sample(
-                                    &mut samples,
-                                    sample,
-                                    &mut encoded_sink,
-                                    retain_output_samples,
-                                    &mut encoded_stats,
-                                ),
+                                TrySyncResult::Ready(Some(sample)) => {
+                                    push_record_hevc_sample_with_timeline(
+                                        &mut samples,
+                                        sample,
+                                        &mut encoded_sink,
+                                        retain_output_samples,
+                                        &mut encoded_stats,
+                                        &mut presentation_timeline,
+                                    )?;
+                                }
                                 TrySyncResult::Ready(None) => break,
                                 TrySyncResult::NotReady => break,
                             }
@@ -1183,6 +1188,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 let warmup_ts90 = u64::from(warmup_encoded_frames)
                                     .saturating_mul(ENCODER_WARMUP_TIMESTAMP_STEP_90K);
                                 warmup_encoded_frames = warmup_encoded_frames.saturating_add(1);
+                                presentation_timeline.remember_discard(warmup_ts90)?;
                                 (*surface).Data.TimeStamp = warmup_ts90;
                                 (*surface).Data.FrameOrder = warmup_encoded_frames;
                                 let warmup_submit_started = Instant::now();
@@ -1194,13 +1200,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                             &mut in_flight,
                                             &mut bitstream_pool,
                                         )? {
-                                            push_record_hevc_sample(
+                                            push_record_hevc_sample_with_timeline(
                                                 &mut samples,
                                                 sample,
                                                 &mut encoded_sink,
                                                 retain_output_samples,
                                                 &mut encoded_stats,
-                                            );
+                                                &mut presentation_timeline,
+                                            )?;
                                         }
                                     }
                                 }
@@ -1238,13 +1245,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                             &mut in_flight,
                                             &mut bitstream_pool,
                                         )? {
-                                            push_record_hevc_sample(
+                                            push_record_hevc_sample_with_timeline(
                                                 &mut samples,
                                                 sample,
                                                 &mut encoded_sink,
                                                 retain_output_samples,
                                                 &mut encoded_stats,
-                                            );
+                                                &mut presentation_timeline,
+                                            )?;
                                         }
                                     }
                                 } else {
@@ -1257,13 +1265,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                             1,
                                         )? {
                                             TrySyncResult::Ready(Some(sample)) => {
-                                                push_record_hevc_sample(
+                                                push_record_hevc_sample_with_timeline(
                                                     &mut samples,
                                                     sample,
                                                     &mut encoded_sink,
                                                     retain_output_samples,
                                                     &mut encoded_stats,
-                                                )
+                                                    &mut presentation_timeline,
+                                                )?;
                                             }
                                             TrySyncResult::Ready(None) => break,
                                             TrySyncResult::NotReady => break,
@@ -1275,7 +1284,33 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 return Ok(());
                             }
 
-                            if first_video_timestamp_100ns.is_none() {
+                            if first_sample_timestamp_90k.is_none() {
+                                let pending_warmup_outputs = in_flight.len();
+                                while !in_flight.is_empty() {
+                                    if let Some(sample) = sync_one_async_encode(
+                                        &api,
+                                        session,
+                                        &mut in_flight,
+                                        &mut bitstream_pool,
+                                    )? {
+                                        push_record_hevc_sample_with_timeline(
+                                            &mut samples,
+                                            sample,
+                                            &mut encoded_sink,
+                                            retain_output_samples,
+                                            &mut encoded_stats,
+                                            &mut presentation_timeline,
+                                        )?;
+                                    }
+                                }
+                                if pending_warmup_outputs > 0 {
+                                    sink_status(
+                                        &mut encoded_sink,
+                                        format!(
+                                            "初始化阶段：首个正式帧前已回收 {pending_warmup_outputs} 个待完成 warmup encode，正式 source timeline 不与预热 transport timestamp 重叠"
+                                        ),
+                                    );
+                                }
                                 sink_status(
                                     &mut encoded_sink,
                                     format!(
@@ -1288,16 +1323,19 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                             }
                             let first_ts = *first_sample_timestamp_90k.get_or_insert(timestamp_90k);
                             let sample_ts90 = timestamp_90k.saturating_sub(first_ts);
+                            let transport_origin = *formal_transport_origin_90k
+                                .get_or_insert(u64::from(warmup_encoded_frames));
+                            let transport_ts90 = transport_origin.saturating_add(sample_ts90);
+                            presentation_timeline.remember(
+                                transport_ts90,
+                                sample_ts90,
+                                timestamp_100ns,
+                                first_video_timestamp_100ns,
+                            )?;
                             last_submitted_sample_timestamp_90k = Some(sample_ts90);
-                            let idr_reference = encoded_stats
-                                .last_sync_timestamp_90k
-                                .or(last_forced_idr_timestamp_90k);
-                            let force_idr =
-                                should_force_source_timed_idr(idr_reference, sample_ts90);
-                            if force_idr {
-                                last_forced_idr_timestamp_90k = Some(sample_ts90);
-                            }
-                            (*surface).Data.TimeStamp = sample_ts90;
+                            let force_idr = idr_scheduler
+                                .should_force(encoded_stats.last_sync_timestamp_90k, sample_ts90);
+                            (*surface).Data.TimeStamp = transport_ts90;
                             (*surface).Data.FrameOrder = captured_frames;
                             let submit_started = Instant::now();
                             if bitstream_pool.is_empty() {
@@ -1308,13 +1346,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                         &mut in_flight,
                                         &mut bitstream_pool,
                                     )? {
-                                        push_record_hevc_sample(
+                                        push_record_hevc_sample_with_timeline(
                                             &mut samples,
                                             sample,
                                             &mut encoded_sink,
                                             retain_output_samples,
                                             &mut encoded_stats,
-                                        );
+                                            &mut presentation_timeline,
+                                        )?;
                                     }
                                 }
                             }
@@ -1330,7 +1369,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                 session,
                                 AsyncEncodeRequest {
                                     surface,
-                                    timestamp_90k: sample_ts90,
+                                    timestamp_90k: transport_ts90,
                                     is_sync: force_idr,
                                     storage: bitstream_storage,
                                     discard: false,
@@ -1351,13 +1390,16 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     &mut bitstream_pool,
                                     1,
                                 )? {
-                                    TrySyncResult::Ready(Some(sample)) => push_record_hevc_sample(
-                                        &mut samples,
-                                        sample,
-                                        &mut encoded_sink,
-                                        retain_output_samples,
-                                        &mut encoded_stats,
-                                    ),
+                                    TrySyncResult::Ready(Some(sample)) => {
+                                        push_record_hevc_sample_with_timeline(
+                                            &mut samples,
+                                            sample,
+                                            &mut encoded_sink,
+                                            retain_output_samples,
+                                            &mut encoded_stats,
+                                            &mut presentation_timeline,
+                                        )?;
+                                    }
                                     TrySyncResult::Ready(None) => break,
                                     TrySyncResult::NotReady => break,
                                 }
@@ -1369,13 +1411,14 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                                     &mut in_flight,
                                     &mut bitstream_pool,
                                 )? {
-                                    push_record_hevc_sample(
+                                    push_record_hevc_sample_with_timeline(
                                         &mut samples,
                                         sample,
                                         &mut encoded_sink,
                                         retain_output_samples,
                                         &mut encoded_stats,
-                                    );
+                                        &mut presentation_timeline,
+                                    )?;
                                 }
                             }
                             perf.sync.add(sync_started.elapsed());
@@ -1458,13 +1501,16 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     &mut bitstream_pool,
                     0,
                 )? {
-                    TrySyncResult::Ready(Some(sample)) => push_record_hevc_sample(
-                        &mut samples,
-                        sample,
-                        &mut encoded_sink,
-                        retain_output_samples,
-                        &mut encoded_stats,
-                    ),
+                    TrySyncResult::Ready(Some(sample)) => {
+                        push_record_hevc_sample_with_timeline(
+                            &mut samples,
+                            sample,
+                            &mut encoded_sink,
+                            retain_output_samples,
+                            &mut encoded_stats,
+                            &mut presentation_timeline,
+                        )?;
+                    }
                     TrySyncResult::Ready(None) => break,
                     TrySyncResult::NotReady => std::thread::sleep(Duration::from_millis(1)),
                 }
@@ -1500,30 +1546,36 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             if let Some(sample) =
                 sync_one_async_encode(&api, session, &mut in_flight, &mut bitstream_pool)?
             {
-                push_record_hevc_sample(
+                push_record_hevc_sample_with_timeline(
                     &mut samples,
                     sample,
                     &mut encoded_sink,
                     retain_output_samples,
                     &mut encoded_stats,
-                );
+                    &mut presentation_timeline,
+                )?;
             }
         }
-        let skipped_flush_samples = flush_encoder(
+        let skipped_flush_samples = flush_encoder_with_timeline(
             &api,
             session,
             &mut samples,
             &mut encoded_sink,
             retain_output_samples,
             &mut encoded_stats,
+            &mut presentation_timeline,
             &mut bitstream_pool,
         )?;
+        presentation_timeline.finish()?;
         let duration_90k = encoded_timeline_duration_90k(
             &samples,
             encoded_stats.last_timestamp_90k,
             requested_duration_90k,
             !capture_source.is_wgc(),
         );
+        let presentation_duration_100ns = presentation_timeline
+            .presentation_duration_100ns()
+            .or_else(|| presentation_timeline_duration_100ns(&samples));
         surface_texture_cache.clear();
         let (close_status, mfx_close_status) = runtime.shutdown();
         if close_status != MFX_ERR_NONE {
@@ -1564,6 +1616,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                         audio_frames,
                         first_video_timestamp_100ns,
                         duration_90k,
+                        presentation_duration_100ns,
                         &mut notes,
                         &mut encoded_sink,
                         sink_push_from_ticks,
@@ -1587,6 +1640,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
                     let track = capture.finish_streaming(
                         first_video_timestamp_100ns,
                         duration_90k,
+                        presentation_duration_100ns,
                         &mut encoded_sink,
                         &mut notes,
                     )?;
@@ -1603,6 +1657,7 @@ pub(super) fn record_d3d11_onecopy_mp4_impl(
             width: capture_width,
             height: capture_height,
             duration_90k,
+            presentation_duration_100ns,
             color: record_route.mp4_color,
             codec: record_route.mp4_codec,
             samples,

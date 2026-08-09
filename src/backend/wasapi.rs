@@ -62,6 +62,23 @@ mod platform {
     const BUFFER_DURATION_100NS: i64 = 10_000_000;
     const POLL_SLEEP: Duration = Duration::from_millis(5);
 
+    struct CoTaskMemWaveFormat(*mut WAVEFORMATEX);
+
+    impl CoTaskMemWaveFormat {
+        fn as_ptr(&self) -> *mut WAVEFORMATEX {
+            self.0
+        }
+    }
+
+    impl Drop for CoTaskMemWaveFormat {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CoTaskMemFree(Some(self.0.cast())) };
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
     pub fn capture_default_streaming(
         source: AudioSourceKind,
         duration: Duration,
@@ -100,15 +117,17 @@ mod platform {
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(windows_audio_error("IMMDevice::Activate(IAudioClient)"))?;
-            let mix_ptr = client
-                .GetMixFormat()
-                .map_err(windows_audio_error("IAudioClient::GetMixFormat"))?;
-            if mix_ptr.is_null() {
+            let mix_memory = CoTaskMemWaveFormat(
+                client
+                    .GetMixFormat()
+                    .map_err(windows_audio_error("IAudioClient::GetMixFormat"))?,
+            );
+            if mix_memory.as_ptr().is_null() {
                 return Err(BackendError::AudioUnsupported {
                     reason: "IAudioClient::GetMixFormat 返回空指针".to_owned(),
                 });
             }
-            let mix = WasapiMixFormat::from_waveformat(mix_ptr)?;
+            let mix = WasapiMixFormat::from_waveformat(mix_memory.as_ptr())?;
             stats.sample_rate = mix.sample_rate;
             stats.channels = mix.channels;
             stats.bits_per_sample = mix.bits_per_sample;
@@ -127,11 +146,10 @@ mod platform {
                     stream_flags,
                     BUFFER_DURATION_100NS,
                     0,
-                    mix_ptr,
+                    mix_memory.as_ptr(),
                     None,
                 )
                 .map_err(windows_audio_error("IAudioClient::Initialize"))?;
-            CoTaskMemFree(Some(mix_ptr as _));
 
             let capture: IAudioCaptureClient = client.GetService().map_err(windows_audio_error(
                 "IAudioClient::GetService(IAudioCaptureClient)",

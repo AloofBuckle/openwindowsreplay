@@ -336,7 +336,7 @@ fn finish_audio_worker(
     };
     let mut sink = Some(audio_sink as &mut dyn VplOneCopyRecordSink);
     let mut track =
-        capture.finish_streaming(video_start_100ns, duration_90k, &mut sink, &mut notes)?;
+        capture.finish_streaming(video_start_100ns, duration_90k, None, &mut sink, &mut notes)?;
     if let Some(track) = track.as_mut()
         && audio_sink.retain_samples
     {

@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) struct EncodedSurfaceBytes {
@@ -6,7 +7,7 @@ pub(super) struct EncodedSurfaceBytes {
     pub(super) sync_status: i32,
     pub(super) timestamp_90k: u64,
     pub(super) frame_type: u16,
-    pub(super) bytes: Vec<u8>,
+    pub(super) bytes: Option<Arc<[u8]>>,
 }
 
 #[derive(Default)]
@@ -193,6 +194,210 @@ pub(super) struct RecordHevcStats {
     pub(super) last_sync_timestamp_90k: Option<u64>,
 }
 
+#[derive(Debug)]
+enum PendingPresentationTimestamp {
+    Discard,
+    Track {
+        timestamp_90k: u64,
+        presentation_timestamp_100ns: Option<u64>,
+    },
+}
+
+/// Correlates oneVPL's 90 kHz transport timestamp with the source presentation
+/// timestamp. WGC can produce source intervals that cannot be represented at
+/// 90 kHz without rounding; this keeps that rounding out of the MP4 timeline.
+#[derive(Debug, Default)]
+pub(super) struct PresentationTimestampTracker {
+    source_timestamp_mode: Option<bool>,
+    pending_by_transport_90k: std::collections::BTreeMap<u64, PendingPresentationTimestamp>,
+    last_attached_90k: Option<u64>,
+    last_attached_100ns: Option<u64>,
+    presentation_duration_100ns: Option<u64>,
+}
+
+impl PresentationTimestampTracker {
+    pub(super) fn remember_discard(
+        &mut self,
+        transport_timestamp_90k: u64,
+    ) -> Result<(), BackendError> {
+        if self
+            .pending_by_transport_90k
+            .insert(
+                transport_timestamp_90k,
+                PendingPresentationTimestamp::Discard,
+            )
+            .is_some()
+        {
+            return Err(BackendError::unsupported(
+                "视频 source timestamp",
+                format!("transport_timestamp_90k={transport_timestamp_90k}"),
+                "编码器 warmup transport timestamp 重复",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn remember(
+        &mut self,
+        transport_timestamp_90k: u64,
+        timestamp_90k: u64,
+        absolute_timestamp_100ns: Option<i64>,
+        origin_timestamp_100ns: Option<i64>,
+    ) -> Result<(), BackendError> {
+        let presentation_timestamp_100ns = match (absolute_timestamp_100ns, origin_timestamp_100ns)
+        {
+            (Some(timestamp), Some(origin)) => {
+                if timestamp < origin {
+                    return Err(BackendError::unsupported(
+                        "视频 source timestamp",
+                        format!("timestamp_100ns={timestamp} origin_100ns={origin}"),
+                        "源视频时间戳早于正式时间线原点",
+                    ));
+                }
+                if self.source_timestamp_mode == Some(false) {
+                    return Err(BackendError::unsupported(
+                        "视频 source timestamp",
+                        format!(
+                            "absolute_100ns={absolute_timestamp_100ns:?} origin_100ns={origin_timestamp_100ns:?}"
+                        ),
+                        "正式录制期间 source timestamp 可用性发生变化",
+                    ));
+                }
+                self.source_timestamp_mode = Some(true);
+                Some(timestamp.saturating_sub(origin) as u64)
+            }
+            (None, None) => {
+                if self.source_timestamp_mode == Some(true) {
+                    return Err(BackendError::unsupported(
+                        "视频 source timestamp",
+                        format!(
+                            "absolute_100ns={absolute_timestamp_100ns:?} origin_100ns={origin_timestamp_100ns:?}"
+                        ),
+                        "正式录制期间 source timestamp 可用性发生变化",
+                    ));
+                }
+                self.source_timestamp_mode = Some(false);
+                None
+            }
+            _ => {
+                return Err(BackendError::unsupported(
+                    "视频 source timestamp",
+                    format!(
+                        "absolute_100ns={absolute_timestamp_100ns:?} origin_100ns={origin_timestamp_100ns:?}"
+                    ),
+                    "正式录制期间 source timestamp 可用性发生变化",
+                ));
+            }
+        };
+
+        if self
+            .pending_by_transport_90k
+            .insert(
+                transport_timestamp_90k,
+                PendingPresentationTimestamp::Track {
+                    timestamp_90k,
+                    presentation_timestamp_100ns,
+                },
+            )
+            .is_some()
+        {
+            return Err(BackendError::unsupported(
+                "视频 source timestamp",
+                format!("transport_timestamp_90k={transport_timestamp_90k}"),
+                "编码器 transport timestamp 重复，无法唯一对应 source PTS",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn attach(
+        &mut self,
+        sample: &mut crate::backend::mp4_mux::HevcAccessUnit,
+    ) -> Result<(), BackendError> {
+        let transport_timestamp_90k = sample.timestamp_90k;
+        let pending = self
+            .pending_by_transport_90k
+            .remove(&transport_timestamp_90k)
+            .ok_or_else(|| {
+                BackendError::unsupported(
+                    "视频 source timestamp",
+                    format!("transport_timestamp_90k={transport_timestamp_90k}"),
+                    "编码器输出没有对应的提交时间戳",
+                )
+            })?;
+
+        let PendingPresentationTimestamp::Track {
+            timestamp_90k,
+            presentation_timestamp_100ns,
+        } = pending
+        else {
+            sample.discard_from_track = true;
+            sample.presentation_timestamp_100ns = None;
+            return Ok(());
+        };
+
+        sample.discard_from_track = false;
+        sample.timestamp_90k = timestamp_90k;
+        if let Some(previous) = self.last_attached_90k
+            && timestamp_90k <= previous
+        {
+            return Err(BackendError::unsupported(
+                "视频 source timestamp",
+                format!("previous_90k={previous} current_90k={timestamp_90k}"),
+                "编码输出的源 VFR 时间戳非严格递增",
+            ));
+        }
+        self.last_attached_90k = Some(timestamp_90k);
+
+        if let Some(exact) = presentation_timestamp_100ns {
+            if let Some(previous) = self.last_attached_100ns
+                && exact <= previous
+            {
+                return Err(BackendError::unsupported(
+                    "视频 source timestamp",
+                    format!("previous_100ns={previous} current_100ns={exact}"),
+                    "编码输出的 source PTS 非严格递增",
+                ));
+            }
+            let tail = self
+                .last_attached_100ns
+                .map(|previous| exact.saturating_sub(previous).max(1))
+                .unwrap_or(1);
+            self.presentation_duration_100ns = Some(exact.saturating_add(tail).max(1));
+            self.last_attached_100ns = Some(exact);
+            sample.presentation_timestamp_100ns = Some(exact);
+        } else {
+            sample.presentation_timestamp_100ns = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn presentation_duration_100ns(&self) -> Option<u64> {
+        self.presentation_duration_100ns
+    }
+
+    fn has_pending_transport_timestamp(&self, transport_timestamp_90k: u64) -> bool {
+        self.pending_by_transport_90k
+            .contains_key(&transport_timestamp_90k)
+    }
+
+    pub(super) fn finish(&self) -> Result<(), BackendError> {
+        let pending_track_correlations = self
+            .pending_by_transport_90k
+            .values()
+            .filter(|pending| matches!(pending, PendingPresentationTimestamp::Track { .. }))
+            .count();
+        if pending_track_correlations > 0 {
+            return Err(BackendError::unsupported(
+                "视频 source timestamp",
+                format!("pending_correlations={pending_track_correlations}"),
+                "编码器结束后仍有 source PTS 未对应到输出 AU",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RecordHevcStats {
     fn observe(&mut self, sample: &crate::backend::mp4_mux::HevcAccessUnit) {
         if sample.discard_from_track {
@@ -222,6 +427,40 @@ pub(super) fn push_record_hevc_sample(
     if retain_sample || sample.discard_from_track {
         samples.push(sample);
     }
+}
+
+pub(super) fn push_record_hevc_sample_with_timeline(
+    samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
+    mut sample: crate::backend::mp4_mux::HevcAccessUnit,
+    encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    retain_sample: bool,
+    stats: &mut RecordHevcStats,
+    timeline: &mut PresentationTimestampTracker,
+) -> Result<(), BackendError> {
+    timeline.attach(&mut sample)?;
+    push_record_hevc_sample(samples, sample, encoded_sink, retain_sample, stats);
+    Ok(())
+}
+
+pub(super) fn presentation_timeline_duration_100ns(
+    samples: &[crate::backend::mp4_mux::HevcAccessUnit],
+) -> Option<u64> {
+    let mut timestamps = samples
+        .iter()
+        .filter(|sample| !sample.discard_from_track)
+        .map(|sample| sample.presentation_timestamp_100ns);
+    let first = timestamps.next()??;
+    let mut previous = None;
+    let mut last = first;
+    for timestamp in timestamps {
+        let timestamp = timestamp?;
+        previous = Some(last);
+        last = timestamp;
+    }
+    let tail = previous
+        .map(|previous| last.saturating_sub(previous).max(1))
+        .unwrap_or(1);
+    Some(last.saturating_add(tail).max(1))
 }
 
 pub(super) fn mfx_frame_type_is_sync(frame_type: u16) -> bool {
@@ -463,14 +702,20 @@ pub(super) unsafe fn finish_synced_async_encode(
         .bitstream
         .Data
         .add(flight.bitstream.DataOffset as usize);
-    let data = std::slice::from_raw_parts(start, len).to_vec();
+    let data = Arc::<[u8]>::from(std::slice::from_raw_parts(start, len));
     let sync_candidate = flight.is_sync || mfx_frame_type_is_sync(flight.bitstream.FrameType);
     let is_sync =
         sync_candidate && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&data);
     bitstream_pool.push(flight.storage);
+    let output_timestamp_90k = if flight.bitstream.TimeStamp == u64::MAX {
+        flight.timestamp_90k
+    } else {
+        flight.bitstream.TimeStamp
+    };
     Ok(Some(crate::backend::mp4_mux::HevcAccessUnit {
-        timestamp_90k: flight.timestamp_90k,
-        data: data.into(),
+        timestamp_90k: output_timestamp_90k,
+        presentation_timestamp_100ns: None,
+        data,
         is_sync,
         discard_from_track: flight.discard,
     }))
@@ -542,7 +787,7 @@ pub(super) unsafe fn encode_surface_or_flush_bytes(
             sync_status: i32::MIN,
             timestamp_90k: 0,
             frame_type: 0,
-            bytes: Vec::new(),
+            bytes: None,
         });
     }
     if encode_status < MFX_ERR_NONE {
@@ -567,9 +812,9 @@ pub(super) unsafe fn encode_surface_or_flush_bytes(
     let start = bitstream.Data.add(bitstream.DataOffset as usize);
     let len = bitstream.DataLength as usize;
     let bytes = if len == 0 {
-        Vec::new()
+        None
     } else {
-        std::slice::from_raw_parts(start, len).to_vec()
+        Some(Arc::<[u8]>::from(std::slice::from_raw_parts(start, len)))
     };
     Ok(EncodedSurfaceBytes {
         encode_status,
@@ -612,7 +857,7 @@ pub(super) unsafe fn flush_encoder(
             if encoded.encode_status == MFX_ERR_MORE_DATA {
                 break;
             }
-            if !encoded.bytes.is_empty() {
+            if let Some(bytes) = encoded.bytes {
                 let last_timestamp = samples.last().map(|sample| sample.timestamp_90k);
                 let last_timestamp = stats
                     .last_timestamp_90k
@@ -626,12 +871,13 @@ pub(super) unsafe fn flush_encoder(
                     continue;
                 }
                 let is_sync = mfx_frame_type_is_sync(encoded.frame_type)
-                    && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&encoded.bytes);
+                    && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&bytes);
                 push_record_hevc_sample(
                     samples,
                     crate::backend::mp4_mux::HevcAccessUnit {
                         timestamp_90k,
-                        data: encoded.bytes.into(),
+                        presentation_timestamp_100ns: None,
+                        data: bytes,
                         is_sync,
                         discard_from_track: false,
                     },
@@ -639,6 +885,62 @@ pub(super) unsafe fn flush_encoder(
                     retain_output_samples,
                     stats,
                 );
+            } else {
+                break;
+            }
+        }
+        Ok(skipped_non_monotonic)
+    })();
+    bitstream_pool.push(storage);
+    result
+}
+
+/// Timeline-aware variant for routes that submit source-derived presentation
+/// timestamps. Kept separate from `flush_encoder` so legacy 90 kHz-only
+/// callers retain their existing behavior until they opt into the tracker.
+pub(super) unsafe fn flush_encoder_with_timeline(
+    api: &VplApi,
+    session: MfxSession,
+    samples: &mut Vec<crate::backend::mp4_mux::HevcAccessUnit>,
+    encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
+    retain_output_samples: bool,
+    stats: &mut RecordHevcStats,
+    presentation_timeline: &mut PresentationTimestampTracker,
+    bitstream_pool: &mut Vec<Vec<u8>>,
+) -> Result<u32, BackendError> {
+    let mut storage = bitstream_pool
+        .pop()
+        .unwrap_or_else(|| vec![0u8; VPL_BITSTREAM_MIN_BYTES + 31]);
+    let result = (|| -> Result<u32, BackendError> {
+        let mut skipped_non_monotonic = 0u32;
+        loop {
+            let encoded =
+                encode_surface_or_flush_bytes(api, session, ptr::null_mut(), &mut storage)?;
+            if encoded.encode_status == MFX_ERR_MORE_DATA {
+                break;
+            }
+            if let Some(bytes) = encoded.bytes {
+                let timestamp_90k = encoded.timestamp_90k;
+                if !presentation_timeline.has_pending_transport_timestamp(timestamp_90k) {
+                    skipped_non_monotonic = skipped_non_monotonic.saturating_add(1);
+                    continue;
+                }
+                let is_sync = mfx_frame_type_is_sync(encoded.frame_type)
+                    && crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&bytes);
+                push_record_hevc_sample_with_timeline(
+                    samples,
+                    crate::backend::mp4_mux::HevcAccessUnit {
+                        timestamp_90k,
+                        presentation_timestamp_100ns: None,
+                        data: bytes,
+                        is_sync,
+                        discard_from_track: false,
+                    },
+                    encoded_sink,
+                    retain_output_samples,
+                    stats,
+                    presentation_timeline,
+                )?;
             } else {
                 break;
             }

@@ -11,17 +11,18 @@ pub(super) fn write_disk_segment_sidecar(
     }
     let file = fs::File::create(path).map_err(|err| BackendError::Io(err.to_string()))?;
     let mut file = BufWriter::with_capacity(1024 * 1024, file);
-    file.write_all(DISK_SEGMENT_SIDECAR_MAGIC)
+    file.write_all(DISK_SEGMENT_SIDECAR_MAGIC_V4)
         .map_err(|err| BackendError::Io(err.to_string()))?;
     write_u16(&mut file, index.video_track.width)?;
     write_u16(&mut file, index.video_track.height)?;
     write_color(&mut file, index.video_track.color)?;
     write_codec(&mut file, index.video_track.codec)?;
     write_parameter_sets(&mut file, &index.video_track.parameter_sets)?;
-    write_u64(&mut file, index.video_track.duration_90k)?;
+    write_u32(&mut file, index.video_track.timescale)?;
+    write_u64(&mut file, index.video_track.duration_ticks)?;
     write_u64(&mut file, index.video_track.samples.len() as u64)?;
     for sample in &index.video_track.samples {
-        write_u32(&mut file, sample.duration_90k)?;
+        write_u32(&mut file, sample.duration_ticks)?;
         write_u8(&mut file, u8::from(sample.is_sync))?;
         write_u64(&mut file, sample.offset)?;
         write_u64(&mut file, sample.len)?;
@@ -52,24 +53,41 @@ pub(super) fn read_disk_segment_sidecar(path: &Path) -> Result<HevcAacMp4Index, 
     let mut magic = [0u8; 8];
     file.read_exact(&mut magic)
         .map_err(|err| BackendError::Io(err.to_string()))?;
-    if &magic != DISK_SEGMENT_SIDECAR_MAGIC {
+    let version = if &magic == DISK_SEGMENT_SIDECAR_MAGIC_V3 {
+        SidecarVersion::V3
+    } else if &magic == DISK_SEGMENT_SIDECAR_MAGIC_V4 {
+        SidecarVersion::V4
+    } else {
         return Err(BackendError::unsupported(
             "磁盘循环缓存",
             path.display().to_string(),
             "sidecar 文件头不匹配",
         ));
-    }
+    };
     let width = read_u16(&mut file)?;
     let height = read_u16(&mut file)?;
     let color = read_color(&mut file)?;
     let codec = read_codec(&mut file)?;
     let parameter_sets = read_parameter_sets(&mut file)?;
-    let duration_90k = read_u64(&mut file)?;
+    let (timescale, duration_ticks) = match version {
+        SidecarVersion::V3 => (VIDEO_CLOCK_HZ as u32, read_u64(&mut file)?),
+        SidecarVersion::V4 => {
+            let timescale = read_u32(&mut file)?;
+            if timescale == 0 {
+                return Err(BackendError::unsupported(
+                    "磁盘循环缓存",
+                    path.display().to_string(),
+                    "sidecar 视频 timescale 为 0",
+                ));
+            }
+            (timescale, read_u64(&mut file)?)
+        }
+    };
     let video_sample_count = read_len(&mut file)?;
     let mut video_samples = Vec::with_capacity(video_sample_count);
     for _ in 0..video_sample_count {
         video_samples.push(HevcIndexedSample {
-            duration_90k: read_u32(&mut file)?,
+            duration_ticks: read_u32(&mut file)?,
             is_sync: read_u8(&mut file)? != 0,
             offset: read_u64(&mut file)?,
             len: read_u64(&mut file)?,
@@ -102,7 +120,8 @@ pub(super) fn read_disk_segment_sidecar(path: &Path) -> Result<HevcAacMp4Index, 
         video_track: HevcIndexedMp4Track {
             width,
             height,
-            duration_90k,
+            timescale,
+            duration_ticks,
             color,
             codec,
             parameter_sets,
@@ -110,6 +129,12 @@ pub(super) fn read_disk_segment_sidecar(path: &Path) -> Result<HevcAacMp4Index, 
         },
         audio_track,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarVersion {
+    V3,
+    V4,
 }
 
 pub(super) fn write_color(
