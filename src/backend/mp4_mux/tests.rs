@@ -54,10 +54,12 @@ fn muxer_can_emit_video_and_aac_tracks() {
         width: 16,
         height: 16,
         duration_90k: 90_000,
+        presentation_duration_100ns: None,
         color: NclxColorMetadata::bt709_full(),
         codec: HevcCodecMetadata::main_420_8(),
         samples: vec![HevcAccessUnit {
             timestamp_90k: 0,
+            presentation_timestamp_100ns: None,
             data: fake_hevc_annex_b_access_unit().into(),
             is_sync: true,
             discard_from_track: false,
@@ -106,10 +108,12 @@ fn muxer_preserves_aac_leading_offset_with_an_edit_list() {
         width: 16,
         height: 16,
         duration_90k: 90_000,
+        presentation_duration_100ns: None,
         color: NclxColorMetadata::bt709_full(),
         codec: HevcCodecMetadata::main_420_8(),
         samples: vec![HevcAccessUnit {
             timestamp_90k: 0,
+            presentation_timestamp_100ns: None,
             data: fake_hevc_annex_b_access_unit().into(),
             is_sync: true,
             discard_from_track: false,
@@ -170,10 +174,12 @@ fn video_track_rejects_non_key_first_sample() {
         width: 16,
         height: 16,
         duration_90k: 90_000,
+        presentation_duration_100ns: None,
         color: NclxColorMetadata::bt709_full(),
         codec: HevcCodecMetadata::main_420_8(),
         samples: vec![HevcAccessUnit {
             timestamp_90k: 0,
+            presentation_timestamp_100ns: None,
             data: non_key.into(),
             is_sync: false,
             discard_from_track: false,
@@ -195,10 +201,12 @@ fn video_track_does_not_trust_a_false_sync_flag() {
         width: 16,
         height: 16,
         duration_90k: 90_000,
+        presentation_duration_100ns: None,
         color: NclxColorMetadata::bt709_full(),
         codec: HevcCodecMetadata::main_420_8(),
         samples: vec![HevcAccessUnit {
             timestamp_90k: 0,
+            presentation_timestamp_100ns: None,
             data: non_key.into(),
             is_sync: true,
             discard_from_track: false,
@@ -239,6 +247,48 @@ fn chunk_offsets_switch_to_co64_when_needed() {
     assert!(co64.windows(4).any(|window| window == b"co64"));
     assert_eq!(&co64[16..24], &32u64.to_be_bytes());
     assert_eq!(&co64[24..32], &(u32::MAX as u64 + 1).to_be_bytes());
+}
+
+#[test]
+fn exact_100ns_video_timeline_preserves_sub_90k_intervals() {
+    let access_unit = fake_hevc_annex_b_access_unit();
+    let track = HevcMp4Track {
+        width: 16,
+        height: 16,
+        duration_90k: 1,
+        presentation_duration_100ns: Some(110),
+        color: NclxColorMetadata::bt709_full(),
+        codec: HevcCodecMetadata::main_420_8(),
+        samples: vec![
+            HevcAccessUnit {
+                timestamp_90k: 0,
+                presentation_timestamp_100ns: Some(0),
+                data: access_unit.clone().into(),
+                is_sync: true,
+                discard_from_track: false,
+            },
+            HevcAccessUnit {
+                timestamp_90k: 1,
+                presentation_timestamp_100ns: Some(55),
+                data: access_unit.into(),
+                is_sync: true,
+                discard_from_track: false,
+            },
+        ],
+    };
+
+    let prepared = writer::prepare_video_track(&track).unwrap();
+    assert_eq!(prepared.timescale, VIDEO_TIMESCALE_100NS);
+    assert_eq!(prepared.duration_ticks, 110);
+    assert_eq!(prepared.samples[0].duration_ticks, 55);
+    assert_eq!(prepared.samples[1].duration_ticks, 55);
+}
+
+#[test]
+fn mdhd_uses_version_one_for_u64_video_duration() {
+    let mdhd = make_mdhd(VIDEO_TIMESCALE_100NS, u64::from(u32::MAX) + 1);
+    assert_eq!(&mdhd[4..8], b"mdhd");
+    assert_eq!(mdhd[8], 1);
 }
 
 fn fake_hevc_annex_b_access_unit() -> Vec<u8> {

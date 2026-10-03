@@ -183,6 +183,22 @@ pub(super) fn wgc_timestamp_from_origin_90k(timestamp_100ns: i64, origin_100ns: 
     (((delta_100ns * VIDEO_CLOCK_HZ as i128) + 5_000_000i128) / 10_000_000i128).max(0) as u64
 }
 
+/// Map a WGC source timestamp to the oneVPL transport clock without allowing
+/// two distinct source frames to reuse the same 90 kHz key. The second return
+/// value is the transport-only compensation; the caller must retain the
+/// original 100 ns timestamp for presentation timing.
+pub(super) fn quantize_wgc_timestamp_90k(
+    timestamp_100ns: i64,
+    origin_100ns: i64,
+    previous_90k: Option<u64>,
+) -> (u64, u64) {
+    let mapped = wgc_timestamp_from_origin_90k(timestamp_100ns, origin_100ns);
+    let timestamp = previous_90k
+        .map(|previous| mapped.max(previous.saturating_add(1)))
+        .unwrap_or(mapped);
+    (timestamp, timestamp.saturating_sub(mapped))
+}
+
 pub(super) fn encoded_timeline_duration_90k(
     samples: &[crate::backend::mp4_mux::HevcAccessUnit],
     last_timestamp_90k: Option<u64>,

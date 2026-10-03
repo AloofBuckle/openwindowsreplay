@@ -1,0 +1,29 @@
+# Keep the repository index normalized and make checkouts deterministic.
+* text=auto eol=lf
+
+# Windows-native scripts are checked out with CRLF while remaining normalized
+# as text in the Git index.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary artifacts must never pass through text or EOL conversion filters.
+*.dll binary
+*.exe binary
+*.lib binary
+*.pdb binary
+*.zip binary
+*.7z binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.ico binary
+*.gif binary
+*.webp binary
+*.pdf binary
+*.mp4 binary
+*.wav binary
+*.aac binary
+*.hevc binary
+*.rrseg binary

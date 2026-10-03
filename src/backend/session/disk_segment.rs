@@ -62,6 +62,7 @@ impl DiskSegmentSink {
         }
         if let Some(mut current) = self.current.take() {
             current.end_90k = Some(recorded.video_track.duration_90k);
+            current.end_presentation_100ns = recorded.video_track.presentation_duration_100ns;
             self.pending.push_back(current);
         }
         let final_audio_ticks = recorded
@@ -71,8 +72,9 @@ impl DiskSegmentSink {
             .unwrap_or(self.latest_audio_ticks);
         self.latest_audio_ticks = self.latest_audio_ticks.max(final_audio_ticks);
         if let Ok(mut ring) = self.live_ring.lock() {
-            ring.finish_segment_with_audio_duration(
+            ring.finish_segment_with_audio_and_presentation_duration(
                 recorded.video_track.duration_90k,
+                recorded.video_track.presentation_duration_100ns,
                 recorded
                     .audio_track
                     .as_ref()
@@ -193,6 +195,7 @@ impl DiskSegmentSink {
             let mut current = DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
+                sample.presentation_timestamp_100ns,
                 start_audio_ticks,
                 parameter_set_header
                     .take()
@@ -212,6 +215,7 @@ impl DiskSegmentSink {
                 scale_90k_to_ticks(sample.timestamp_90k, audio_sample_rate);
             if let Some(mut current) = self.current.take() {
                 current.end_90k = Some(sample.timestamp_90k);
+                current.end_presentation_100ns = sample.presentation_timestamp_100ns;
                 carried_audio = current.take_audio_at_or_after(next_start_audio_ticks);
                 self.pending.push_back(current);
             }
@@ -225,6 +229,7 @@ impl DiskSegmentSink {
             self.current = Some(DiskSegmentBuilder::new(
                 metadata.clone(),
                 sample.timestamp_90k,
+                sample.presentation_timestamp_100ns,
                 scale_90k_to_ticks(sample.timestamp_90k, audio_sample_rate),
                 parameter_set_header
                     .take()
@@ -338,14 +343,32 @@ impl DiskSegmentSink {
             segment,
             enqueued_at: Instant::now(),
         };
-        match self.writer_tx.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.fail(format!(
-                "磁盘循环写入队列已满（容量 {}），磁盘速度低于编码分段产生速度",
-                DISK_WRITER_QUEUE_CAPACITY
-            )),
-            Err(TrySendError::Disconnected(_)) => {
-                self.fail("磁盘循环异步 writer 已停止".to_owned())
+        let mut pending_job = job;
+        let mut backpressure_reported = false;
+        loop {
+            match self.writer_tx.try_send(pending_job) {
+                Ok(()) => break,
+                Err(TrySendError::Full(job)) => {
+                    pending_job = job;
+                    if self.stop.load(Ordering::Relaxed) {
+                        self.fail(
+                            "磁盘循环写入队列在停止期间仍然已满，最终分段未能排队写入".to_owned(),
+                        );
+                        break;
+                    }
+                    if !backpressure_reported {
+                        backpressure_reported = true;
+                        self.send_status(&format!(
+                            "磁盘循环写入队列已满（容量 {}），等待 writer 释放槽位；录制会话保持有效",
+                            DISK_WRITER_QUEUE_CAPACITY
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.fail("磁盘循环异步 writer 已停止".to_owned());
+                    break;
+                }
             }
         }
     }
@@ -375,8 +398,10 @@ impl DiskSegmentSink {
 pub(super) struct DiskSegmentBuilder {
     pub(super) metadata: EncodedReplayMetadata,
     pub(super) start_90k: u64,
+    pub(super) start_presentation_100ns: Option<u64>,
     pub(super) start_audio_ticks: u64,
     pub(super) end_90k: Option<u64>,
+    pub(super) end_presentation_100ns: Option<u64>,
     pub(super) video_samples: Vec<HevcAccessUnit>,
     pub(super) audio_samples: Vec<AacAccessUnit>,
     pub(super) parameter_set_header: Arc<[u8]>,
@@ -386,14 +411,17 @@ impl DiskSegmentBuilder {
     pub(super) fn new(
         metadata: EncodedReplayMetadata,
         start_90k: u64,
+        start_presentation_100ns: Option<u64>,
         start_audio_ticks: u64,
         parameter_set_header: Arc<[u8]>,
     ) -> Self {
         Self {
             metadata,
             start_90k,
+            start_presentation_100ns,
             start_audio_ticks,
             end_90k: None,
+            end_presentation_100ns: None,
             video_samples: Vec::new(),
             audio_samples: Vec::new(),
             parameter_set_header,
@@ -409,6 +437,14 @@ impl DiskSegmentBuilder {
     pub(super) fn push_video(&mut self, sample: &HevcAccessUnit) {
         let mut sample = sample.clone();
         sample.timestamp_90k = sample.timestamp_90k.saturating_sub(self.start_90k);
+        sample.presentation_timestamp_100ns = match (
+            sample.presentation_timestamp_100ns,
+            self.start_presentation_100ns,
+        ) {
+            (Some(timestamp), Some(start)) => Some(timestamp.saturating_sub(start)),
+            (None, None) => None,
+            _ => None,
+        };
         self.video_samples.push(sample);
     }
 
@@ -456,6 +492,11 @@ impl DiskSegmentBuilder {
     pub(super) fn into_tracks(self) -> Option<DiskSegmentTracks> {
         let end_90k = self.end_90k?;
         let duration_90k = end_90k.saturating_sub(self.start_90k).max(1);
+        let presentation_duration_100ns =
+            match (self.end_presentation_100ns, self.start_presentation_100ns) {
+                (Some(end), Some(start)) => Some(end.saturating_sub(start).max(1)),
+                _ => None,
+            };
         if !self.has_video() {
             return None;
         }
@@ -468,6 +509,7 @@ impl DiskSegmentBuilder {
         }
         let mut samples = vec![HevcAccessUnit {
             timestamp_90k: 0,
+            presentation_timestamp_100ns: None,
             data: self.parameter_set_header,
             is_sync: false,
             discard_from_track: true,
@@ -485,8 +527,7 @@ impl DiskSegmentBuilder {
                         .saturating_add(u64::from(sample.duration_ticks))
                 })
                 .max()
-                .unwrap_or(1)
-                .max(1);
+                .unwrap_or(1);
             let segment_duration_ticks =
                 scale_90k_to_ticks(duration_90k, self.metadata.audio_sample_rate);
             Some(AacLcMp4Track {
@@ -503,6 +544,7 @@ impl DiskSegmentBuilder {
                 width: self.metadata.width,
                 height: self.metadata.height,
                 duration_90k,
+                presentation_duration_100ns,
                 color: self.metadata.color,
                 codec: self.metadata.codec,
                 samples,
@@ -545,6 +587,7 @@ pub(super) fn concat_disk_indexed_segments(
     let mut audio_samples = Vec::new();
     let parameter_sets = first.index.video_track.parameter_sets.clone();
     let mut video_base_90k = 0u64;
+    let mut video_duration_ticks = 0u64;
     let mut expected_audio_timestamp_ticks = None;
     let audio_sample_rate = first
         .index
@@ -563,7 +606,7 @@ pub(super) fn concat_disk_indexed_segments(
         let segment_audio_base_ticks = scale_90k_to_ticks(video_base_90k, audio_sample_rate);
         video_samples.extend(segment.index.video_track.samples.iter().map(|sample| {
             HevcPreparedSample {
-                duration_90k: sample.duration_90k,
+                duration_ticks: sample.duration_ticks,
                 is_sync: sample.is_sync,
                 data: Mp4SampleFileRange {
                     path: segment.mp4_path.clone(),
@@ -602,7 +645,14 @@ pub(super) fn concat_disk_indexed_segments(
                 });
             }
         }
-        video_base_90k = video_base_90k.saturating_add(segment.index.video_track.duration_90k);
+        let segment_duration_90k = scale_video_ticks(
+            segment.index.video_track.duration_ticks,
+            segment.index.video_track.timescale,
+            VIDEO_CLOCK_HZ as u32,
+        );
+        video_base_90k = video_base_90k.saturating_add(segment_duration_90k);
+        video_duration_ticks =
+            video_duration_ticks.saturating_add(segment.index.video_track.duration_ticks);
     }
     if video_samples.is_empty() {
         return Ok(None);
@@ -623,7 +673,8 @@ pub(super) fn concat_disk_indexed_segments(
         video_track: HevcPreparedMp4Track {
             width: first.index.video_track.width,
             height: first.index.video_track.height,
-            duration_90k: video_base_90k.max(1),
+            timescale: first.index.video_track.timescale,
+            duration_ticks: video_duration_ticks.max(1),
             color: first.index.video_track.color,
             codec: first.index.video_track.codec,
             parameter_sets,
@@ -637,6 +688,15 @@ pub(super) fn concat_disk_indexed_segments(
     }))
 }
 
+pub(super) fn scale_video_ticks(value: u64, source_timescale: u32, target_timescale: u32) -> u64 {
+    if source_timescale == 0 || target_timescale == 0 {
+        return 0;
+    }
+    ((u128::from(value) * u128::from(target_timescale) + u128::from(source_timescale / 2))
+        / u128::from(source_timescale))
+    .min(u128::from(u64::MAX)) as u64
+}
+
 pub(super) fn validate_disk_segment_compatibility(
     expected: &DiskSegmentIndexedTracks,
     actual: &DiskSegmentIndexedTracks,
@@ -645,6 +705,7 @@ pub(super) fn validate_disk_segment_compatibility(
     let actual_video = &actual.index.video_track;
     let incompatible_video = expected_video.width != actual_video.width
         || expected_video.height != actual_video.height
+        || expected_video.timescale != actual_video.timescale
         || expected_video.color != actual_video.color
         || expected_video.codec != actual_video.codec
         || expected_video.parameter_sets != actual_video.parameter_sets;
@@ -652,7 +713,7 @@ pub(super) fn validate_disk_segment_compatibility(
         return Err(BackendError::unsupported(
             "磁盘循环缓存拼接",
             actual.mp4_path.display().to_string(),
-            "分段的分辨率、色彩、HEVC profile/位深或 VPS/SPS/PPS 与当前保存 epoch 不一致",
+            "分段的视频 timescale、分辨率、色彩、HEVC profile/位深或 VPS/SPS/PPS 与当前保存 epoch 不一致",
         ));
     }
     if !actual_video

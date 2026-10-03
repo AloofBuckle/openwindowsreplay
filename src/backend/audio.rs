@@ -1,18 +1,21 @@
 //! 音频后端基础结构。
 //!
 //! 文档目标是 WASAPI loopback + 麦克风 -> 48k stereo float PCM -> AAC LC -> MP4。
-//! 本模块先实现与平台无关的时间戳保持、声道混合、线性重采样和 AAC 1024-sample
+//! 本模块先实现与平台无关的时间戳保持、声道混合、有状态带限重采样和 AAC 1024-sample
 //! 输入分块；实际 WASAPI 采集与 Media Foundation AAC 编码后续接到这些结构上。
 #![allow(dead_code)]
 
 use crate::error::BackendError;
+use std::collections::VecDeque;
 
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
 pub const TARGET_CHANNELS: u16 = 2;
 pub const AAC_LC_FRAME_SAMPLES: usize = 1024;
 const HNS_PER_SECOND: i128 = 10_000_000;
+const RESAMPLE_FILTER_RADIUS: i64 = 32;
+const MAX_RESAMPLE_GAP_SECONDS: i64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioSourceKind {
     Loopback,
     Microphone,
@@ -104,6 +107,238 @@ impl StereoPcmFrame {
     }
 }
 
+/// Stateful, packet-boundary-independent PCM normalizer.
+///
+/// The resampling phase is anchored to the first packet timestamp and the
+/// windowed-sinc kernel keeps enough history/future input to make packetized
+/// WASAPI input equivalent to one continuous stream. Downsampling uses a
+/// band-limited kernel so source content above the 48 kHz Nyquist frequency is
+/// rejected instead of being folded into the saved replay.
+#[derive(Debug)]
+pub struct PcmStreamNormalizer {
+    source: AudioSourceKind,
+    input_format: Option<PcmFormat>,
+    base_time_100ns: i64,
+    input: VecDeque<[f32; 2]>,
+    input_start_index: i64,
+    input_end_index: i64,
+    next_output_index: u64,
+}
+
+impl PcmStreamNormalizer {
+    pub fn new(source: AudioSourceKind) -> Self {
+        Self {
+            source,
+            input_format: None,
+            base_time_100ns: 0,
+            input: VecDeque::new(),
+            input_start_index: 0,
+            input_end_index: 0,
+            next_output_index: 0,
+        }
+    }
+
+    pub fn push(&mut self, frame: &PcmFrame) -> Result<Vec<PcmFrame>, BackendError> {
+        frame.validate()?;
+        if frame.source != self.source {
+            return Err(BackendError::AudioUnsupported {
+                reason: format!(
+                    "音频流归一化器 source={:?} 收到 {:?} packet",
+                    self.source, frame.source
+                ),
+            });
+        }
+
+        let mut out = Vec::new();
+        if self
+            .input_format
+            .is_some_and(|format| format != frame.format)
+        {
+            out.extend(self.finish());
+        }
+
+        let stereo = remix_to_stereo(frame);
+        if frame.format.sample_rate == TARGET_SAMPLE_RATE {
+            if self.input_format.is_some() {
+                out.extend(self.finish());
+            }
+            if !stereo.is_empty() {
+                out.push(pcm_frame_from_stereo(
+                    self.source,
+                    frame.start_time_100ns,
+                    stereo,
+                ));
+            }
+            return Ok(out);
+        }
+
+        if self.input_format.is_none() {
+            self.input_format = Some(frame.format);
+            self.base_time_100ns = frame.start_time_100ns;
+            self.input_start_index = 0;
+            self.input_end_index = 0;
+            self.next_output_index = 0;
+        }
+
+        let mut packet_start = duration_100ns_to_samples_round_signed(
+            frame.start_time_100ns.saturating_sub(self.base_time_100ns),
+            frame.format.sample_rate,
+        );
+        if packet_start > self.input_end_index {
+            let gap = packet_start - self.input_end_index;
+            let max_gap =
+                i64::from(frame.format.sample_rate).saturating_mul(MAX_RESAMPLE_GAP_SECONDS);
+            if gap > max_gap {
+                // A device timestamp jump can be arbitrarily large after a
+                // sleep/reconnect. Do not materialize unbounded silence; the
+                // mixer already restores silence from the absolute timestamps.
+                out.extend(self.finish());
+                self.input_format = Some(frame.format);
+                self.base_time_100ns = frame.start_time_100ns;
+                self.input_start_index = 0;
+                self.input_end_index = 0;
+                self.next_output_index = 0;
+                packet_start = 0;
+            } else {
+                let gap = usize::try_from(gap).map_err(|_| BackendError::AudioUnsupported {
+                    reason: format!(
+                        "PCM 时间戳间隙 {} samples 超出当前平台可寻址范围",
+                        packet_start - self.input_end_index
+                    ),
+                })?;
+                self.input.extend(std::iter::repeat_n([0.0, 0.0], gap));
+                self.input_end_index = packet_start;
+            }
+        }
+        let overlap = self.input_end_index.saturating_sub(packet_start).max(0) as usize;
+        if overlap < stereo.len() {
+            self.input.extend(stereo[overlap..].iter().copied());
+            self.input_end_index = self
+                .input_end_index
+                .saturating_add((stereo.len() - overlap) as i64);
+        }
+        if let Some(frame) = self.emit_ready(false) {
+            out.push(frame);
+        }
+        Ok(out)
+    }
+
+    pub fn finish(&mut self) -> Vec<PcmFrame> {
+        let mut out = Vec::new();
+        if let Some(frame) = self.emit_ready(true) {
+            out.push(frame);
+        }
+        self.input_format = None;
+        self.input.clear();
+        self.input_start_index = 0;
+        self.input_end_index = 0;
+        self.next_output_index = 0;
+        out
+    }
+
+    fn emit_ready(&mut self, flush: bool) -> Option<PcmFrame> {
+        let input_rate = self.input_format?.sample_rate;
+        if self.input_end_index <= 0 {
+            return None;
+        }
+        let first_output_index = self.next_output_index;
+        let flush_limit = ((self.input_end_index as u128 * u128::from(TARGET_SAMPLE_RATE))
+            .div_ceil(u128::from(input_rate)))
+        .min(u128::from(u64::MAX)) as u64;
+        let mut samples = Vec::new();
+        while self.next_output_index < flush_limit {
+            let source_numerator = u128::from(self.next_output_index) * u128::from(input_rate);
+            let source_center =
+                (source_numerator / u128::from(TARGET_SAMPLE_RATE)).min(i64::MAX as u128) as i64;
+            if !flush
+                && source_center.saturating_add(RESAMPLE_FILTER_RADIUS) >= self.input_end_index
+            {
+                break;
+            }
+            samples.push(self.interpolate(source_numerator, input_rate));
+            self.next_output_index = self.next_output_index.saturating_add(1);
+        }
+        self.prune_consumed_input(input_rate);
+        (!samples.is_empty()).then(|| {
+            pcm_frame_from_stereo(
+                self.source,
+                self.base_time_100ns
+                    .saturating_add(samples_to_100ns(first_output_index, TARGET_SAMPLE_RATE)),
+                samples,
+            )
+        })
+    }
+
+    fn interpolate(&self, source_numerator: u128, input_rate: u32) -> [f32; 2] {
+        let denominator = u128::from(TARGET_SAMPLE_RATE);
+        let center = (source_numerator / denominator).min(i64::MAX as u128) as i64;
+        let remainder = source_numerator % denominator;
+        let cutoff = (TARGET_SAMPLE_RATE as f64 / input_rate as f64).min(1.0);
+        if cutoff == 1.0 && remainder == 0 {
+            return self.sample_at(center);
+        }
+        let source_position = center as f64 + remainder as f64 / TARGET_SAMPLE_RATE as f64;
+        let radius = RESAMPLE_FILTER_RADIUS as f64;
+        let mut left = 0.0f64;
+        let mut right = 0.0f64;
+        let mut weight_sum = 0.0f64;
+        for index in center.saturating_sub(RESAMPLE_FILTER_RADIUS)
+            ..=center.saturating_add(RESAMPLE_FILTER_RADIUS)
+        {
+            let distance = source_position - index as f64;
+            let normalized = distance / radius;
+            if normalized.abs() >= 1.0 {
+                continue;
+            }
+            let window = 0.42
+                + 0.5 * (std::f64::consts::PI * normalized).cos()
+                + 0.08 * (2.0 * std::f64::consts::PI * normalized).cos();
+            let sinc_argument = cutoff * distance;
+            let sinc = if sinc_argument.abs() < 1.0e-12 {
+                1.0
+            } else {
+                let angle = std::f64::consts::PI * sinc_argument;
+                angle.sin() / angle
+            };
+            let weight = cutoff * sinc * window;
+            let sample = self.sample_at(index);
+            left += f64::from(sample[0]) * weight;
+            right += f64::from(sample[1]) * weight;
+            weight_sum += weight;
+        }
+        if weight_sum.abs() < 1.0e-12 {
+            [0.0, 0.0]
+        } else {
+            [(left / weight_sum) as f32, (right / weight_sum) as f32]
+        }
+    }
+
+    fn sample_at(&self, index: i64) -> [f32; 2] {
+        if index < self.input_start_index || index >= self.input_end_index {
+            return [0.0, 0.0];
+        }
+        self.input
+            .get((index - self.input_start_index) as usize)
+            .copied()
+            .unwrap_or([0.0, 0.0])
+    }
+
+    fn prune_consumed_input(&mut self, input_rate: u32) {
+        let next_source_center = ((u128::from(self.next_output_index) * u128::from(input_rate))
+            / u128::from(TARGET_SAMPLE_RATE))
+        .min(i64::MAX as u128) as i64;
+        let keep_from = next_source_center
+            .saturating_sub(RESAMPLE_FILTER_RADIUS)
+            .saturating_sub(1);
+        let remove = keep_from
+            .saturating_sub(self.input_start_index)
+            .max(0)
+            .min(self.input.len() as i64) as usize;
+        self.input.drain(..remove);
+        self.input_start_index = self.input_start_index.saturating_add(remove as i64);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AacPcmBlock {
     /// 48kHz audio timescale 下的绝对 sample tick。
@@ -163,31 +398,52 @@ impl AacBlocker {
 }
 
 pub fn normalize_to_stereo_48k(frame: &PcmFrame) -> Result<StereoPcmFrame, BackendError> {
-    frame.validate()?;
-    let mono_or_stereo = remix_to_stereo(frame);
-    let samples = if frame.format.sample_rate == TARGET_SAMPLE_RATE {
-        mono_or_stereo
-    } else {
-        resample_linear(
-            &mono_or_stereo,
-            frame.format.sample_rate,
-            TARGET_SAMPLE_RATE,
-        )
-    };
+    let mut normalizer = PcmStreamNormalizer::new(frame.source);
+    let mut normalized = normalizer.push(frame)?;
+    normalized.extend(normalizer.finish());
+    let start_time_100ns = normalized
+        .first()
+        .map(|frame| frame.start_time_100ns)
+        .unwrap_or(frame.start_time_100ns);
+    let samples = normalized
+        .into_iter()
+        .flat_map(|frame| {
+            frame
+                .samples
+                .chunks_exact(2)
+                .map(|pair| [pair[0], pair[1]])
+                .collect::<Vec<_>>()
+        })
+        .collect();
     Ok(StereoPcmFrame {
-        start_time_100ns: frame.start_time_100ns,
+        start_time_100ns,
         samples,
     })
 }
 
-pub fn mix_to_stereo_48k(frames: &[PcmFrame]) -> Result<Option<StereoPcmFrame>, BackendError> {
-    let mut normalized = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let converted = normalize_to_stereo_48k(frame)?;
-        if !converted.samples.is_empty() {
-            normalized.push(converted);
+fn normalize_pcm_streams(frames: &[PcmFrame]) -> Result<Vec<StereoPcmFrame>, BackendError> {
+    let mut normalized = Vec::new();
+    for source in [AudioSourceKind::Loopback, AudioSourceKind::Microphone] {
+        let mut source_frames = frames
+            .iter()
+            .filter(|frame| frame.source == source)
+            .collect::<Vec<_>>();
+        source_frames.sort_by_key(|frame| frame.start_time_100ns);
+        let mut normalizer = PcmStreamNormalizer::new(source);
+        for frame in source_frames {
+            for frame in normalizer.push(frame)? {
+                normalized.push(stereo_frame_from_target_pcm(frame));
+            }
+        }
+        for frame in normalizer.finish() {
+            normalized.push(stereo_frame_from_target_pcm(frame));
         }
     }
+    Ok(normalized)
+}
+
+pub fn mix_to_stereo_48k(frames: &[PcmFrame]) -> Result<Option<StereoPcmFrame>, BackendError> {
+    let normalized = normalize_pcm_streams(frames)?;
     if normalized.is_empty() {
         return Ok(None);
     }
@@ -248,9 +504,7 @@ pub fn mix_window_samples_to_stereo_48k(
 
     let window_start_tick = time_100ns_to_sample_ticks(window_start_100ns);
     let window_end_tick = window_start_tick.saturating_add(output_samples as u64);
-    for frame in frames {
-        frame.validate()?;
-        let converted = normalize_to_stereo_48k(frame)?;
+    for converted in normalize_pcm_streams(frames)? {
         if converted.samples.is_empty() {
             continue;
         }
@@ -378,24 +632,41 @@ fn remix_to_stereo(frame: &PcmFrame) -> Vec<[f32; 2]> {
     out
 }
 
-fn resample_linear(input: &[[f32; 2]], from_rate: u32, to_rate: u32) -> Vec<[f32; 2]> {
-    if input.is_empty() || from_rate == 0 || to_rate == 0 {
-        return Vec::new();
+fn pcm_frame_from_stereo(
+    source: AudioSourceKind,
+    start_time_100ns: i64,
+    samples: Vec<[f32; 2]>,
+) -> PcmFrame {
+    PcmFrame {
+        source,
+        start_time_100ns,
+        format: PcmFormat::target(),
+        samples: samples.into_iter().flatten().collect(),
     }
-    let out_len = ((input.len() as u128 * u128::from(to_rate)).div_ceil(u128::from(from_rate)))
-        .max(1) as usize;
-    let ratio = from_rate as f64 / to_rate as f64;
-    let mut out = Vec::with_capacity(out_len);
-    for out_index in 0..out_len {
-        let src_pos = out_index as f64 * ratio;
-        let i0 = src_pos.floor() as usize;
-        let i1 = (i0 + 1).min(input.len() - 1);
-        let t = (src_pos - i0 as f64) as f32;
-        let a = input[i0.min(input.len() - 1)];
-        let b = input[i1];
-        out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+}
+
+fn stereo_frame_from_target_pcm(frame: PcmFrame) -> StereoPcmFrame {
+    StereoPcmFrame {
+        start_time_100ns: frame.start_time_100ns,
+        samples: frame
+            .samples
+            .chunks_exact(2)
+            .map(|pair| [pair[0], pair[1]])
+            .collect(),
     }
-    out
+}
+
+fn duration_100ns_to_samples_round_signed(duration_100ns: i64, sample_rate: u32) -> i64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let numerator = i128::from(duration_100ns) * i128::from(sample_rate);
+    let rounded = if numerator >= 0 {
+        (numerator + HNS_PER_SECOND / 2) / HNS_PER_SECOND
+    } else {
+        (numerator - HNS_PER_SECOND / 2) / HNS_PER_SECOND
+    };
+    rounded.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 fn samples_to_100ns(samples: u64, sample_rate: u32) -> i64 {
@@ -530,21 +801,40 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known bug: packet-local resampling resets interpolation state at every WASAPI packet"]
     fn packetized_44k1_resampling_matches_continuous_stream() {
         let input_rate = 44_100u32;
         let frequency = 10_000.0f32;
         let input = (0..input_rate as usize)
             .map(|index| {
                 let phase = std::f32::consts::TAU * frequency * index as f32 / input_rate as f32;
-                let sample = phase.sin();
-                [sample, sample]
+                phase.sin()
             })
             .collect::<Vec<_>>();
-        let continuous = resample_linear(&input, input_rate, TARGET_SAMPLE_RATE);
-        let packetized = input
-            .chunks(441)
-            .flat_map(|packet| resample_linear(packet, input_rate, TARGET_SAMPLE_RATE))
+        let frame = |start: usize, samples: &[f32]| PcmFrame {
+            source: AudioSourceKind::Loopback,
+            start_time_100ns: samples_to_100ns(start as u64, input_rate),
+            format: PcmFormat {
+                sample_rate: input_rate,
+                channels: 1,
+            },
+            samples: samples.to_vec(),
+        };
+        let continuous = normalize_to_stereo_48k(&frame(0, &input)).unwrap().samples;
+        let mut normalizer = PcmStreamNormalizer::new(AudioSourceKind::Loopback);
+        let mut packetized_frames = Vec::new();
+        for (packet_index, packet) in input.chunks(441).enumerate() {
+            packetized_frames.extend(normalizer.push(&frame(packet_index * 441, packet)).unwrap());
+        }
+        packetized_frames.extend(normalizer.finish());
+        let packetized = packetized_frames
+            .into_iter()
+            .flat_map(|frame| {
+                frame
+                    .samples
+                    .chunks_exact(2)
+                    .map(|pair| [pair[0], pair[1]])
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         assert_eq!(packetized.len(), continuous.len());
         let max_error = packetized
@@ -556,18 +846,210 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known bug: linear downsampling has no anti-alias filter"]
+    fn irregular_packetized_resampling_preserves_phase_and_sample_count() {
+        let input_rate = 44_100u32;
+        let input_len = 44_100usize * 2 + 137;
+        let input = (0..input_len)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * 1_000.0 * index as f32 / input_rate as f32;
+                phase.sin()
+            })
+            .collect::<Vec<_>>();
+        let frame = |start: usize, samples: &[f32]| PcmFrame {
+            source: AudioSourceKind::Loopback,
+            start_time_100ns: samples_to_100ns(start as u64, input_rate),
+            format: PcmFormat {
+                sample_rate: input_rate,
+                channels: 1,
+            },
+            samples: samples.to_vec(),
+        };
+        let continuous = normalize_to_stereo_48k(&frame(0, &input)).unwrap().samples;
+        let mut normalizer = PcmStreamNormalizer::new(AudioSourceKind::Loopback);
+        let mut packetized_frames = Vec::new();
+        let packet_sizes = [17usize, 503, 7, 1_000, 64, 3, 2_048, 31];
+        let mut start = 0usize;
+        let mut packet_index = 0usize;
+        while start < input.len() {
+            let count = packet_sizes[packet_index % packet_sizes.len()]
+                .min(input.len().saturating_sub(start));
+            packetized_frames.extend(
+                normalizer
+                    .push(&frame(start, &input[start..start + count]))
+                    .unwrap(),
+            );
+            start += count;
+            packet_index += 1;
+        }
+        packetized_frames.extend(normalizer.finish());
+        let packetized = packetized_frames
+            .into_iter()
+            .flat_map(|frame| {
+                frame
+                    .samples
+                    .chunks_exact(2)
+                    .map(|pair| [pair[0], pair[1]])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(packetized.len(), continuous.len());
+        let max_error = packetized
+            .iter()
+            .zip(&continuous)
+            .map(|(packet, whole)| (packet[0] - whole[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error < 0.005, "irregular packet max error={max_error}");
+    }
+
+    #[test]
+    fn interleaved_audio_sources_keep_independent_resampler_state() {
+        let input_rate = 44_100u32;
+        let packet = |source, start, value| PcmFrame {
+            source,
+            start_time_100ns: samples_to_100ns(start, input_rate),
+            format: PcmFormat {
+                sample_rate: input_rate,
+                channels: 1,
+            },
+            samples: vec![value; 441],
+        };
+        let mut loopback = PcmStreamNormalizer::new(AudioSourceKind::Loopback);
+        let mut microphone = PcmStreamNormalizer::new(AudioSourceKind::Microphone);
+        let mut loopback_frames = Vec::new();
+        let mut microphone_frames = Vec::new();
+        for index in 0..4u64 {
+            loopback_frames.extend(
+                loopback
+                    .push(&packet(AudioSourceKind::Loopback, index * 441, 0.25))
+                    .unwrap(),
+            );
+            microphone_frames.extend(
+                microphone
+                    .push(&packet(AudioSourceKind::Microphone, index * 441, -0.75))
+                    .unwrap(),
+            );
+        }
+        loopback_frames.extend(loopback.finish());
+        microphone_frames.extend(microphone.finish());
+        assert!(!loopback_frames.is_empty());
+        assert!(!microphone_frames.is_empty());
+        assert!(
+            loopback_frames
+                .iter()
+                .all(|frame| frame.source == AudioSourceKind::Loopback)
+        );
+        assert!(
+            microphone_frames
+                .iter()
+                .all(|frame| frame.source == AudioSourceKind::Microphone)
+        );
+        let loopback_mean = loopback_frames
+            .iter()
+            .flat_map(|frame| frame.samples.iter())
+            .copied()
+            .sum::<f32>();
+        let microphone_mean = microphone_frames
+            .iter()
+            .flat_map(|frame| frame.samples.iter())
+            .copied()
+            .sum::<f32>();
+        assert!(loopback_mean > 0.0);
+        assert!(microphone_mean < 0.0);
+    }
+
+    #[test]
+    fn streaming_resampler_preserves_expected_count_for_multiple_rates() {
+        for input_rate in [44_100u32, 88_200, 96_000, 192_000] {
+            let input_len = 50_003usize;
+            let input = vec![0.125f32; input_len];
+            let mut normalizer = PcmStreamNormalizer::new(AudioSourceKind::Loopback);
+            let mut output_frames = Vec::new();
+            let mut start = 0usize;
+            let packet_sizes = [1_003usize, 17, 2_047, 5, 509];
+            let mut packet_index = 0usize;
+            while start < input.len() {
+                let count = packet_sizes[packet_index % packet_sizes.len()]
+                    .min(input.len().saturating_sub(start));
+                output_frames.extend(
+                    normalizer
+                        .push(&PcmFrame {
+                            source: AudioSourceKind::Loopback,
+                            start_time_100ns: samples_to_100ns(start as u64, input_rate),
+                            format: PcmFormat {
+                                sample_rate: input_rate,
+                                channels: 1,
+                            },
+                            samples: input[start..start + count].to_vec(),
+                        })
+                        .unwrap(),
+                );
+                start += count;
+                packet_index += 1;
+            }
+            output_frames.extend(normalizer.finish());
+            let actual = output_frames
+                .iter()
+                .map(|frame| frame.samples.len() / 2)
+                .sum::<usize>();
+            let expected = (input_len * TARGET_SAMPLE_RATE as usize).div_ceil(input_rate as usize);
+            assert_eq!(actual, expected, "rate={input_rate}");
+        }
+    }
+
+    #[test]
+    fn huge_timestamp_gap_reanchors_without_materializing_unbounded_silence() {
+        let mut normalizer = PcmStreamNormalizer::new(AudioSourceKind::Loopback);
+        let format = PcmFormat {
+            sample_rate: 192_000,
+            channels: 1,
+        };
+        normalizer
+            .push(&PcmFrame {
+                source: AudioSourceKind::Loopback,
+                start_time_100ns: 0,
+                format,
+                samples: vec![0.25; 192],
+            })
+            .unwrap();
+        let gap_start = samples_to_100ns(192_000 * 60, format.sample_rate);
+        let output = normalizer
+            .push(&PcmFrame {
+                source: AudioSourceKind::Loopback,
+                start_time_100ns: gap_start,
+                format,
+                samples: vec![-0.25; 192],
+            })
+            .unwrap();
+        let tail = normalizer.finish();
+        assert!(
+            output
+                .iter()
+                .chain(tail.iter())
+                .all(|frame| frame.start_time_100ns >= 0)
+        );
+    }
+
+    #[test]
     fn downsampling_rejects_frequencies_above_target_nyquist() {
         let input_rate = 96_000u32;
         let frequency = 30_000.0f32;
         let input = (0..input_rate as usize)
             .map(|index| {
                 let phase = std::f32::consts::TAU * frequency * index as f32 / input_rate as f32;
-                let sample = phase.sin();
-                [sample, sample]
+                phase.sin()
             })
             .collect::<Vec<_>>();
-        let output = resample_linear(&input, input_rate, TARGET_SAMPLE_RATE);
+        let output = normalize_to_stereo_48k(&PcmFrame {
+            source: AudioSourceKind::Loopback,
+            start_time_100ns: 0,
+            format: PcmFormat {
+                sample_rate: input_rate,
+                channels: 1,
+            },
+            samples: input,
+        })
+        .unwrap()
+        .samples;
         let rms = (output
             .iter()
             .map(|sample| sample[0] * sample[0])

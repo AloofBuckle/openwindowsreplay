@@ -1,11 +1,17 @@
 use super::*;
 
-pub(super) const VIDEO_TIMESCALE: u32 = 90_000;
+pub(crate) const VIDEO_TIMESCALE_90K: u32 = 90_000;
+pub(super) const VIDEO_TIMESCALE_100NS: u32 = 10_000_000;
 pub(super) const MOVIE_TIMESCALE: u32 = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct HevcAccessUnit {
+    /// Encoder transport/correlation timestamp. oneVPL requires a 90 kHz
+    /// clock, so this is intentionally separate from the source media PTS.
     pub timestamp_90k: u64,
+    /// Exact source-relative presentation timestamp when the capture API
+    /// exposes one. WGC and QPC-backed routes use 100 ns units.
+    pub presentation_timestamp_100ns: Option<u64>,
     pub data: Arc<[u8]>,
     pub is_sync: bool,
     /// 只用于从预热帧中提取 VPS/SPS/PPS 等参数集，不写入 MP4 sample 表。
@@ -17,6 +23,10 @@ pub struct HevcMp4Track {
     pub width: u16,
     pub height: u16,
     pub duration_90k: u64,
+    /// Exact source-derived duration in 100 ns units. When present, every
+    /// playable sample must also carry `presentation_timestamp_100ns` and the
+    /// MP4 video track uses a 10 MHz timescale.
+    pub presentation_duration_100ns: Option<u64>,
     pub color: NclxColorMetadata,
     pub codec: HevcCodecMetadata,
     pub samples: Vec<HevcAccessUnit>,
@@ -149,7 +159,7 @@ impl NclxColorMetadata {
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedSample {
-    pub(super) duration_90k: u32,
+    pub(super) duration_ticks: u32,
     pub(super) data: SamplePayload,
     pub(super) is_sync: bool,
 }
@@ -199,7 +209,7 @@ pub(crate) struct Mp4SampleFileRange {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HevcIndexedSample {
-    pub(crate) duration_90k: u32,
+    pub(crate) duration_ticks: u32,
     pub(crate) is_sync: bool,
     pub(crate) offset: u64,
     pub(crate) len: u64,
@@ -217,7 +227,8 @@ pub(crate) struct AacIndexedSample {
 pub(crate) struct HevcIndexedMp4Track {
     pub(crate) width: u16,
     pub(crate) height: u16,
-    pub(crate) duration_90k: u64,
+    pub(crate) timescale: u32,
+    pub(crate) duration_ticks: u64,
     pub(crate) color: NclxColorMetadata,
     pub(crate) codec: HevcCodecMetadata,
     pub(crate) parameter_sets: HevcParameterSets,
@@ -240,7 +251,7 @@ pub(crate) struct HevcAacMp4Index {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HevcPreparedSample {
-    pub(crate) duration_90k: u32,
+    pub(crate) duration_ticks: u32,
     pub(crate) is_sync: bool,
     pub(crate) data: Mp4SampleFileRange,
 }
@@ -256,7 +267,8 @@ pub(crate) struct AacPreparedSample {
 pub(crate) struct HevcPreparedMp4Track {
     pub(crate) width: u16,
     pub(crate) height: u16,
-    pub(crate) duration_90k: u64,
+    pub(crate) timescale: u32,
+    pub(crate) duration_ticks: u64,
     pub(crate) color: NclxColorMetadata,
     pub(crate) codec: HevcCodecMetadata,
     pub(crate) parameter_sets: HevcParameterSets,

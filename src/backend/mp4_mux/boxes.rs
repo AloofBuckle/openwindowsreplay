@@ -2,13 +2,14 @@ use super::*;
 
 pub(super) fn make_moov(
     video_track: &HevcMp4Track,
-    video_duration_90k: u64,
+    video_timescale: u32,
+    video_duration_ticks: u64,
     video_samples: &[PreparedSample],
     video_offsets: &[u64],
     sets: &HevcParameterSets,
     audio: Option<PreparedAacTrackRef<'_>>,
 ) -> Result<Vec<u8>, BackendError> {
-    let video_duration_ms = scale_duration(video_duration_90k, VIDEO_TIMESCALE, MOVIE_TIMESCALE);
+    let video_duration_ms = scale_duration(video_duration_ticks, video_timescale, MOVIE_TIMESCALE);
     let audio_duration_ms = audio
         .map(|audio| {
             scale_duration(
@@ -23,7 +24,8 @@ pub(super) fn make_moov(
     p.extend(make_mvhd(movie_duration_ms));
     p.extend(make_video_trak(
         video_track,
-        video_duration_90k,
+        video_timescale,
+        video_duration_ticks,
         video_samples,
         video_offsets,
         sets,
@@ -61,7 +63,8 @@ pub(super) fn make_mvhd(duration_ms: u32) -> Vec<u8> {
 
 pub(super) fn make_video_trak(
     track: &HevcMp4Track,
-    duration_90k: u64,
+    timescale: u32,
+    duration_ticks: u64,
     samples: &[PreparedSample],
     offsets: &[u64],
     sets: &HevcParameterSets,
@@ -75,7 +78,14 @@ pub(super) fn make_video_trak(
         (track.width as u32) << 16,
         (track.height as u32) << 16,
     ));
-    p.extend(make_mdia(track, duration_90k, samples, offsets, sets)?);
+    p.extend(make_mdia(
+        track,
+        timescale,
+        duration_ticks,
+        samples,
+        offsets,
+        sets,
+    )?);
     Ok(mp4_box(*b"trak", p))
 }
 
@@ -179,13 +189,14 @@ pub(super) fn make_tkhd(
 
 pub(super) fn make_mdia(
     track: &HevcMp4Track,
-    duration_90k: u64,
+    timescale: u32,
+    duration_ticks: u64,
     samples: &[PreparedSample],
     offsets: &[u64],
     sets: &HevcParameterSets,
 ) -> Result<Vec<u8>, BackendError> {
     let mut p = Vec::new();
-    p.extend(make_mdhd(VIDEO_TIMESCALE, duration_90k));
+    p.extend(make_mdhd(timescale, duration_ticks));
     p.extend(make_hdlr(*b"vide", "VideoHandler"));
     p.extend(make_minf(track, samples, offsets, sets)?);
     Ok(mp4_box(*b"mdia", p))
@@ -206,13 +217,21 @@ pub(super) fn make_audio_mdia(
 
 pub(super) fn make_mdhd(timescale: u32, duration: u64) -> Vec<u8> {
     let mut p = Vec::new();
-    be32(&mut p, 0);
-    be32(&mut p, 0);
-    be32(&mut p, timescale);
-    be32(&mut p, duration.min(u32::MAX as u64) as u32);
+    let version = if duration > u64::from(u32::MAX) { 1 } else { 0 };
+    if version == 1 {
+        be64(&mut p, 0);
+        be64(&mut p, 0);
+        be32(&mut p, timescale);
+        be64(&mut p, duration);
+    } else {
+        be32(&mut p, 0);
+        be32(&mut p, 0);
+        be32(&mut p, timescale);
+        be32(&mut p, duration as u32);
+    }
     be16(&mut p, 0x55c4); // "und"
     be16(&mut p, 0);
-    full_box(*b"mdhd", 0, 0, p)
+    full_box(*b"mdhd", version, 0, p)
 }
 
 pub(super) fn make_hdlr(handler_type: [u8; 4], name: &str) -> Vec<u8> {
@@ -525,12 +544,12 @@ pub(super) fn make_stts(samples: &[PreparedSample]) -> Vec<u8> {
     let mut entries: Vec<(u32, u32)> = Vec::new();
     for sample in samples {
         if let Some((count, duration)) = entries.last_mut()
-            && *duration == sample.duration_90k
+            && *duration == sample.duration_ticks
         {
             *count += 1;
             continue;
         }
-        entries.push((1, sample.duration_90k));
+        entries.push((1, sample.duration_ticks));
     }
     let mut p = Vec::new();
     be32(&mut p, entries.len() as u32);

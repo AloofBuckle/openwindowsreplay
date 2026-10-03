@@ -677,6 +677,7 @@ impl NvencD3d9Encoder {
         }
         Ok(Some(HevcAccessUnit {
             timestamp_90k: pending.timestamp_90k,
+            presentation_timestamp_100ns: None,
             data: output.bytes,
             is_sync,
             discard_from_track: pending.discard_from_track,

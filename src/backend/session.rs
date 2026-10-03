@@ -28,7 +28,13 @@ const LIVE_RECORD_SECONDS: f32 = 24.0 * 60.0 * 60.0;
 const DISK_SEGMENT_TARGET_SECONDS: f32 = 10.0;
 const DISK_WRITER_QUEUE_CAPACITY: usize = 3;
 const DISK_PENDING_SEGMENT_LIMIT: usize = 3;
-const DISK_SEGMENT_SIDECAR_MAGIC: &[u8; 8] = b"RRSEG003";
+/// Legacy sidecar layout: video is fixed at 90 kHz, AAC carries absolute
+/// `timestamp_ticks`. Keep this reader compatibility for cache files created
+/// before the exact-presentation-timeline change.
+const DISK_SEGMENT_SIDECAR_MAGIC_V3: &[u8; 8] = b"RRSEG003";
+/// Current sidecar layout: video carries an explicit timescale so a 10 MHz
+/// WGC/QPC presentation timeline can survive disk-ring save/concat intact.
+const DISK_SEGMENT_SIDECAR_MAGIC_V4: &[u8; 8] = b"RRSEG004";
 const VIDEO_CLOCK_HZ: u64 = 90_000;
 
 mod controller;

@@ -859,6 +859,7 @@ impl NvencD3d11Encoder {
         let is_sync = crate::backend::mp4_mux::hevc_annex_b_has_random_access_nal(&output.bytes);
         Ok(HevcAccessUnit {
             timestamp_90k,
+            presentation_timestamp_100ns: None,
             data: output.bytes,
             is_sync,
             discard_from_track,
@@ -5659,6 +5660,7 @@ mod tests {
                     width: width as u16,
                     height: height as u16,
                     duration_90k: u64::from(frame_count) * 375,
+                    presentation_duration_100ns: None,
                     color,
                     codec: crate::backend::mp4_mux::HevcCodecMetadata::main10_420_10(),
                     samples,
@@ -5711,6 +5713,7 @@ mod tests {
                         width: width as u16,
                         height: height as u16,
                         duration_90k: 3_000,
+                        presentation_duration_100ns: None,
                         color,
                         codec: crate::backend::mp4_mux::HevcCodecMetadata::main10_420_10(),
                         samples: vec![sample],

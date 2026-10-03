@@ -401,6 +401,7 @@ fn record_nvfbc_inner(
         width,
         height,
         duration_90k,
+        presentation_duration_100ns: None,
         color,
         codec,
         samples,

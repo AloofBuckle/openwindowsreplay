@@ -22,7 +22,11 @@ pub(crate) fn write_hevc_aac_mp4_with_index(
         validate_aac_track(audio)?;
     }
 
-    let (converted, parameter_sets, final_video_duration_90k) = prepare_video_track(video_track)?;
+    let prepared_video = prepare_video_track(video_track)?;
+    let converted = prepared_video.samples;
+    let parameter_sets = prepared_video.parameter_sets;
+    let final_video_duration_ticks = prepared_video.duration_ticks;
+    let video_timescale = prepared_video.timescale;
     let prepared_audio = audio_track.map(prepare_audio_track).transpose()?;
 
     let ftyp = make_ftyp();
@@ -58,7 +62,8 @@ pub(crate) fn write_hevc_aac_mp4_with_index(
     };
     let moov = make_moov(
         video_track,
-        final_video_duration_90k,
+        video_timescale,
+        final_video_duration_ticks,
         &converted,
         &video_offsets,
         &parameter_sets,
@@ -86,7 +91,8 @@ pub(crate) fn write_hevc_aac_mp4_with_index(
         video_track: HevcIndexedMp4Track {
             width: video_track.width,
             height: video_track.height,
-            duration_90k: final_video_duration_90k,
+            timescale: video_timescale,
+            duration_ticks: final_video_duration_ticks,
             color: video_track.color,
             codec: video_track.codec,
             parameter_sets,
@@ -94,7 +100,7 @@ pub(crate) fn write_hevc_aac_mp4_with_index(
                 .into_iter()
                 .zip(video_offsets)
                 .map(|(sample, offset)| HevcIndexedSample {
-                    duration_90k: sample.duration_90k,
+                    duration_ticks: sample.duration_ticks,
                     is_sync: sample.is_sync,
                     offset,
                     len: sample.data.len(),
@@ -144,7 +150,7 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
         .samples
         .iter()
         .map(|sample| PreparedSample {
-            duration_90k: sample.duration_90k,
+            duration_ticks: sample.duration_ticks,
             data: SamplePayload::FileRange(sample.data.clone()),
             is_sync: sample.is_sync,
         })
@@ -170,7 +176,8 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
     let video_meta = HevcMp4Track {
         width: video_track.width,
         height: video_track.height,
-        duration_90k: video_track.duration_90k,
+        duration_90k: 0,
+        presentation_duration_100ns: None,
         color: video_track.color,
         codec: video_track.codec,
         samples: Vec::new(),
@@ -214,7 +221,8 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
     };
     let moov = make_moov(
         &video_meta,
-        video_track.duration_90k,
+        video_track.timescale,
+        video_track.duration_ticks,
         &converted,
         &video_offsets,
         &video_track.parameter_sets,
@@ -239,9 +247,17 @@ pub(crate) fn write_prepared_hevc_aac_mp4(
         .map_err(|err| BackendError::Io(err.to_string()))
 }
 
+#[derive(Debug)]
+pub(super) struct PreparedVideoTrack {
+    pub(super) timescale: u32,
+    pub(super) duration_ticks: u64,
+    pub(super) samples: Vec<PreparedSample>,
+    pub(super) parameter_sets: HevcParameterSets,
+}
+
 pub(super) fn prepare_video_track(
     track: &HevcMp4Track,
-) -> Result<(Vec<PreparedSample>, HevcParameterSets, u64), BackendError> {
+) -> Result<PreparedVideoTrack, BackendError> {
     let playable_samples = track
         .samples
         .iter()
@@ -254,6 +270,61 @@ pub(super) fn prepare_video_track(
             "没有可封装的视频 sample",
         ));
     }
+
+    let exact_timestamp_count = playable_samples
+        .iter()
+        .filter(|sample| sample.presentation_timestamp_100ns.is_some())
+        .count();
+    if exact_timestamp_count != 0 && exact_timestamp_count != playable_samples.len() {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "HEVC presentation timestamp",
+            "视频 sample 混用了 90 kHz transport PTS 与 100 ns source PTS",
+        ));
+    }
+    let exact_timeline = exact_timestamp_count == playable_samples.len();
+    if track.presentation_duration_100ns.is_some() && !exact_timeline {
+        return Err(BackendError::unsupported(
+            "MP4 封装",
+            "HEVC presentation duration",
+            "存在 100 ns track duration，但视频 sample 没有完整的 100 ns source PTS",
+        ));
+    }
+    let timescale = if exact_timeline {
+        VIDEO_TIMESCALE_100NS
+    } else {
+        VIDEO_TIMESCALE_90K
+    };
+    let timestamps = playable_samples
+        .iter()
+        .map(|sample| {
+            if exact_timeline {
+                sample.presentation_timestamp_100ns.unwrap_or(0)
+            } else {
+                sample.timestamp_90k
+            }
+        })
+        .collect::<Vec<_>>();
+    for pair in timestamps.windows(2) {
+        if pair[1] <= pair[0] {
+            return Err(BackendError::unsupported(
+                "MP4 封装",
+                format!("video timescale={timescale}"),
+                format!(
+                    "视频 source PTS 非严格递增：previous={} current={}",
+                    pair[0], pair[1]
+                ),
+            ));
+        }
+    }
+    let requested_duration_ticks = if exact_timeline {
+        track
+            .presentation_duration_100ns
+            .unwrap_or_else(|| infer_video_duration(&timestamps))
+    } else {
+        track.duration_90k
+    }
+    .max(1);
 
     let mut parameter_sets = HevcParameterSets {
         vps: Vec::new(),
@@ -268,10 +339,11 @@ pub(super) fn prepare_video_track(
         if sample.discard_from_track {
             continue;
         }
-        let duration_90k = sample_duration(&playable_samples, track.duration_90k, playable_index);
+        let duration_ticks =
+            sample_duration(&timestamps, requested_duration_ticks, playable_index)?;
         playable_index += 1;
         converted.push(PreparedSample {
-            duration_90k,
+            duration_ticks,
             data: SamplePayload::Memory(data.into()),
             is_sync,
         });
@@ -283,17 +355,24 @@ pub(super) fn prepare_video_track(
             "首个可播放视频 sample 不是 IDR/CRA 关键帧，拒绝生成不可独立解码的 MP4",
         ));
     }
-    let prepared_duration_90k = converted
+    let prepared_duration_ticks = converted
         .iter()
-        .map(|sample| u64::from(sample.duration_90k))
+        .map(|sample| u64::from(sample.duration_ticks))
         .sum::<u64>();
     if let Some(last) = converted.last_mut()
-        && prepared_duration_90k < track.duration_90k
+        && prepared_duration_ticks < requested_duration_ticks
     {
-        let extra = track.duration_90k.saturating_sub(prepared_duration_90k);
-        last.duration_90k = u64::from(last.duration_90k)
+        let extra = requested_duration_ticks.saturating_sub(prepared_duration_ticks);
+        last.duration_ticks = u64::from(last.duration_ticks)
             .saturating_add(extra)
-            .min(u32::MAX as u64) as u32;
+            .try_into()
+            .map_err(|_| {
+                BackendError::unsupported(
+                    "MP4 封装",
+                    format!("video timescale={timescale}"),
+                    "末个视频 sample duration 超过 MP4 stts 的 u32 上限",
+                )
+            })?;
     }
 
     if parameter_sets.vps.is_empty()
@@ -307,12 +386,17 @@ pub(super) fn prepare_video_track(
         ));
     }
 
-    let final_duration_90k = converted
+    let final_duration_ticks = converted
         .iter()
-        .map(|sample| u64::from(sample.duration_90k))
+        .map(|sample| u64::from(sample.duration_ticks))
         .sum::<u64>()
         .max(1);
-    Ok((converted, parameter_sets, final_duration_90k))
+    Ok(PreparedVideoTrack {
+        timescale,
+        duration_ticks: final_duration_ticks,
+        samples: converted,
+        parameter_sets,
+    })
 }
 
 pub(super) fn prepare_audio_track(
@@ -421,16 +505,37 @@ fn validate_prepared_audio_track(track: &AacPreparedMp4Track) -> Result<(), Back
 }
 
 pub(super) fn sample_duration(
-    samples: &[&HevcAccessUnit],
-    track_duration_90k: u64,
+    timestamps: &[u64],
+    track_duration_ticks: u64,
     index: usize,
-) -> u32 {
-    let current = samples[index].timestamp_90k;
-    let next = samples
+) -> Result<u32, BackendError> {
+    let current = timestamps[index];
+    let next = timestamps
         .get(index + 1)
-        .map(|s| s.timestamp_90k)
-        .unwrap_or(track_duration_90k);
-    next.saturating_sub(current).max(1).min(u32::MAX as u64) as u32
+        .copied()
+        .unwrap_or(track_duration_ticks);
+    let duration = next.saturating_sub(current).max(1);
+    u32::try_from(duration).map_err(|_| {
+        BackendError::unsupported(
+            "MP4 封装",
+            format!("sample_index={index} duration_ticks={duration}"),
+            "单个视频 sample duration 超过 MP4 stts 的 u32 上限",
+        )
+    })
+}
+
+fn infer_video_duration(timestamps: &[u64]) -> u64 {
+    let Some(&last) = timestamps.last() else {
+        return 1;
+    };
+    let tail = timestamps
+        .iter()
+        .rev()
+        .copied()
+        .find(|timestamp| *timestamp < last)
+        .map(|previous| last.saturating_sub(previous).max(1))
+        .unwrap_or(1);
+    last.saturating_add(tail).max(1)
 }
 
 pub(super) fn merge_parameter_sets(dst: &mut HevcParameterSets, src: HevcParameterSets) {

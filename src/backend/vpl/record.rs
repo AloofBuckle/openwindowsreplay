@@ -371,6 +371,11 @@ pub(super) struct RecordAudioCapture {
     pub(super) handles: Vec<RecordAudioCaptureHandle>,
     pub(super) rx: std::sync::mpsc::Receiver<crate::backend::audio::PcmFrame>,
     pub(super) frames: Vec<crate::backend::audio::PcmFrame>,
+    pub(super) normalizers: std::collections::HashMap<
+        crate::backend::audio::AudioSourceKind,
+        crate::backend::audio::PcmStreamNormalizer,
+    >,
+    pub(super) normalization_failure: Option<String>,
     pub(super) live_encoder: Option<crate::backend::aac_mf::MfAacLcEncoder>,
     pub(super) live_blocker: crate::backend::audio::AacBlocker,
     pub(super) live_submitted_until_ticks: u64,
@@ -426,11 +431,23 @@ impl RecordAudioCapture {
         notes.push(format!(
             "音频路径已启动：sources={selected}，保留 WASAPI device-position/QPC 时钟元数据并流式采集；录制后端内部按首个正式视频源时间戳裁剪/重基准并实时推送 AAC 到 encoded ring"
         ));
+        let normalizers = sources
+            .iter()
+            .copied()
+            .map(|source| {
+                (
+                    source,
+                    crate::backend::audio::PcmStreamNormalizer::new(source),
+                )
+            })
+            .collect();
         Some(Self {
             stop,
             handles,
             rx,
             frames: Vec::new(),
+            normalizers,
+            normalization_failure: None,
             live_encoder: None,
             live_blocker: crate::backend::audio::AacBlocker::default(),
             live_submitted_until_ticks: 0,
@@ -446,13 +463,19 @@ impl RecordAudioCapture {
 
     pub(super) fn drain_incoming(&mut self) {
         while let Ok(frame) = self.rx.try_recv() {
-            let end = frame.end_time_100ns();
-            self.audio_end_abs_100ns = Some(
-                self.audio_end_abs_100ns
-                    .map(|current| current.max(end))
-                    .unwrap_or(end),
-            );
-            self.frames.push(frame);
+            let source = frame.source;
+            let normalized = self
+                .normalizers
+                .entry(source)
+                .or_insert_with(|| crate::backend::audio::PcmStreamNormalizer::new(source))
+                .push(&frame);
+            match normalized {
+                Ok(frames) => self.push_normalized_frames(frames),
+                Err(err) => {
+                    self.normalization_failure
+                        .get_or_insert_with(|| err.to_string());
+                }
+            }
         }
         if !self.retain_full_pcm && self.live_submitted_until_ticks == 0 {
             let keep_from = self
@@ -472,6 +495,11 @@ impl RecordAudioCapture {
         _notes: &mut Vec<String>,
     ) -> Result<(), BackendError> {
         self.drain_incoming();
+        if let Some(message) = self.normalization_failure.as_deref() {
+            return Err(BackendError::AudioUnsupported {
+                reason: format!("实时 PCM 重采样失败：{message}"),
+            });
+        }
         if encoded_sink.is_none() {
             return Ok(());
         }
@@ -522,7 +550,9 @@ impl RecordAudioCapture {
             return Ok(());
         }
         if self.live_encoder.is_none() {
-            self.live_encoder = Some(crate::backend::aac_mf::MfAacLcEncoder::new()?);
+            let mut encoder = crate::backend::aac_mf::MfAacLcEncoder::new()?;
+            encoder.prime_silence()?;
+            self.live_encoder = Some(encoder);
         }
         while self.live_submitted_until_ticks < encode_until_ticks {
             let from_ticks = self.live_submitted_until_ticks;
@@ -655,6 +685,7 @@ impl RecordAudioCapture {
         &mut self,
         first_video_timestamp_100ns: Option<i64>,
         video_duration_90k: u64,
+        presentation_duration_100ns: Option<u64>,
         encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
         notes: &mut Vec<String>,
     ) -> Result<Option<crate::backend::mp4_mux::AacLcMp4Track>, BackendError> {
@@ -664,7 +695,10 @@ impl RecordAudioCapture {
             notes.push("流式 AAC 结束跳过：没有首个正式视频绝对时间戳".to_owned());
             return Ok(None);
         };
-        let target_ticks = video_90k_to_audio_ticks(video_duration_90k).max(1);
+        let target_ticks = presentation_duration_100ns
+            .map(|duration| audio_100ns_to_ticks(duration.min(i64::MAX as u64) as i64))
+            .unwrap_or_else(|| video_90k_to_audio_ticks(video_duration_90k))
+            .max(1);
         self.encode_live_until_ticks(video_start_100ns, target_ticks, encoded_sink)?;
         self.finish_live_aac(encoded_sink, notes)?;
         self.frames.clear();
@@ -742,6 +776,30 @@ impl RecordAudioCapture {
             self.drain_incoming();
         }
         self.drain_incoming();
+        self.flush_normalizers();
+        if let Some(message) = self.normalization_failure.as_deref() {
+            notes.push(format!("PCM 流归一化失败：{message}"));
+        }
+    }
+
+    fn push_normalized_frames(&mut self, frames: Vec<crate::backend::audio::PcmFrame>) {
+        for frame in frames {
+            let end = frame.end_time_100ns();
+            self.audio_end_abs_100ns = Some(
+                self.audio_end_abs_100ns
+                    .map(|current| current.max(end))
+                    .unwrap_or(end),
+            );
+            self.frames.push(frame);
+        }
+    }
+
+    fn flush_normalizers(&mut self) {
+        let mut frames = Vec::new();
+        for normalizer in self.normalizers.values_mut() {
+            frames.extend(normalizer.finish());
+        }
+        self.push_normalized_frames(frames);
     }
 
     pub(super) fn stop_without_reencode(&mut self, notes: &mut Vec<String>) {
@@ -786,6 +844,9 @@ impl RecordAudioCapture {
             }
         }
         self.drain_incoming();
+        for normalizer in self.normalizers.values_mut() {
+            let _ = normalizer.finish();
+        }
         self.frames.clear();
         notes.push(format!(
             "音频快速停止完成：跳过停止时完整 AAC 重建，耗时 {:.1}ms",
@@ -809,6 +870,7 @@ pub(super) fn build_record_aac_track(
     audio_frames: Vec<crate::backend::audio::PcmFrame>,
     first_video_timestamp_100ns: Option<i64>,
     video_duration_90k: u64,
+    presentation_duration_100ns: Option<u64>,
     notes: &mut Vec<String>,
     encoded_sink: &mut Option<&mut dyn VplOneCopyRecordSink>,
     sink_push_from_ticks: u64,
@@ -822,8 +884,16 @@ pub(super) fn build_record_aac_track(
         notes.push("音频封装跳过：视频路径没有可与 WASAPI QPC 对齐的首帧绝对时间戳".to_owned());
         return Ok(None);
     };
-    let audio_duration_ticks = video_90k_to_audio_ticks(video_duration_90k).max(1);
-    let audio_duration_100ns = video_90k_to_100ns(video_duration_90k).max(1);
+    let (audio_duration_100ns, audio_duration_ticks) = match presentation_duration_100ns {
+        Some(duration) => {
+            let duration = duration.max(1).min(i64::MAX as u64) as i64;
+            (duration, audio_100ns_to_ticks(duration).max(1))
+        }
+        None => (
+            video_90k_to_100ns(video_duration_90k).max(1),
+            video_90k_to_audio_ticks(video_duration_90k).max(1),
+        ),
+    };
     let audio_end_100ns = video_start_100ns.saturating_add(audio_duration_100ns);
     let clipped_packets = audio_frames
         .iter()
@@ -839,6 +909,7 @@ pub(super) fn build_record_aac_track(
         .map(|frame| frame.frame_count())
         .sum::<usize>();
     let mut encoder = crate::backend::aac_mf::MfAacLcEncoder::new()?;
+    encoder.prime_silence()?;
     let mut blocker = AacBlocker::default();
     let mut samples = Vec::new();
     let mut mixed_48k_frames = 0u64;
@@ -884,9 +955,10 @@ pub(super) fn build_record_aac_track(
         .max(1);
     let aac_padding_ticks = final_duration_ticks.saturating_sub(audio_duration_ticks);
     notes.push(format!(
-        "音频同步：video_start_qpc100ns={} video_duration_90k={} requested_audio_ticks={} final_aac_ticks={} aac_padding_ticks={} clipped_packets={} clipped_pcm_frames={} mixed_48k_frames={} aac_blocks={}",
+        "音频同步：video_start_qpc100ns={} video_duration_90k={} presentation_duration_100ns={:?} requested_audio_ticks={} final_aac_ticks={} aac_padding_ticks={} clipped_packets={} clipped_pcm_frames={} mixed_48k_frames={} aac_blocks={}",
         video_start_100ns,
         video_duration_90k,
+        presentation_duration_100ns,
         audio_duration_ticks,
         final_duration_ticks,
         aac_padding_ticks,
@@ -992,20 +1064,45 @@ pub(super) fn display_frequency_hz_from_output(
     (available && devmode.dmDisplayFrequency > 0).then_some(devmode.dmDisplayFrequency)
 }
 
-pub(super) fn minimum_source_interval_90k_for_refresh(refresh_hz: u32) -> u64 {
-    if refresh_hz == 0 {
-        1
-    } else {
-        (VIDEO_CLOCK_HZ / (u64::from(refresh_hz) * 2)).max(1)
-    }
-}
-
 pub(super) fn should_force_source_timed_idr(
     last_sync_or_request_90k: Option<u64>,
     current_timestamp_90k: u64,
 ) -> bool {
     last_sync_or_request_90k
         .is_none_or(|last| current_timestamp_90k.saturating_sub(last) >= REPLAY_IDR_INTERVAL_90K)
+}
+
+pub(super) fn latest_idr_timestamp_90k(
+    last_completed_sync_90k: Option<u64>,
+    last_requested_sync_90k: Option<u64>,
+) -> Option<u64> {
+    match (last_completed_sync_90k, last_requested_sync_90k) {
+        (Some(completed), Some(requested)) => Some(completed.max(requested)),
+        (Some(completed), None) => Some(completed),
+        (None, Some(requested)) => Some(requested),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SourceTimedIdrScheduler {
+    last_requested_sync_90k: Option<u64>,
+}
+
+impl SourceTimedIdrScheduler {
+    pub(super) fn should_force(
+        &mut self,
+        last_completed_sync_90k: Option<u64>,
+        current_timestamp_90k: u64,
+    ) -> bool {
+        let latest_sync_or_request =
+            latest_idr_timestamp_90k(last_completed_sync_90k, self.last_requested_sync_90k);
+        let force = should_force_source_timed_idr(latest_sync_or_request, current_timestamp_90k);
+        if force {
+            self.last_requested_sync_90k = Some(current_timestamp_90k);
+        }
+        force
+    }
 }
 
 pub(super) fn capture_pool_size_for_route(

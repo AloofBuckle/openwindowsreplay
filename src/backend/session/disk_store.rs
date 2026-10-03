@@ -111,24 +111,30 @@ pub(super) struct DiskReplayStore {
 }
 
 impl DiskReplayStore {
-    pub(super) fn prepare_directory(dir: &Path) -> Result<(), BackendError> {
+    pub(super) fn prepare_directory(dir: &Path) -> Result<Vec<String>, BackendError> {
         fs::create_dir_all(dir).map_err(|err| BackendError::Io(err.to_string()))?;
+        let mut warnings = Vec::new();
         for entry in fs::read_dir(dir).map_err(|err| BackendError::Io(err.to_string()))? {
-            let entry = entry.map_err(|err| BackendError::Io(err.to_string()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.push(format!("读取磁盘循环缓存条目失败：{err}"));
+                    continue;
+                }
+            };
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("rustreplay_segment_")
                 && (name.ends_with(".mp4") || name.ends_with(".rrseg") || name.ends_with(".part"))
+                && let Err(err) = fs::remove_file(entry.path())
             {
-                fs::remove_file(entry.path()).map_err(|err| {
-                    BackendError::Io(format!(
-                        "清理残留磁盘循环文件 {} 失败：{err}",
-                        entry.path().display()
-                    ))
-                })?;
+                warnings.push(format!(
+                    "清理残留磁盘循环文件 {} 失败，已继续启动：{err}",
+                    entry.path().display()
+                ));
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     pub(super) fn new(dir: PathBuf, retention: Duration, segment_slop: Duration) -> Self {
@@ -180,6 +186,12 @@ impl DiskReplayStore {
         not_before: Option<DiskSaveCursor>,
     ) -> Result<Option<(DiskPreparedReplaySnapshot, DiskSaveCursor)>, BackendError> {
         let selected = self.select_recent_segments_after(duration, not_before);
+        Self::snapshot_selected_segments(selected)
+    }
+
+    pub(super) fn snapshot_selected_segments(
+        selected: Vec<DiskSegmentMeta>,
+    ) -> Result<Option<(DiskPreparedReplaySnapshot, DiskSaveCursor)>, BackendError> {
         if selected.is_empty() {
             return Ok(None);
         }
@@ -416,11 +428,14 @@ impl DiskSegmentWriter {
     }
 
     pub(super) fn shutdown(mut self) -> Option<String> {
-        self.shutdown.store(true, Ordering::Relaxed);
+        // Drop the writer-owned sender first, then let the worker drain every
+        // queued segment before the channel closes. Setting the flag first
+        // makes the worker discard a queued final segment on normal stop.
         self.sender.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        self.shutdown.store(true, Ordering::Relaxed);
         match self.failure.lock() {
             Ok(mut failure) => failure.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -430,11 +445,11 @@ impl DiskSegmentWriter {
 
 impl Drop for DiskSegmentWriter {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
         self.sender.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -480,7 +495,14 @@ pub(super) fn write_disk_segment_job(
         source_end_ns: scale_90k_to_ns(job.segment.source_end_90k),
         mp4_path: transaction.reservation.mp4_path.clone(),
         sidecar_path: transaction.reservation.sidecar_path.clone(),
-        duration_90k: index.video_track.duration_90k,
+        // Cache retention and save cursors are still represented in the
+        // encoder/source 90 kHz clock. The MP4 sidecar video timebase may be
+        // 10 MHz, so never mistake encoded ticks for source-clock duration.
+        duration_90k: job
+            .segment
+            .source_end_90k
+            .saturating_sub(job.segment.source_start_90k)
+            .max(1),
         audio_access_units: index
             .audio_track
             .as_ref()
